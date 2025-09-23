@@ -2,15 +2,19 @@
 
 #include <fcntl.h>
 #include <pthread.h>
+#include <stdlib.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
-#include <sd-bus.h>
-#include <sd-event.h>
+#include "sd-bus.h"
+#include "sd-event.h"
 
 #include "bus-locator.h"
 #include "bus-wait-for-jobs.h"
 #include "fd-util.h"
+#include "format-util.h"
+#include "hashmap.h"
 #include "path-util.h"
 #include "process-util.h"
 #include "random-util.h"
@@ -18,6 +22,7 @@
 #include "signal-util.h"
 #include "socket-util.h"
 #include "tests.h"
+#include "time-util.h"
 #include "tmpfile-util.h"
 #include "unit-def.h"
 
@@ -30,20 +35,20 @@ static void *fake_pressure_thread(void *p) {
         _cleanup_free_ struct fake_pressure_context *c = ASSERT_PTR(p);
         _cleanup_close_ int cfd = -EBADF;
 
-        usleep(150);
+        usleep_safe(150);
 
         assert_se(write(c->fifo_fd, &(const char) { 'x' }, 1) == 1);
 
-        usleep(150);
+        usleep_safe(150);
 
         cfd = accept4(c->socket_fd, NULL, NULL, SOCK_CLOEXEC);
         assert_se(cfd >= 0);
         char buf[STRLEN("hello")+1] = {};
         assert_se(read(cfd, buf, sizeof(buf)-1) == sizeof(buf)-1);
-        assert_se(streq(buf, "hello"));
+        ASSERT_STREQ(buf, "hello");
         assert_se(write(cfd, &(const char) { 'z' }, 1) == 1);
 
-        return 0;
+        return NULL;
 }
 
 static int fake_pressure_callback(sd_event_source *s, void *userdata) {
@@ -86,7 +91,7 @@ TEST(fake_pressure) {
         socket_fd = socket(AF_UNIX, SOCK_STREAM|SOCK_CLOEXEC, 0);
         assert_se(socket_fd >= 0);
         assert_se(sockaddr_un_set_path(&sa.un, k) >= 0);
-        assert_se(bind(socket_fd, &sa.sa, SOCKADDR_UN_LEN(sa.un)) >= 0);
+        assert_se(bind(socket_fd, &sa.sa, sockaddr_un_len(&sa.un)) >= 0);
         assert_se(listen(socket_fd, 1) >= 0);
 
         /* Ideally we'd just allocate this on the stack, but AddressSanitizer doesn't like it if threads
@@ -164,7 +169,7 @@ _noreturn_ static void real_pressure_eat_memory(int pipe_fd) {
 
                 log_info("Ate %s in total.", FORMAT_BYTES(ate));
 
-                usleep(50 * USEC_PER_MSEC);
+                usleep_safe(50 * USEC_PER_MSEC);
         }
 }
 
@@ -188,7 +193,7 @@ TEST(real_pressure) {
         _cleanup_(sd_event_source_unrefp) sd_event_source *es = NULL, *cs = NULL;
         _cleanup_(bus_wait_for_jobs_freep) BusWaitForJobs *w = NULL;
         _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
-        _cleanup_close_pair_ int pipe_fd[2] = PIPE_EBADF;
+        _cleanup_close_pair_ int pipe_fd[2] = EBADF_PAIR;
         _cleanup_(sd_event_unrefp) sd_event *e = NULL;
         _cleanup_free_ char *scope = NULL;
         const char *object;
@@ -196,10 +201,8 @@ TEST(real_pressure) {
         pid_t pid;
 
         r = sd_bus_open_system(&bus);
-        if (r < 0) {
-                log_notice_errno(r, "Can't connect to system bus, skipping test: %m");
-                return;
-        }
+        if (r < 0)
+                return (void) log_tests_skipped_errno(r, "can't connect to system bus");
 
         assert_se(bus_wait_for_jobs_new(bus, &w) >= 0);
 
@@ -213,27 +216,25 @@ TEST(real_pressure) {
         assert_se(sd_bus_message_append(m, "a(sa(sv))", 0) >= 0);
 
         r = sd_bus_call(bus, m, 0, &error, &reply);
-        if (r < 0) {
-                log_notice_errno(r, "Can't issue transient unit call, skipping test: %m");
-                return;
-        }
+        if (r < 0)
+                return (void) log_tests_skipped_errno(r, "can't issue transient unit call");
 
         assert_se(sd_bus_message_read(reply, "o", &object) >= 0);
 
-        assert_se(bus_wait_for_jobs_one(w, object, /* quiet= */ false, /* extra_args= */ NULL) >= 0);
+        assert_se(bus_wait_for_jobs_one(w, object, /* flags= */ BUS_WAIT_JOBS_LOG_ERROR, /* extra_args= */ NULL) >= 0);
 
         assert_se(sd_event_default(&e) >= 0);
 
         assert_se(pipe2(pipe_fd, O_CLOEXEC) >= 0);
 
-        r = safe_fork("(eat-memory)", FORK_RESET_SIGNALS|FORK_DEATHSIG, &pid);
+        r = safe_fork("(eat-memory)", FORK_RESET_SIGNALS|FORK_DEATHSIG_SIGTERM, &pid);
         assert_se(r >= 0);
         if (r == 0) {
                 real_pressure_eat_memory(pipe_fd[0]);
                 _exit(EXIT_SUCCESS);
         }
 
-        assert_se(sigprocmask_many(SIG_BLOCK, NULL, SIGCHLD, -1) >= 0);
+        assert_se(sigprocmask_many(SIG_BLOCK, NULL, SIGCHLD) >= 0);
         assert_se(sd_event_add_child(e, &cs, pid, WEXITED, real_pressure_child_callback, NULL) >= 0);
         assert_se(sd_event_source_set_child_process_own(cs, true) >= 0);
 
@@ -245,10 +246,8 @@ TEST(real_pressure) {
         };
 
         r = sd_event_add_memory_pressure(e, &es, real_pressure_callback, &context);
-        if (r < 0) {
-                log_notice_errno(r, "Can't allocate memory pressure fd, skipping test: %m");
-                return;
-        }
+        if (r < 0)
+                return (void) log_tests_skipped_errno(r, "can't allocate memory pressure fd");
 
         assert_se(sd_event_source_set_description(es, "real pressure event source") >= 0);
         assert_se(sd_event_source_set_memory_pressure_type(es, "some") == 0);
@@ -260,17 +259,15 @@ TEST(real_pressure) {
         assert_se(sd_event_source_set_memory_pressure_period(es, 70 * USEC_PER_MSEC, USEC_PER_SEC) == 0);
         assert_se(sd_event_source_set_enabled(es, SD_EVENT_ONESHOT) >= 0);
 
-        _cleanup_free_ char *uo;
+        _cleanup_free_ char *uo = NULL;
         assert_se(uo = unit_dbus_path_from_name(scope));
 
         uint64_t mcurrent = UINT64_MAX;
         assert_se(sd_bus_get_property_trivial(bus, "org.freedesktop.systemd1", uo, "org.freedesktop.systemd1.Scope", "MemoryCurrent", &error, 't', &mcurrent) >= 0);
 
         printf("current: %" PRIu64 "\n", mcurrent);
-        if (mcurrent == UINT64_MAX) {
-                log_notice_errno(r, "Memory accounting not available, skipping test: %m");
-                return;
-        }
+        if (mcurrent == UINT64_MAX)
+                return (void) log_tests_skipped_errno(r, "memory accounting not available");
 
         m = sd_bus_message_unref(m);
 

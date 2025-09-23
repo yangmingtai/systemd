@@ -4,21 +4,28 @@ basic_sources = files(
         'MurmurHash2.c',
         'af-list.c',
         'alloc-util.c',
+        'ansi-color.c',
         'architecture.c',
         'argv-util.c',
         'arphrd-util.c',
-        'async.c',
+        'assert-util.c',
         'audit-util.c',
+        'btrfs.c',
         'build.c',
+        'build-path.c',
         'bus-label.c',
-        'cap-list.c',
+        'capability-list.c',
         'capability-util.c',
+        'capsule-util.c',
         'cgroup-util.c',
         'chase.c',
         'chattr-util.c',
+        'compress.c',
         'conf-files.c',
+        'confidential-virt.c',
         'devnum-util.c',
         'dirent-util.c',
+        'dlfcn-util.c',
         'efivars.c',
         'env-file.c',
         'env-util.c',
@@ -29,8 +36,10 @@ basic_sources = files(
         'fd-util.c',
         'fileio.c',
         'filesystems.c',
+        'format-ifname.c',
         'format-util.c',
         'fs-util.c',
+        'gcrypt-util.c',
         'glob-util.c',
         'glyph-util.c',
         'gunicode.c',
@@ -43,15 +52,20 @@ basic_sources = files(
         'initrd-util.c',
         'inotify-util.c',
         'io-util.c',
-        'ioprio-util.c',
+        'iovec-util.c',
+        'iovec-wrapper.c',
+        'keyring-util.c',
+        'label.c',
         'limits-util.c',
         'locale-util.c',
         'lock-util.c',
         'log.c',
+        'log-context.c',
         'login-util.c',
         'memfd-util.c',
         'memory-util.c',
         'mempool.c',
+        'memstream-util.c',
         'mkdir.c',
         'mountpoint-util.c',
         'namespace-util.c',
@@ -59,9 +73,10 @@ basic_sources = files(
         'ordered-set.c',
         'os-util.c',
         'parse-util.c',
-        'path-lookup.c',
         'path-util.c',
         'percent-util.c',
+        'pidfd-util.c',
+        'pidref.c',
         'prioq.c',
         'proc-cmdline.c',
         'process-util.c',
@@ -69,16 +84,19 @@ basic_sources = files(
         'psi-util.c',
         'random-util.c',
         'ratelimit.c',
+        'raw-clone.c',
         'recurse-dir.c',
         'replace-var.c',
         'rlimit-util.c',
         'runtime-scope.c',
+        'sha256.c',
         'sigbus.c',
         'signal-util.c',
         'siphash24.c',
         'socket-util.c',
         'sort-util.c',
         'stat-util.c',
+        'static-destruct.c',
         'strbuf.c',
         'string-table.c',
         'string-util.c',
@@ -90,9 +108,9 @@ basic_sources = files(
         'terminal-util.c',
         'time-util.c',
         'tmpfile-util.c',
+        'uid-classification.c',
         'uid-range.c',
         'unit-def.c',
-        'unit-file.c',
         'unit-name.c',
         'user-util.c',
         'utf8.c',
@@ -100,210 +118,99 @@ basic_sources = files(
         'xattr-util.c',
 )
 
-missing_audit_h = files('missing_audit.h')
-missing_capability_h = files('missing_capability.h')
-missing_socket_h = files('missing_socket.h')
-
-missing_syscall_def_h = files('missing_syscall_def.h')
-basic_sources += missing_syscall_def_h
-
-generate_af_list = find_program('generate-af-list.sh')
-af_list_txt = custom_target(
-        'af-list.txt',
-        output : 'af-list.txt',
-        command : [generate_af_list, cpp, config_h, missing_socket_h],
-        capture : true)
-
-generate_arphrd_list = find_program('generate-arphrd-list.sh')
-arphrd_list_txt = custom_target(
-        'arphrd-list.txt',
-        output : 'arphrd-list.txt',
-        command : [generate_arphrd_list, cpp, config_h],
-        capture : true)
-
-generate_cap_list = find_program('generate-cap-list.sh')
-cap_list_txt = custom_target(
-        'cap-list.txt',
-        output : 'cap-list.txt',
-        command : [generate_cap_list, cpp, config_h, missing_capability_h],
-        capture : true)
-
-generate_errno_list = find_program('generate-errno-list.sh')
-errno_list_txt = custom_target(
-        'errno-list.txt',
-        output : 'errno-list.txt',
-        command : [generate_errno_list, cpp],
-        capture : true)
+sources += basic_sources
 
 generated_gperf_headers = []
-foreach item : [['af',     af_list_txt,     'af',         ''],
-                ['arphrd', arphrd_list_txt, 'arphrd',     'ARPHRD_'],
-                ['cap',    cap_list_txt,    'capability', ''],
-                ['errno',  errno_list_txt,  'errno',      '']]
+foreach item : [
+        # name,        source,             prefix,    headers
+        ['af',         af_sources,         '',        ['<sys/socket.h>'],       ],
+        ['arphrd',     arphrd_sources,     'ARPHRD_', ['<linux/if_arp.h>'],     ],
+        ['capability', capability_sources, '',        ['<linux/capability.h>'], ],
+        ['errno',      [],                 '',        ['<errno.h>'],            ],
+]
 
-        fname = '@0@-from-name.gperf'.format(item[0])
-        gperf_file = custom_target(
-                fname,
-                input : item[1],
-                output : fname,
-                command : [generate_gperfs, item[2], item[3], '@INPUT@'],
+        generate_list = files('generate-@0@-list.sh'.format(item[0]))
+        list_txt = custom_target(
+                input : [generate_list, item[1]],
+                output : '@0@-list.txt'.format(item[0]),
+                command : [env, 'bash', generate_list, cpp, system_include_args],
                 capture : true)
 
-        fname = '@0@-from-name.h'.format(item[0])
+        gperf_file = custom_target(
+                input : list_txt,
+                output : '@0@-from-name.gperf'.format(item[0]),
+                command : [generate_gperfs, item[0], item[2], '@INPUT@'] + item[3],
+                capture : true)
+
         target1 = custom_target(
-                fname,
                 input : gperf_file,
-                output : fname,
+                output : '@0@-from-name.inc'.format(item[0]),
                 command : [gperf,
                            '-L', 'ANSI-C', '-t', '--ignore-case',
-                           '-N', 'lookup_@0@'.format(item[2]),
-                           '-H', 'hash_@0@_name'.format(item[2]),
+                           '-N', 'lookup_@0@'.format(item[0]),
+                           '-H', 'hash_@0@_name'.format(item[0]),
                            '-p', '-C',
                            '@INPUT@'],
                 capture : true)
 
-        fname = '@0@-to-name.h'.format(item[0])
         awkscript = '@0@-to-name.awk'.format(item[0])
         target2 = custom_target(
-                fname,
-                input : [awkscript, item[1]],
-                output : fname,
+                input : [awkscript, list_txt],
+                output : '@0@-to-name.inc'.format(item[0]),
                 command : [awk, '-f', '@INPUT0@', '@INPUT1@'],
                 capture : true)
 
         generated_gperf_headers += [target1, target2]
 endforeach
 
+generated_sources += generated_gperf_headers
 basic_sources += generated_gperf_headers
 
 ############################################################
 
-arch_list = [
-        'alpha',
-        'arc',
-        'arm',
-        'arm64',
-        'i386',
-        'ia64',
-        'loongarch64',
-        'm68k',
-        'mips64',
-        'mips64n32',
-        'mipso32',
-        'parisc',
-        'powerpc',
-        'powerpc64',
-        'riscv32',
-        'riscv64',
-        's390',
-        's390x',
-        'sparc',
-        'x86_64'
-]
+filesystem_sets_py = files('filesystem-sets.py')
+filesystem_sets_c = custom_target(
+        output : 'filesystem-sets.c',
+        command : [filesystem_sets_py,
+                   'fs-type-to-string',
+                   'filesystem-sets',
+                   'fs-in-group'],
+        capture : true)
 
-run_target(
-        'update-syscall-tables',
-        command : [update_syscall_tables_sh, meson.current_source_dir()] + arch_list)
-
-syscall_list_txt = files('syscall-list.txt')
-
-syscall_lists = []
-foreach arch: arch_list
-        syscall_lists += files('syscalls-@0@.txt'.format(arch))
-endforeach
-
-missing_syscalls_py = find_program('missing_syscalls.py')
-
-run_target(
-        'update-syscall-header',
-        command : [missing_syscalls_py,
-                   missing_syscall_def_h,
-                   syscall_lists])
-
-############################################################
-
-filesystem_includes = ['linux/magic.h',
-                       'linux/gfs2_ondisk.h']
-
-check_filesystems = find_program('check-filesystems.sh')
-r = run_command([check_filesystems, cpp, files('filesystems-gperf.gperf')] + filesystem_includes, check: false)
-if r.returncode() != 0
-        error('Unknown filesystems defined in kernel headers:\n\n' + r.stdout())
-endif
+filesystems_gperf_gperf = custom_target(
+        output : 'filesystems-gperf.gperf',
+        command : [filesystem_sets_py,
+                   'gperf'],
+        capture : true)
 
 filesystems_gperf_h = custom_target(
-        'filesystems-gperf.h',
-        input : 'filesystems-gperf.gperf',
+        input : filesystems_gperf_gperf,
         output : 'filesystems-gperf.h',
         command : [gperf, '@INPUT@', '--output-file', '@OUTPUT@'])
 
-generate_filesystem_list = find_program('generate-filesystem-list.py')
-fname = 'filesystem-list.h'
-filesystem_list_h = custom_target(
-        fname,
-        input : 'filesystems-gperf.gperf',
-        output : fname,
-        command : [generate_filesystem_list,
-                   '@INPUT@'],
-        capture : true)
+generated_sources += [filesystem_sets_c, filesystems_gperf_gperf, filesystems_gperf_h]
+basic_sources += [filesystem_sets_c, filesystems_gperf_h]
 
-generate_filesystem_switch_case_h = find_program('generate-filesystem-switch-case.py')
-fname = 'filesystem-switch-case.h'
-filesystem_switch_case_h = custom_target(
-        fname,
-        input : 'filesystems-gperf.gperf',
-        output : 'filesystem-switch-case.h',
-        command : [generate_filesystem_switch_case_h,
-                   '@INPUT@'],
-        capture : true)
+test('kernel-filesystem-magics',
+     filesystem_sets_py,
+     args : ['check'],
+     env : ['CPP=@0@'.format(cpp)])
 
-basic_sources += [filesystem_list_h, filesystem_switch_case_h, filesystems_gperf_h]
-
-libbasic = static_library(
+libbasic_static = static_library(
         'basic',
         basic_sources,
         fundamental_sources,
         include_directories : basic_includes,
+        implicit_include_directories : false,
         dependencies : [libcap,
+                        libdl,
+                        libgcrypt_cflags,
+                        liblz4_cflags,
                         libm,
+                        librt,
+                        libxz_cflags,
+                        libzstd_cflags,
                         threads,
-                        userspace,
-                        versiondep],
-        c_args : ['-fvisibility=default'],
-        build_by_default : false)
-
-############################################################
-
-basic_gcrypt_sources = files(
-        'gcrypt-util.c',
-)
-
-# A convenience library that is separate from libbasic to avoid
-# unnecessary linking to libgcrypt.
-libbasic_gcrypt = static_library(
-        'basic-gcrypt',
-        basic_gcrypt_sources,
-        include_directories : basic_includes,
-        dependencies : [libgcrypt,
-                        userspace],
-        c_args : ['-fvisibility=default'],
-        build_by_default : false)
-
-############################################################
-
-basic_compress_sources = files(
-        'compress.c',
-)
-
-# A convenience library that is separate from libbasic to avoid unnecessary
-# linking to the compression libraries.
-libbasic_compress = static_library(
-        'basic-compress',
-        basic_compress_sources,
-        include_directories : basic_includes,
-        dependencies : [liblz4,
-                        libxz,
-                        libzstd,
                         userspace],
         c_args : ['-fvisibility=default'],
         build_by_default : false)

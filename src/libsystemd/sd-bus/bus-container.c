@@ -7,12 +7,14 @@
 #include "bus-internal.h"
 #include "bus-socket.h"
 #include "fd-util.h"
+#include "format-util.h"
+#include "log.h"
 #include "namespace-util.h"
 #include "process-util.h"
 #include "string-util.h"
 
 int bus_container_connect_socket(sd_bus *b) {
-        _cleanup_close_pair_ int pair[2] = PIPE_EBADF;
+        _cleanup_close_pair_ int pair[2] = EBADF_PAIR;
         _cleanup_close_ int pidnsfd = -EBADF, mntnsfd = -EBADF, usernsfd = -EBADF, rootfd = -EBADF;
         int r, error_buf = 0;
         pid_t child;
@@ -34,7 +36,7 @@ int bus_container_connect_socket(sd_bus *b) {
                 log_debug("sd-bus: connecting bus%s%s to namespace of PID "PID_FMT"...",
                           b->description ? " " : "", strempty(b->description), b->nspid);
 
-        r = namespace_open(b->nspid, &pidnsfd, &mntnsfd, NULL, &usernsfd, &rootfd);
+        r = namespace_open(b->nspid, &pidnsfd, &mntnsfd, /* ret_netns_fd = */ NULL, &usernsfd, &rootfd);
         if (r < 0)
                 return log_debug_errno(r, "Failed to open namespace of PID "PID_FMT": %m", b->nspid);
 
@@ -51,7 +53,7 @@ int bus_container_connect_socket(sd_bus *b) {
         if (socketpair(AF_UNIX, SOCK_SEQPACKET|SOCK_CLOEXEC, 0, pair) < 0)
                 return log_debug_errno(errno, "Failed to create a socket pair: %m");
 
-        r = namespace_fork("(sd-buscntrns)", "(sd-buscntr)", NULL, 0, FORK_RESET_SIGNALS|FORK_DEATHSIG,
+        r = namespace_fork("(sd-buscntrns)", "(sd-buscntr)", NULL, 0, FORK_RESET_SIGNALS|FORK_DEATHSIG_SIGKILL,
                            pidnsfd, mntnsfd, -1, usernsfd, rootfd, &child);
         if (r < 0)
                 return log_debug_errno(r, "Failed to create namespace for (sd-buscntr): %m");
@@ -83,11 +85,11 @@ int bus_container_connect_socket(sd_bus *b) {
         if (n > 0) {
                 if (n != sizeof(error_buf))
                         return log_debug_errno(SYNTHETIC_ERRNO(EIO),
-                                               "Read error status of unexpected length %zd from (sd-buscntr): %m", n);
+                                               "Read error status of unexpected length %zd from (sd-buscntr).", n);
 
                 if (error_buf < 0)
                         return log_debug_errno(SYNTHETIC_ERRNO(EBADMSG),
-                                               "Got unexpected error status from (sd-buscntr): %m");
+                                               "Got unexpected error status from (sd-buscntr).");
 
                 if (error_buf == EINPROGRESS)
                         return 1;

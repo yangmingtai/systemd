@@ -1,18 +1,17 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <arpa/inet.h>
-#include <errno.h>
-#include <net/if_arp.h>
+#include <netdb.h>
 #include <netinet/in.h>
-#include <resolv.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 #include "sd-resolve.h"
 
 #include "alloc-util.h"
-#include "macro.h"
 #include "socket-util.h"
 #include "string-util.h"
+#include "tests.h"
 #include "time-util.h"
 
 #define TEST_TIMEOUT_USEC (20*USEC_PER_SEC)
@@ -67,6 +66,8 @@ int main(int argc, char *argv[]) {
                 .in.sin_port = htobe16(80),
         };
 
+        test_setup_logging(LOG_DEBUG);
+
         assert_se(sd_resolve_default(&resolve) >= 0);
 
         /* Test a floating resolver query */
@@ -81,7 +82,7 @@ int main(int argc, char *argv[]) {
 
         /* Make an address -> name query */
         sa.in.sin_addr.s_addr = inet_addr(argc >= 3 ? argv[2] : "193.99.144.71");
-        r = sd_resolve_getnameinfo(resolve, &q2, &sa.sa, SOCKADDR_LEN(sa), 0, SD_RESOLVE_GET_BOTH, getnameinfo_handler, NULL);
+        r = sd_resolve_getnameinfo(resolve, &q2, &sa.sa, sockaddr_len(&sa), 0, SD_RESOLVE_GET_BOTH, getnameinfo_handler, NULL);
         if (r < 0)
                 log_error_errno(r, "sd_resolve_getnameinfo(): %m");
 

@@ -1,17 +1,20 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <sys/mount.h>
+#include <unistd.h>
 
 #include "alloc-util.h"
 #include "blockdev-util.h"
 #include "chase.h"
 #include "devnum-util.h"
 #include "escape.h"
+#include "log.h"
 #include "main-func.h"
 #include "mkdir.h"
 #include "mount-util.h"
 #include "mountpoint-util.h"
 #include "path-util.h"
+#include "stat-util.h"
 #include "string-util.h"
 #include "volatile-util.h"
 
@@ -154,7 +157,7 @@ static int run(int argc, char *argv[]) {
         if (!IN_SET(m, VOLATILE_YES, VOLATILE_OVERLAY))
                 return 0;
 
-        r = path_is_mount_point(path, NULL, AT_SYMLINK_FOLLOW);
+        r = path_is_mount_point_full(path, /* root = */ NULL, AT_SYMLINK_FOLLOW);
         if (r < 0)
                 return log_error_errno(r, "Couldn't determine whether %s is a mount point: %m", path);
         if (r == 0)

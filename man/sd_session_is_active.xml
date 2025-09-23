@@ -1,6 +1,6 @@
 <?xml version='1.0'?> <!--*-nxml-*-->
 <!DOCTYPE refentry PUBLIC "-//OASIS//DTD DocBook XML V4.5//EN"
-  "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd">
+  "http://www.oasis-open.org/docbook/xml/4.5/docbookx.dtd">
 <!-- SPDX-License-Identifier: LGPL-2.1-or-later -->
 
 <refentry id="sd_session_is_active" conditional='HAVE_PAM'
@@ -33,6 +33,7 @@
     <refname>sd_session_get_vt</refname>
     <refname>sd_session_get_remote_host</refname>
     <refname>sd_session_get_remote_user</refname>
+    <refname>sd_session_get_leader</refname>
     <refpurpose>Determine state of a specific session</refpurpose>
   </refnamediv>
 
@@ -108,6 +109,12 @@
         <funcdef>int <function>sd_session_get_display</function></funcdef>
         <paramdef>const char *<parameter>session</parameter></paramdef>
         <paramdef>char **<parameter>display</parameter></paramdef>
+      </funcprototype>
+
+      <funcprototype>
+        <funcdef>int <function>sd_session_get_leader</function></funcdef>
+        <paramdef>const char *<parameter>session</parameter></paramdef>
+        <paramdef>pid_t *<parameter>leader</parameter></paramdef>
       </funcprototype>
 
       <funcprototype>
@@ -207,14 +214,14 @@
     <citerefentry project='man-pages'><refentrytitle>free</refentrytitle><manvolnum>3</manvolnum></citerefentry>
     call after use.</para>
 
-    <para><function>sd_session_get_class()</function> may be used to
-    determine the class of the session identified by the specified
-    session identifier. The returned string is one of
-    <literal>user</literal>, <literal>greeter</literal>,
-    <literal>lock-screen</literal>, or <literal>background</literal>
-    and needs to be freed with the libc
-    <citerefentry project='man-pages'><refentrytitle>free</refentrytitle><manvolnum>3</manvolnum></citerefentry>
-    call after use.</para>
+    <para><function>sd_session_get_class()</function> may be used to determine the class of the session
+    identified by the specified session identifier. The returned string is one of <literal>user</literal>,
+    <literal>user-early</literal>, <literal>user-light</literal>, <literal>user-early-light</literal>,
+    <literal>user-incomplete</literal>, <literal>greeter</literal>, <literal>lock-screen</literal>,
+    <literal>background</literal>, <literal>background-light</literal>, <literal>manager</literal> or
+    <literal>manager-early</literal> and needs to be freed with the libc <citerefentry
+    project='man-pages'><refentrytitle>free</refentrytitle><manvolnum>3</manvolnum></citerefentry> call after
+    use.</para>
 
     <para><function>sd_session_get_desktop()</function> may be used to
     determine the brand of the desktop running on the session
@@ -235,6 +242,10 @@
     freed with the libc
     <citerefentry project='man-pages'><refentrytitle>free</refentrytitle><manvolnum>3</manvolnum></citerefentry>
     call after use.</para>
+
+    <para><function>sd_session_get_leader()</function> may be used to
+    determine the PID of the leader of the session identified by the
+    specified session identifier.</para>
 
     <para><function>sd_session_get_remote_host()</function> may be
     used to determine the remote hostname of the session identified by
@@ -284,6 +295,7 @@
     <function>sd_session_get_type()</function>,
     <function>sd_session_get_class()</function>,
     <function>sd_session_get_display()</function>,
+    <function>sd_session_get_leader()</function>,
     <function>sd_session_get_remote_user()</function>,
     <function>sd_session_get_remote_host()</function> and
     <function>sd_session_get_tty()</function> return 0 or
@@ -330,13 +342,27 @@
   <xi:include href="libsystemd-pkgconfig.xml" />
 
   <refsect1>
+    <title>History</title>
+    <para><function>sd_session_get_state()</function> was added in version 186.</para>
+    <para><function>sd_session_get_tty()</function> was added in version 198.</para>
+    <para><function>sd_session_get_vt()</function> was added in version 207.</para>
+    <para><function>sd_session_is_remote()</function>,
+    <function>sd_session_get_remote_host()</function>, and
+    <function>sd_session_get_remote_user()</function> were added in version 209.</para>
+    <para><function>sd_session_get_desktop()</function> was added in version 217.</para>
+    <para><function>sd_session_get_username()</function>,
+    <function>sd_session_get_start_time()</function>, and
+    <function>sd_session_get_leader()</function> were added in version 254.</para>
+  </refsect1>
+
+  <refsect1>
     <title>See Also</title>
 
-    <para>
-      <citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>sd-login</refentrytitle><manvolnum>3</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>sd_pid_get_session</refentrytitle><manvolnum>3</manvolnum></citerefentry>
-    </para>
+    <para><simplelist type="inline">
+      <member><citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>sd-login</refentrytitle><manvolnum>3</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>sd_pid_get_session</refentrytitle><manvolnum>3</manvolnum></citerefentry></member>
+    </simplelist></para>
   </refsect1>
 
 </refentry>

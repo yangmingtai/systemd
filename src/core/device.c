@@ -1,28 +1,27 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <errno.h>
-#include <sys/epoll.h>
-
+#include "sd-bus.h"
 #include "sd-messages.h"
 
 #include "alloc-util.h"
-#include "bus-error.h"
-#include "dbus-device.h"
+#include "bus-common-errors.h"
 #include "dbus-unit.h"
+#include "device.h"
 #include "device-private.h"
 #include "device-util.h"
-#include "device.h"
+#include "extract-word.h"
+#include "hashmap.h"
 #include "log.h"
-#include "parse-util.h"
+#include "manager.h"
 #include "path-util.h"
-#include "ratelimit.h"
 #include "serialize.h"
-#include "stat-util.h"
+#include "set.h"
 #include "string-util.h"
+#include "strv.h"
 #include "swap.h"
 #include "udev-util.h"
-#include "unit-name.h"
 #include "unit.h"
+#include "unit-name.h"
 
 static const UnitActiveState state_translation_table[_DEVICE_STATE_MAX] = {
         [DEVICE_DEAD]      = UNIT_INACTIVE,
@@ -54,8 +53,6 @@ static int device_by_path(Manager *m, const char *path, Unit **ret) {
 }
 
 static void device_unset_sysfs(Device *d) {
-        Hashmap *devices;
-
         assert(d);
 
         if (!d->sysfs)
@@ -63,7 +60,7 @@ static void device_unset_sysfs(Device *d) {
 
         /* Remove this unit from the chain of devices which share the same sysfs path. */
 
-        devices = UNIT(d)->manager->devices_by_sysfs;
+        Hashmap *devices = ASSERT_PTR(UNIT(d)->manager->devices_by_sysfs);
 
         if (d->same_sysfs_prev)
                 /* If this is not the first unit, then simply remove this unit. */
@@ -84,52 +81,52 @@ static void device_unset_sysfs(Device *d) {
 }
 
 static int device_set_sysfs(Device *d, const char *sysfs) {
-        _cleanup_free_ char *copy = NULL;
-        Device *first;
+        Unit *u = UNIT(ASSERT_PTR(d));
         int r;
 
-        assert(d);
+        assert(sysfs);
 
-        if (streq_ptr(d->sysfs, sysfs))
+        if (path_equal(d->sysfs, sysfs))
                 return 0;
 
-        r = hashmap_ensure_allocated(&UNIT(d)->manager->devices_by_sysfs, &path_hash_ops);
+        Hashmap **devices = &u->manager->devices_by_sysfs;
+
+        r = hashmap_ensure_allocated(devices, &path_hash_ops);
         if (r < 0)
                 return r;
 
-        copy = strdup(sysfs);
+        _cleanup_free_ char *copy = strdup(sysfs);
         if (!copy)
                 return -ENOMEM;
 
         device_unset_sysfs(d);
 
-        first = hashmap_get(UNIT(d)->manager->devices_by_sysfs, sysfs);
+        Device *first = hashmap_get(*devices, sysfs);
         LIST_PREPEND(same_sysfs, first, d);
 
-        r = hashmap_replace(UNIT(d)->manager->devices_by_sysfs, copy, first);
+        r = hashmap_replace(*devices, copy, first);
         if (r < 0) {
                 LIST_REMOVE(same_sysfs, first, d);
                 return r;
         }
 
         d->sysfs = TAKE_PTR(copy);
-        unit_add_to_dbus_queue(UNIT(d));
+        unit_add_to_dbus_queue(u);
 
         return 0;
 }
 
 static void device_init(Unit *u) {
-        Device *d = DEVICE(u);
+        Device *d = ASSERT_PTR(DEVICE(u));
 
-        assert(d);
-        assert(UNIT(d)->load_state == UNIT_STUB);
+        assert(u->load_state == UNIT_STUB);
 
         /* In contrast to all other unit types we timeout jobs waiting
          * for devices by default. This is because they otherwise wait
          * indefinitely for plugged in devices, something which cannot
          * happen for the other units since their operations time out
          * anyway. */
-        u->job_running_timeout = u->manager->default_device_timeout_usec;
+        u->job_running_timeout = u->manager->defaults.device_timeout_usec;
 
         u->ignore_on_isolate = true;
 
@@ -137,9 +134,7 @@ static void device_init(Unit *u) {
 }
 
 static void device_done(Unit *u) {
-        Device *d = DEVICE(u);
-
-        assert(d);
+        Device *d = ASSERT_PTR(DEVICE(u));
 
         device_unset_sysfs(d);
         d->deserialized_sysfs = mfree(d->deserialized_sysfs);
@@ -182,7 +177,7 @@ static void device_set_state(Device *d, DeviceState state) {
         if (state != old_state)
                 log_unit_debug(UNIT(d), "Changed %s -> %s", device_state_to_string(old_state), device_state_to_string(state));
 
-        unit_notify(UNIT(d), state_translation_table[old_state], state_translation_table[state], 0);
+        unit_notify(UNIT(d), state_translation_table[old_state], state_translation_table[state], /* reload_success = */ true);
 }
 
 static void device_found_changed(Device *d, DeviceFound previous, DeviceFound now) {
@@ -258,9 +253,8 @@ static void device_update_found_by_name(Manager *m, const char *path, DeviceFoun
 }
 
 static int device_coldplug(Unit *u) {
-        Device *d = DEVICE(u);
+        Device *d = ASSERT_PTR(DEVICE(u));
 
-        assert(d);
         assert(d->state == DEVICE_DEAD);
 
         /* First, let's put the deserialized state and found mask into effect, if we have it. */
@@ -336,12 +330,24 @@ static int device_coldplug(Unit *u) {
 }
 
 static void device_catchup(Unit *u) {
-        Device *d = DEVICE(u);
-
-        assert(d);
+        Device *d = ASSERT_PTR(DEVICE(u));
 
         /* Second, let's update the state with the enumerated state */
-        device_update_found_one(d, d->enumerated_found, DEVICE_FOUND_MASK);
+
+        /* If Device.found (set from Device.deserialized_found) does not have DEVICE_FOUND_UDEV, and the
+         * device has not been processed by udevd while enumeration, it indicates the unit was never active
+         * before reexecution, hence we can safely drop the flag from Device.enumerated_found. The device
+         * will be set up later when udev finishes processing (see also comment in
+         * device_setup_devlink_unit_one()).
+         *
+         * NB: 💣💣💣 If Device.found already contains udev, i.e. the unit was fully ready before
+         * reexecution, do not unset the flag. Otherwise, e.g. if systemd-udev-trigger.service is started
+         * just before reexec, reload, and so on, devices being reprocessed (carrying ID_PROCESSING=1
+         * property) on enumeration and will enter dead state. See issue #35329. */
+        if (!FLAGS_SET(d->found, DEVICE_FOUND_UDEV) && !d->processed)
+                d->enumerated_found &= ~DEVICE_FOUND_UDEV;
+
+        device_update_found_one(d, d->enumerated_found, _DEVICE_FOUND_MASK);
 }
 
 static const struct {
@@ -356,13 +362,14 @@ static const struct {
 static int device_found_to_string_many(DeviceFound flags, char **ret) {
         _cleanup_free_ char *s = NULL;
 
+        assert((flags & ~_DEVICE_FOUND_MASK) == 0);
         assert(ret);
 
-        for (size_t i = 0; i < ELEMENTSOF(device_found_map); i++) {
-                if (!FLAGS_SET(flags, device_found_map[i].flag))
+        FOREACH_ELEMENT(i, device_found_map) {
+                if (!FLAGS_SET(flags, i->flag))
                         continue;
 
-                if (!strextend_with_separator(&s, ",", device_found_map[i].name))
+                if (!strextend_with_separator(&s, ",", i->name))
                         return -ENOMEM;
         }
 
@@ -380,7 +387,6 @@ static int device_found_from_string_many(const char *name, DeviceFound *ret) {
         for (;;) {
                 _cleanup_free_ char *word = NULL;
                 DeviceFound f = 0;
-                unsigned i;
 
                 r = extract_first_word(&name, &word, ",", 0);
                 if (r < 0)
@@ -388,9 +394,9 @@ static int device_found_from_string_many(const char *name, DeviceFound *ret) {
                 if (r == 0)
                         break;
 
-                for (i = 0; i < ELEMENTSOF(device_found_map); i++)
-                        if (streq(word, device_found_map[i].name)) {
-                                f = device_found_map[i].flag;
+                FOREACH_ELEMENT(i, device_found_map)
+                        if (streq(word, i->name)) {
+                                f = i->flag;
                                 break;
                         }
 
@@ -405,11 +411,9 @@ static int device_found_from_string_many(const char *name, DeviceFound *ret) {
 }
 
 static int device_serialize(Unit *u, FILE *f, FDSet *fds) {
+        Device *d = ASSERT_PTR(DEVICE(u));
         _cleanup_free_ char *s = NULL;
-        Device *d = DEVICE(u);
 
-        assert(d);
-        assert(u);
         assert(f);
         assert(fds);
 
@@ -428,11 +432,9 @@ static int device_serialize(Unit *u, FILE *f, FDSet *fds) {
 }
 
 static int device_deserialize_item(Unit *u, const char *key, const char *value, FDSet *fds) {
-        Device *d = DEVICE(u);
+        Device *d = ASSERT_PTR(DEVICE(u));
         int r;
 
-        assert(d);
-        assert(u);
         assert(key);
         assert(value);
         assert(fds);
@@ -472,10 +474,11 @@ static int device_deserialize_item(Unit *u, const char *key, const char *value, 
 }
 
 static void device_dump(Unit *u, FILE *f, const char *prefix) {
-        Device *d = DEVICE(u);
+        Device *d = ASSERT_PTR(DEVICE(u));
         _cleanup_free_ char *s = NULL;
 
-        assert(d);
+        assert(f);
+        assert(prefix);
 
         (void) device_found_to_string_many(d->found, &s);
 
@@ -494,16 +497,16 @@ static void device_dump(Unit *u, FILE *f, const char *prefix) {
                         prefix, *i);
 }
 
-_pure_ static UnitActiveState device_active_state(Unit *u) {
-        assert(u);
+static UnitActiveState device_active_state(Unit *u) {
+        Device *d = ASSERT_PTR(DEVICE(u));
 
-        return state_translation_table[DEVICE(u)->state];
+        return state_translation_table[d->state];
 }
 
-_pure_ static const char *device_sub_state_to_string(Unit *u) {
-        assert(u);
+static const char *device_sub_state_to_string(Unit *u) {
+        Device *d = ASSERT_PTR(DEVICE(u));
 
-        return device_state_to_string(DEVICE(u)->state);
+        return device_state_to_string(d->state);
 }
 
 static int device_update_description(Unit *u, sd_device *dev, const char *path) {
@@ -516,9 +519,7 @@ static int device_update_description(Unit *u, sd_device *dev, const char *path) 
 
         desc = path;
 
-        if (dev &&
-            (sd_device_get_property_value(dev, "ID_MODEL_FROM_DATABASE", &model) >= 0 ||
-             sd_device_get_property_value(dev, "ID_MODEL", &model) >= 0)) {
+        if (dev && device_get_model_string(dev, &model) >= 0) {
                 desc = model;
 
                 /* Try to concatenate the device model string with a label, if there is one */
@@ -540,12 +541,11 @@ static int device_update_description(Unit *u, sd_device *dev, const char *path) 
 }
 
 static int device_add_udev_wants(Unit *u, sd_device *dev) {
+        Device *d = ASSERT_PTR(DEVICE(u));
         _cleanup_strv_free_ char **added = NULL;
         const char *wants, *property;
-        Device *d = DEVICE(u);
         int r;
 
-        assert(d);
         assert(dev);
 
         property = MANAGER_IS_USER(u->manager) ? "SYSTEMD_USER_WANTS" : "SYSTEMD_WANTS";
@@ -557,7 +557,7 @@ static int device_add_udev_wants(Unit *u, sd_device *dev) {
         for (;;) {
                 _cleanup_free_ char *word = NULL, *k = NULL;
 
-                r = extract_first_word(&wants, &word, NULL, EXTRACT_UNQUOTE);
+                r = extract_first_word(&wants, &word, NULL, EXTRACT_UNQUOTE | EXTRACT_RETAIN_ESCAPE);
                 if (r == 0)
                         break;
                 if (r == -ENOMEM)
@@ -619,7 +619,8 @@ static int device_add_udev_wants(Unit *u, sd_device *dev) {
 
                         r = manager_add_job_by_name(u->manager, JOB_START, *i, JOB_FAIL, NULL, &error, NULL);
                         if (r < 0)
-                                log_unit_warning_errno(u, r, "Failed to enqueue SYSTEMD_WANTS= job, ignoring: %s", bus_error_message(&error, r));
+                                log_unit_full_errno(u, sd_bus_error_has_name(&error, BUS_ERROR_NO_SUCH_UNIT) ? LOG_DEBUG : LOG_WARNING, r,
+                                                    "Failed to enqueue %s job, ignoring: %s", property, bus_error_message(&error, r));
                 }
 
         return strv_free_and_replace(d->wants_property, added);
@@ -646,6 +647,8 @@ static void device_upgrade_mount_deps(Unit *u) {
         int r;
 
         /* Let's upgrade Requires= to BindsTo= on us. (Used when SYSTEMD_MOUNT_DEVICE_BOUND is set) */
+
+        assert(u);
 
         HASHMAP_FOREACH_KEY(v, other, unit_get_dependencies(u, UNIT_REQUIRED_BY)) {
                 if (other->type != UNIT_MOUNT)
@@ -677,8 +680,8 @@ static int device_setup_unit(Manager *m, sd_device *dev, const char *path, bool 
         if (r < 0)
                 return log_struct_errno(
                                 LOG_WARNING, r,
-                                "MESSAGE_ID=" SD_MESSAGE_DEVICE_PATH_NOT_SUITABLE_STR,
-                                "DEVICE=%s", path,
+                                LOG_MESSAGE_ID(SD_MESSAGE_DEVICE_PATH_NOT_SUITABLE_STR),
+                                LOG_ITEM("DEVICE=%s", path),
                                 LOG_MESSAGE("Failed to generate valid unit name from device path '%s', ignoring device: %m",
                                             path));
 
@@ -707,16 +710,18 @@ static int device_setup_unit(Manager *m, sd_device *dev, const char *path, bool 
                 unit_add_to_load_queue(u);
         }
 
-        if (!DEVICE(u)->path) {
-                DEVICE(u)->path = strdup(path);
-                if (!DEVICE(u)->path)
+        Device *d = ASSERT_PTR(DEVICE(u));
+
+        if (!d->path) {
+                d->path = strdup(path);
+                if (!d->path)
                         return log_oom();
         }
 
         /* If this was created via some dependency and has not actually been seen yet ->sysfs will not be
          * initialized. Hence initialize it if necessary. */
         if (sysfs) {
-                r = device_set_sysfs(DEVICE(u), sysfs);
+                r = device_set_sysfs(d, sysfs);
                 if (r < 0)
                         return log_unit_error_errno(u, r, "Failed to set sysfs path %s: %m", sysfs);
 
@@ -731,11 +736,11 @@ static int device_setup_unit(Manager *m, sd_device *dev, const char *path, bool 
          * by systemd before the device appears on its radar. In this case the device unit is partially
          * initialized and includes the deps on the mount unit but at that time the "bind mounts" flag wasn't
          * present. Fix this up now. */
-        if (dev && device_is_bound_by_mounts(DEVICE(u), dev))
+        if (dev && device_is_bound_by_mounts(d, dev))
                 device_upgrade_mount_deps(u);
 
         if (units) {
-                r = set_ensure_put(units, NULL, DEVICE(u));
+                r = set_ensure_put(units, NULL, d);
                 if (r < 0)
                         return log_unit_error_errno(u, r, "Failed to store unit: %m");
         }
@@ -787,8 +792,16 @@ static int device_setup_devlink_unit_one(Manager *m, const char *devlink, Set **
         assert(ready_units);
         assert(not_ready_units);
 
-        if (sd_device_new_from_devname(&dev, devlink) >= 0 && device_is_ready(dev))
+        if (sd_device_new_from_devname(&dev, devlink) >= 0 && device_is_ready(dev)) {
+                if (MANAGER_IS_RUNNING(m) && device_is_processed(dev) <= 0)
+                        /* The device is being processed by udevd. We will receive relevant uevent for the
+                         * device later when completed. Let's ignore the device now. */
+                        return 0;
+
+                /* Note, even if the device is being processed by udevd, setup the unit on enumerate.
+                 * See also the comments in device_catchup(). */
                 return device_setup_unit(m, dev, devlink, /* main = */ false, ready_units);
+        }
 
         /* the devlink is already removed or not ready */
         if (device_by_path(m, devlink, &u) < 0)
@@ -799,7 +812,7 @@ static int device_setup_devlink_unit_one(Manager *m, const char *devlink, Set **
 
 static int device_setup_extra_units(Manager *m, sd_device *dev, Set **ready_units, Set **not_ready_units) {
         _cleanup_strv_free_ char **aliases = NULL;
-        const char *devlink, *syspath, *devname = NULL;
+        const char *syspath, *devname = NULL;
         Device *l;
         int r;
 
@@ -884,14 +897,15 @@ static int device_setup_extra_units(Manager *m, sd_device *dev, Set **ready_unit
         return 0;
 }
 
-static int device_setup_units(Manager *m, sd_device *dev, Set **ready_units, Set **not_ready_units) {
+static int device_setup_units(Manager *m, sd_device *dev, Set **ret_ready_units, Set **ret_not_ready_units) {
+        _cleanup_set_free_ Set *ready_units = NULL, *not_ready_units = NULL;
         const char *syspath, *devname = NULL;
         int r;
 
         assert(m);
         assert(dev);
-        assert(ready_units);
-        assert(not_ready_units);
+        assert(ret_ready_units);
+        assert(ret_not_ready_units);
 
         r = sd_device_get_syspath(dev, &syspath);
         if (r < 0)
@@ -911,13 +925,13 @@ static int device_setup_units(Manager *m, sd_device *dev, Set **ready_units, Set
                 /* Add the main unit named after the syspath. If this one fails, don't bother with the rest,
                  * as this one shall be the main device unit the others just follow. (Compare with how
                  * device_following() is implemented, see below, which looks for the sysfs device.) */
-                r = device_setup_unit(m, dev, syspath, /* main = */ true, ready_units);
+                r = device_setup_unit(m, dev, syspath, /* main = */ true, &ready_units);
                 if (r < 0)
                         return r;
 
                 /* Add an additional unit for the device node */
                 if (sd_device_get_devname(dev, &devname) >= 0)
-                        (void) device_setup_unit(m, dev, devname, /* main = */ false, ready_units);
+                        (void) device_setup_unit(m, dev, devname, /* main = */ false, &ready_units);
 
         } else {
                 Unit *u;
@@ -925,36 +939,35 @@ static int device_setup_units(Manager *m, sd_device *dev, Set **ready_units, Set
                 /* If the device exists but not ready, then save the units and unset udev bits later. */
 
                 if (device_by_path(m, syspath, &u) >= 0) {
-                        r = set_ensure_put(not_ready_units, NULL, DEVICE(u));
+                        r = set_ensure_put(&not_ready_units, NULL, DEVICE(u));
                         if (r < 0)
                                 log_unit_debug_errno(u, r, "Failed to store unit, ignoring: %m");
                 }
 
                 if (sd_device_get_devname(dev, &devname) >= 0 &&
                     device_by_path(m, devname, &u) >= 0) {
-                        r = set_ensure_put(not_ready_units, NULL, DEVICE(u));
+                        r = set_ensure_put(&not_ready_units, NULL, DEVICE(u));
                         if (r < 0)
                                 log_unit_debug_errno(u, r, "Failed to store unit, ignoring: %m");
                 }
         }
 
         /* Next, add/update additional .device units point to aliases and symlinks. */
-        (void) device_setup_extra_units(m, dev, ready_units, not_ready_units);
+        (void) device_setup_extra_units(m, dev, &ready_units, &not_ready_units);
 
         /* Safety check: no unit should be in ready_units and not_ready_units simultaneously. */
         Unit *u;
-        SET_FOREACH(u, *not_ready_units)
-                if (set_remove(*ready_units, u))
+        SET_FOREACH(u, not_ready_units)
+                if (set_remove(ready_units, u))
                         log_unit_error(u, "Cannot activate and deactivate the unit simultaneously. Deactivating.");
 
+        *ret_ready_units = TAKE_PTR(ready_units);
+        *ret_not_ready_units = TAKE_PTR(not_ready_units);
         return 0;
 }
 
 static Unit *device_following(Unit *u) {
-        Device *d = DEVICE(u);
-        Device *first = NULL;
-
-        assert(d);
+        Device *d = ASSERT_PTR(DEVICE(u)), *first = NULL;
 
         if (startswith(u->id, "sys-"))
                 return NULL;
@@ -974,16 +987,15 @@ static Unit *device_following(Unit *u) {
         return UNIT(first);
 }
 
-static int device_following_set(Unit *u, Set **_set) {
-        Device *d = DEVICE(u);
+static int device_following_set(Unit *u, Set **ret) {
+        Device *d = ASSERT_PTR(DEVICE(u));
         _cleanup_set_free_ Set *set = NULL;
         int r;
 
-        assert(d);
-        assert(_set);
+        assert(ret);
 
         if (LIST_JUST_US(same_sysfs, d)) {
-                *_set = NULL;
+                *ret = NULL;
                 return 0;
         }
 
@@ -1003,7 +1015,7 @@ static int device_following_set(Unit *u, Set **_set) {
                         return r;
         }
 
-        *_set = TAKE_PTR(set);
+        *ret = TAKE_PTR(set);
         return 1;
 }
 
@@ -1016,7 +1028,6 @@ static void device_shutdown(Manager *m) {
 
 static void device_enumerate(Manager *m) {
         _cleanup_(sd_device_enumerator_unrefp) sd_device_enumerator *e = NULL;
-        sd_device *dev;
         int r;
 
         assert(m);
@@ -1027,11 +1038,6 @@ static void device_enumerate(Manager *m) {
                         log_error_errno(r, "Failed to allocate device monitor: %m");
                         goto fail;
                 }
-
-                /* This will fail if we are unprivileged, but that
-                 * should not matter much, as user instances won't run
-                 * during boot. */
-                (void) sd_device_monitor_set_receive_buffer_size(m->device_monitor, 128*1024*1024);
 
                 r = sd_device_monitor_filter_add_match_tag(m->device_monitor, "systemd");
                 if (r < 0) {
@@ -1066,13 +1072,32 @@ static void device_enumerate(Manager *m) {
 
         FOREACH_DEVICE(e, dev) {
                 _cleanup_set_free_ Set *ready_units = NULL, *not_ready_units = NULL;
+                const char *syspath;
+                bool processed;
                 Device *d;
+
+                r = sd_device_get_syspath(dev, &syspath);
+                if (r < 0) {
+                        log_device_debug_errno(dev, r, "Failed to get syspath of enumerated device, ignoring: %m");
+                        continue;
+                }
+
+                r = device_is_processed(dev);
+                if (r < 0)
+                        log_device_debug_errno(dev, r, "Failed to check if device is processed by udevd, assuming not: %m");
+                processed = r > 0;
 
                 if (device_setup_units(m, dev, &ready_units, &not_ready_units) < 0)
                         continue;
 
-                SET_FOREACH(d, ready_units)
+                SET_FOREACH(d, ready_units) {
                         device_update_found_one(d, DEVICE_FOUND_UDEV, DEVICE_FOUND_UDEV);
+
+                        /* Why we need to check the syspath here? Because the device unit may be generated by
+                         * a devlink, and the syspath may be different from the one of the original device. */
+                        if (path_equal(d->sysfs, syspath))
+                                d->processed = processed;
+                }
                 SET_FOREACH(d, not_ready_units)
                         device_update_found_one(d, DEVICE_NOT_FOUND, DEVICE_FOUND_UDEV);
         }
@@ -1113,11 +1138,10 @@ static void device_remove_old_on_move(Manager *m, sd_device *dev) {
         if (!syspath_old)
                 return (void) log_oom();
 
-        device_update_found_by_sysfs(m, syspath_old, DEVICE_NOT_FOUND, DEVICE_FOUND_MASK);
+        device_update_found_by_sysfs(m, syspath_old, DEVICE_NOT_FOUND, _DEVICE_FOUND_MASK);
 }
 
 static int device_dispatch_io(sd_device_monitor *monitor, sd_device *dev, void *userdata) {
-        _cleanup_set_free_ Set *ready_units = NULL, *not_ready_units = NULL;
         Manager *m = ASSERT_PTR(userdata);
         sd_device_action_t action;
         const char *sysfs;
@@ -1140,6 +1164,8 @@ static int device_dispatch_io(sd_device_monitor *monitor, sd_device *dev, void *
                 log_device_warning_errno(dev, r, "Failed to get udev action, ignoring: %m");
                 return 0;
         }
+
+        log_device_debug(dev, "Got '%s' action on syspath '%s'.", device_action_to_string(action), sysfs);
 
         if (action == SD_DEVICE_MOVE)
                 device_remove_old_on_move(m, dev);
@@ -1168,6 +1194,7 @@ static int device_dispatch_io(sd_device_monitor *monitor, sd_device *dev, void *
          * change events */
         ready = device_is_ready(dev);
 
+        _cleanup_set_free_ Set *ready_units = NULL, *not_ready_units = NULL;
         (void) device_setup_units(m, dev, &ready_units, &not_ready_units);
 
         if (action == SD_DEVICE_REMOVE) {
@@ -1191,7 +1218,7 @@ static int device_dispatch_io(sd_device_monitor *monitor, sd_device *dev, void *
                 /* If we get notified that a device was removed by udev, then it's completely gone, hence
                  * unset all found bits. Note this affects all .device units still point to the removed
                  * device. */
-                device_update_found_by_sysfs(m, sysfs, DEVICE_NOT_FOUND, DEVICE_FOUND_MASK);
+                device_update_found_by_sysfs(m, sysfs, DEVICE_NOT_FOUND, _DEVICE_FOUND_MASK);
 
         /* These devices are found and ready now, set the udev found bit. Note, this is also necessary to do
          * on remove uevent, as some devlinks may be updated and now point to other device nodes. */
@@ -1296,6 +1323,7 @@ const UnitVTable device_vtable = {
         .status_message_formats = {
                 .starting_stopping = {
                         [0] = "Expecting device %s...",
+                        [1] = "Waiting for device %s to disappear...",
                 },
                 .finished_start_job = {
                         [JOB_DONE]       = "Found device %s.",

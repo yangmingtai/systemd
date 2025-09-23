@@ -1,11 +1,12 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include "sd-gpt.h"
+#include "sd-gpt.h" /* IWYU pragma: export */
 #include "sd-id128.h"
 
 #include "architecture.h"
-#include "id128-util.h"
+#include "forward.h"
+#include "sparse-endian.h"
 
 /* maximum length of gpt label */
 #define GPT_LABEL_MAX 36
@@ -28,25 +29,35 @@ typedef enum PartitionDesignator {
         _PARTITION_DESIGNATOR_INVALID = -EINVAL,
 } PartitionDesignator;
 
-bool partition_designator_is_versioned(PartitionDesignator d);
+bool partition_designator_is_versioned(PartitionDesignator d) _const_;
 
-PartitionDesignator partition_verity_of(PartitionDesignator p);
-PartitionDesignator partition_verity_sig_of(PartitionDesignator p);
-PartitionDesignator partition_verity_to_data(PartitionDesignator d);
-PartitionDesignator partition_verity_sig_to_data(PartitionDesignator d);
+PartitionDesignator partition_verity_of(PartitionDesignator p) _const_;
+PartitionDesignator partition_verity_sig_of(PartitionDesignator p) _const_;
+PartitionDesignator partition_verity_to_data(PartitionDesignator d) _const_;
+PartitionDesignator partition_verity_sig_to_data(PartitionDesignator d) _const_;
+
+static inline bool partition_designator_is_verity(PartitionDesignator d) {
+        return partition_verity_to_data(d) >= 0;
+}
+
+static inline bool partition_designator_is_verity_sig(PartitionDesignator d) {
+        return partition_verity_sig_to_data(d) >= 0;
+}
 
 const char* partition_designator_to_string(PartitionDesignator d) _const_;
 PartitionDesignator partition_designator_from_string(const char *name) _pure_;
 
-const char *gpt_partition_type_uuid_to_string(sd_id128_t id);
-const char *gpt_partition_type_uuid_to_string_harder(
+const char* partition_mountpoint_to_string(PartitionDesignator d) _const_;
+
+const char* gpt_partition_type_uuid_to_string(sd_id128_t id) _const_;
+const char* gpt_partition_type_uuid_to_string_harder(
                 sd_id128_t id,
                 char buffer[static SD_ID128_UUID_STRING_MAX]);
 
 #define GPT_PARTITION_TYPE_UUID_TO_STRING_HARDER(id) \
         gpt_partition_type_uuid_to_string_harder((id), (char[SD_ID128_UUID_STRING_MAX]) {})
 
-Architecture gpt_partition_type_uuid_to_arch(sd_id128_t id);
+Architecture gpt_partition_type_uuid_to_arch(sd_id128_t id) _const_;
 
 typedef struct GptPartitionType {
         sd_id128_t uuid;
@@ -62,8 +73,39 @@ int gpt_partition_label_valid(const char *s);
 GptPartitionType gpt_partition_type_from_uuid(sd_id128_t id);
 int gpt_partition_type_from_string(const char *s, GptPartitionType *ret);
 
-const char *gpt_partition_type_mountpoint_nulstr(GptPartitionType type);
+GptPartitionType gpt_partition_type_override_architecture(GptPartitionType type, Architecture arch) _const_;
 
-bool gpt_partition_type_knows_read_only(GptPartitionType type);
-bool gpt_partition_type_knows_growfs(GptPartitionType type);
-bool gpt_partition_type_knows_no_auto(GptPartitionType type);
+const char* gpt_partition_type_mountpoint_nulstr(GptPartitionType type);
+
+bool gpt_partition_type_knows_read_only(GptPartitionType type) _const_;
+bool gpt_partition_type_knows_growfs(GptPartitionType type) _const_;
+bool gpt_partition_type_knows_no_auto(GptPartitionType type) _const_;
+bool gpt_partition_type_has_filesystem(GptPartitionType type) _const_;
+
+typedef struct {
+        uint8_t partition_type_guid[16];
+        uint8_t unique_partition_guid[16];
+        le64_t starting_lba;
+        le64_t ending_lba;
+        le64_t attributes;
+        char16_t partition_name[36];
+} _packed_ GptPartitionEntry;
+
+typedef struct {
+        char signature[8];
+        le32_t revision;
+        le32_t header_size;
+        le32_t crc32;
+        le32_t reserved;
+        le64_t my_lba;
+        le64_t alternate_lba;
+        le64_t first_usable_lba;
+        le64_t last_usable_lba;
+        uint8_t disk_guid[16];
+        le64_t partition_entry_lba;
+        le32_t number_of_partition_entries;
+        le32_t size_of_partition_entry;
+        le32_t partition_entry_array_crc32;
+} _packed_ GptHeader;
+
+bool gpt_header_has_signature(const GptHeader *p) _pure_;

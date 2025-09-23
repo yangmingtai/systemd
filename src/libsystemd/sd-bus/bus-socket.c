@@ -1,8 +1,10 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <endian.h>
+#include <grp.h>
 #include <poll.h>
 #include <stdlib.h>
+#include <sys/inotify.h>
 #include <unistd.h>
 
 #include "sd-bus.h"
@@ -12,20 +14,21 @@
 #include "bus-internal.h"
 #include "bus-message.h"
 #include "bus-socket.h"
+#include "errno-util.h"
 #include "escape.h"
 #include "fd-util.h"
-#include "format-util.h"
 #include "fs-util.h"
 #include "hexdecoct.h"
 #include "io-util.h"
-#include "macro.h"
+#include "iovec-util.h"
+#include "log.h"
 #include "memory-util.h"
 #include "path-util.h"
 #include "process-util.h"
 #include "random-util.h"
-#include "signal-util.h"
 #include "stdio-util.h"
 #include "string-util.h"
+#include "time-util.h"
 #include "user-util.h"
 #include "utf8.h"
 
@@ -61,7 +64,7 @@ static int append_iovec(sd_bus_message *m, const void *p, size_t sz) {
 }
 
 static int bus_message_setup_iovec(sd_bus_message *m) {
-        struct bus_body_part *part;
+        BusMessageBodyPart *part;
         unsigned n, i;
         int r;
 
@@ -216,7 +219,7 @@ static int bus_socket_auth_verify_client(sd_bus *b) {
         /* And possibly check the third line, too */
         if (b->accept_fd) {
                 l = lines[i++];
-                b->can_fds = !!memory_startswith(l, lines[i] - l, "AGREE_UNIX_FD");
+                b->can_fds = memory_startswith(l, lines[i] - l, "AGREE_UNIX_FD");
         }
 
         assert(i == n);
@@ -265,7 +268,7 @@ static int verify_anonymous_token(sd_bus *b, const char *p, size_t l) {
         if (l % 2 != 0)
                 return 0;
 
-        r = unhexmem(p, l, (void **) &token, &len);
+        r = unhexmem_full(p, l, /* secure = */ false, (void**) &token, &len);
         if (r < 0)
                 return 0;
 
@@ -297,7 +300,7 @@ static int verify_external_token(sd_bus *b, const char *p, size_t l) {
         if (l % 2 != 0)
                 return 0;
 
-        r = unhexmem(p, l, (void**) &token, &len);
+        r = unhexmem_full(p, l, /* secure = */ false, (void**) &token, &len);
         if (r < 0)
                 return 0;
 
@@ -337,8 +340,7 @@ static int bus_socket_auth_write(sd_bus *b, const char *t) {
         b->auth_iovec[0].iov_base = p;
         b->auth_iovec[0].iov_len += l;
 
-        free(b->auth_buffer);
-        b->auth_buffer = p;
+        free_and_replace(b->auth_buffer, p);
         b->auth_index = 0;
         return 0;
 }
@@ -503,10 +505,37 @@ static int bus_socket_write_auth(sd_bus *b) {
         if (b->prefer_writev)
                 k = writev(b->output_fd, b->auth_iovec + b->auth_index, ELEMENTSOF(b->auth_iovec) - b->auth_index);
         else {
+                CMSG_BUFFER_TYPE(CMSG_SPACE(sizeof(struct ucred))) control = {};
+
                 struct msghdr mh = {
                         .msg_iov = b->auth_iovec + b->auth_index,
                         .msg_iovlen = ELEMENTSOF(b->auth_iovec) - b->auth_index,
                 };
+
+                if (uid_is_valid(b->connect_as_uid) || gid_is_valid(b->connect_as_gid)) {
+
+                        /* If we shall connect under some specific UID/GID, then synthesize an
+                         * SCM_CREDENTIALS record accordingly. After all we want to adopt this UID/GID both
+                         * for SO_PEERCRED (where we have to fork()) and SCM_CREDENTIALS (where we can just
+                         * fake it via sendmsg()) */
+
+                        struct ucred ucred = {
+                                .pid = getpid_cached(),
+                                .uid = uid_is_valid(b->connect_as_uid) ? b->connect_as_uid : getuid(),
+                                .gid = gid_is_valid(b->connect_as_gid) ? b->connect_as_gid : getgid(),
+                        };
+
+                        mh.msg_control = &control;
+                        mh.msg_controllen = sizeof(control);
+                        struct cmsghdr *cmsg = CMSG_FIRSTHDR(&mh);
+                        *cmsg = (struct cmsghdr) {
+                                .cmsg_level = SOL_SOCKET,
+                                .cmsg_type = SCM_CREDENTIALS,
+                                .cmsg_len = CMSG_LEN(sizeof(struct ucred)),
+                        };
+
+                        memcpy(CMSG_DATA(cmsg), &ucred, sizeof(struct ucred));
+                }
 
                 k = sendmsg(b->output_fd, &mh, MSG_DONTWAIT|MSG_NOSIGNAL);
                 if (k < 0 && errno == ENOTSOCK) {
@@ -524,6 +553,52 @@ static int bus_socket_write_auth(sd_bus *b) {
          * the server only processes "BEGIN" when the write buffer is empty.
          */
         return bus_socket_auth_verify(b);
+}
+
+static int bus_process_cmsg(sd_bus *bus, struct msghdr *mh, bool allow_fds) {
+        _cleanup_close_ int pidfd = -EBADF;
+        const int *fds = NULL;
+        size_t n_fds = 0;
+
+        assert(bus);
+        assert(mh);
+
+        CLEANUP_ARRAY(fds, n_fds, close_many);
+
+        struct cmsghdr *cmsg;
+        CMSG_FOREACH(cmsg, mh)
+                if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_RIGHTS) {
+                        assert(!fds);
+                        fds = CMSG_TYPED_DATA(cmsg, int);
+                        n_fds = (cmsg->cmsg_len - CMSG_LEN(0)) / sizeof(int);
+
+                } else if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_PIDFD) {
+                        log_debug("Got unexpected auxiliary pidfd, ignoring.");
+                        assert(pidfd < 0);
+                        pidfd = *CMSG_TYPED_DATA(cmsg, int);
+
+                } else
+                        log_debug("Got unexpected auxiliary data with level=%d and type=%d, ignoring.",
+                                  cmsg->cmsg_level, cmsg->cmsg_type);
+
+        if (!allow_fds) {
+                if (fds)
+                        /* Whut? We received fds during the auth protocol or so? Somebody is playing games
+                         * with us. Close them all, and fail */
+                        return -EIO;
+
+                return 0;
+        }
+
+        if (!GREEDY_REALLOC(bus->fds, bus->n_fds + n_fds))
+                return -ENOMEM;
+
+        FOREACH_ARRAY(i, fds, n_fds)
+                bus->fds[bus->n_fds++] = fd_move_above_stdio(*i);
+
+        TAKE_PTR(fds);
+        n_fds = 0;
+        return 0;
 }
 
 static int bus_socket_read_auth(sd_bus *b) {
@@ -580,11 +655,10 @@ static int bus_socket_read_auth(sd_bus *b) {
                 } else
                         handle_cmsg = true;
         }
-        if (k < 0) {
-                if (ERRNO_IS_TRANSIENT(k))
-                        return 0;
+        if (ERRNO_IS_NEG_TRANSIENT(k))
+                return 0;
+        if (k < 0)
                 return (int) k;
-        }
         if (k == 0) {
                 if (handle_cmsg)
                         cmsg_close_all(&mh); /* paranoia, we shouldn't have gotten any fds on EOF */
@@ -594,22 +668,9 @@ static int bus_socket_read_auth(sd_bus *b) {
         b->rbuffer_size += k;
 
         if (handle_cmsg) {
-                struct cmsghdr *cmsg;
-
-                CMSG_FOREACH(cmsg, &mh)
-                        if (cmsg->cmsg_level == SOL_SOCKET &&
-                            cmsg->cmsg_type == SCM_RIGHTS) {
-                                int j;
-
-                                /* Whut? We received fds during the auth
-                                 * protocol? Somebody is playing games with
-                                 * us. Close them all, and fail */
-                                j = (cmsg->cmsg_len - CMSG_LEN(0)) / sizeof(int);
-                                close_many(CMSG_TYPED_DATA(cmsg, int), j);
-                                return -EIO;
-                        } else
-                                log_debug("Got unexpected auxiliary data with level=%d and type=%d",
-                                          cmsg->cmsg_level, cmsg->cmsg_type);
+                r = bus_process_cmsg(b, &mh, /* allow_fds = */ false);
+                if (r < 0)
+                        return r;
         }
 
         r = bus_socket_auth_verify(b);
@@ -644,14 +705,20 @@ static void bus_get_peercred(sd_bus *b) {
         /* Get the SELinux context of the peer */
         r = getpeersec(b->input_fd, &b->label);
         if (r < 0 && !IN_SET(r, -EOPNOTSUPP, -ENOPROTOOPT))
-                log_debug_errno(r, "Failed to determine peer security context: %m");
+                log_debug_errno(r, "Failed to determine peer security context, ignoring: %m");
 
         /* Get the list of auxiliary groups of the peer */
         r = getpeergroups(b->input_fd, &b->groups);
         if (r >= 0)
                 b->n_groups = (size_t) r;
         else if (!IN_SET(r, -EOPNOTSUPP, -ENOPROTOOPT))
-                log_debug_errno(r, "Failed to determine peer's group list: %m");
+                log_debug_errno(r, "Failed to determine peer's group list, ignoring: %m");
+
+        r = getpeerpidfd(b->input_fd);
+        if (r < 0)
+                log_debug_errno(r, "Failed to determine peer pidfd, ignoring: %m");
+        else
+                close_and_replace(b->pidfd, r);
 
         /* Let's query the peers socket address, it might carry information such as the peer's comm or
          * description string */
@@ -736,12 +803,12 @@ static int bus_socket_inotify_setup(sd_bus *b) {
         assert(b->sockaddr.sa.sa_family == AF_UNIX);
         assert(b->sockaddr.un.sun_path[0] != 0);
 
-        /* Sets up an inotify fd in case watch_bind is enabled: wait until the configured AF_UNIX file system socket
-         * appears before connecting to it. The implemented is pretty simplistic: we just subscribe to relevant changes
-         * to all prefix components of the path, and every time we get an event for that we try to reconnect again,
-         * without actually caring what precisely the event we got told us. If we still can't connect we re-subscribe
-         * to all relevant changes of anything in the path, so that our watches include any possibly newly created path
-         * components. */
+        /* Sets up an inotify fd in case watch_bind is enabled: wait until the configured AF_UNIX file system
+         * socket appears before connecting to it. The implemented is pretty simplistic: we just subscribe to
+         * relevant changes to all components of the path, and every time we get an event for that we try to
+         * reconnect again, without actually caring what precisely the event we got told us. If we still
+         * can't connect we re-subscribe to all relevant changes of anything in the path, so that our watches
+         * include any possibly newly created path components. */
 
         if (b->inotify_fd < 0) {
                 b->inotify_fd = inotify_init1(IN_NONBLOCK|IN_CLOEXEC);
@@ -760,17 +827,17 @@ static int bus_socket_inotify_setup(sd_bus *b) {
         if (r < 0)
                 goto fail;
 
-        /* Watch all parent directories, and don't mind any prefix that doesn't exist yet. For the innermost directory
-         * that exists we want to know when files are created or moved into it. For all parents of it we just care if
-         * they are removed or renamed. */
+        /* Watch all components of the path, and don't mind any prefix that doesn't exist yet. For the
+         * innermost directory that exists we want to know when files are created or moved into it. For all
+         * parents of it we just care if they are removed or renamed. */
 
         if (!GREEDY_REALLOC(new_watches, n + 1)) {
                 r = -ENOMEM;
                 goto fail;
         }
 
-        /* Start with the top-level directory, which is a bit simpler than the rest, since it can't be a symlink, and
-         * always exists */
+        /* Start with the top-level directory, which is a bit simpler than the rest, since it can't be a
+         * symlink, and always exists */
         wd = inotify_add_watch(b->inotify_fd, "/", IN_CREATE|IN_MOVED_TO);
         if (wd < 0) {
                 r = log_debug_errno(errno, "Failed to add inotify watch on /: %m");
@@ -868,8 +935,7 @@ static int bus_socket_inotify_setup(sd_bus *b) {
                         goto fail;
                 }
 
-                free(absolute);
-                absolute = c;
+                free_and_replace(absolute, c);
 
                 max_follow--;
         }
@@ -920,10 +986,10 @@ static int bind_description(sd_bus *b, int fd, int family) {
         (void) sd_bus_get_description(b, &d);
 
         /* Generate a recognizable source address in the abstract namespace. We'll include:
-         * - a random 64bit value (to avoid collisions)
+         * - a random 64-bit value (to avoid collisions)
          * - our "comm" process name (suppressed if contains "/" to avoid parsing issues)
          * - the description string of the bus connection. */
-        (void) get_process_comm(0, &comm);
+        (void) pid_get_comm(0, &comm);
         if (comm && strchr(comm, '/'))
                 comm = mfree(comm);
 
@@ -943,6 +1009,66 @@ static int bind_description(sd_bus *b, int fd, int family) {
                 return -errno;
 
         return 0;
+}
+
+static int connect_as(int fd, const struct sockaddr *sa, socklen_t salen, uid_t uid, gid_t gid) {
+        _cleanup_close_pair_ int pfd[2] = EBADF_PAIR;
+        ssize_t n;
+        int r;
+
+        /* Shortcut if we are not supposed to drop privileges */
+        if (!uid_is_valid(uid) && !gid_is_valid(gid))
+                return RET_NERRNO(connect(fd, sa, salen));
+
+        /* This changes identity to the specified uid/gid and issues connect() as that. This is useful to
+         * make sure SO_PEERCRED reports the selected UID/GID rather than the usual one of the caller. */
+
+        if (pipe2(pfd, O_CLOEXEC) < 0)
+                return -errno;
+
+        r = safe_fork("(sd-setresuid)", FORK_RESET_SIGNALS|FORK_DEATHSIG_SIGKILL|FORK_WAIT, /* ret_pid= */ NULL);
+        if (r < 0)
+                return r;
+        if (r == 0) {
+                /* child */
+
+                pfd[0] = safe_close(pfd[0]);
+
+                r = RET_NERRNO(setgroups(0, NULL));
+                if (r < 0)
+                        goto child_finish;
+
+                if (gid_is_valid(gid)) {
+                        r = RET_NERRNO(setresgid(gid, gid, gid));
+                        if (r < 0)
+                                goto child_finish;
+                }
+
+                if (uid_is_valid(uid)) {
+                        r = RET_NERRNO(setresuid(uid, uid, uid));
+                        if (r < 0)
+                                goto child_finish;
+                }
+
+                r = RET_NERRNO(connect(fd, sa, salen));
+                if (r < 0)
+                        goto child_finish;
+
+                r = 0;
+
+        child_finish:
+                n = write(pfd[1], &r, sizeof(r));
+                if (n != sizeof(r))
+                        _exit(EXIT_FAILURE);
+
+                _exit(EXIT_SUCCESS);
+        }
+
+        n = read(pfd[0], &r, sizeof(r));
+        if (n != sizeof(r))
+                return -EIO;
+
+        return r;
 }
 
 int bus_socket_connect(sd_bus *b) {
@@ -976,8 +1102,9 @@ int bus_socket_connect(sd_bus *b) {
                 b->output_fd = b->input_fd;
                 bus_socket_setup(b);
 
-                if (connect(b->input_fd, &b->sockaddr.sa, b->sockaddr_size) < 0) {
-                        if (errno == EINPROGRESS) {
+                r = connect_as(b->input_fd, &b->sockaddr.sa, b->sockaddr_size, b->connect_as_uid, b->connect_as_gid);
+                if (r < 0) {
+                        if (r == -EINPROGRESS) {
 
                                 /* If we have any inotify watches open, close them now, we don't need them anymore, as
                                  * we have successfully initiated a connection */
@@ -990,7 +1117,7 @@ int bus_socket_connect(sd_bus *b) {
                                 return 1;
                         }
 
-                        if (IN_SET(errno, ENOENT, ECONNREFUSED) &&  /* ENOENT → unix socket doesn't exist at all; ECONNREFUSED → unix socket stale */
+                        if (IN_SET(r, -ENOENT, -ECONNREFUSED) &&  /* ENOENT → unix socket doesn't exist at all; ECONNREFUSED → unix socket stale */
                             b->watch_bind &&
                             b->sockaddr.sa.sa_family == AF_UNIX &&
                             b->sockaddr.un.sun_path[0] != 0) {
@@ -1018,7 +1145,7 @@ int bus_socket_connect(sd_bus *b) {
                                 inotify_done = true;
 
                         } else
-                                return -errno;
+                                return r;
                 } else
                         break;
         }
@@ -1158,8 +1285,8 @@ static int bus_socket_read_message_need(sd_bus *bus, size_t *need) {
         assert(need);
         assert(IN_SET(bus->state, BUS_RUNNING, BUS_HELLO));
 
-        if (bus->rbuffer_size < sizeof(struct bus_header)) {
-                *need = sizeof(struct bus_header) + 8;
+        if (bus->rbuffer_size < sizeof(BusMessageHeader)) {
+                *need = sizeof(BusMessageHeader) + 8;
 
                 /* Minimum message size:
                  *
@@ -1193,7 +1320,7 @@ static int bus_socket_read_message_need(sd_bus *bus, size_t *need) {
         } else
                 return -EBADMSG;
 
-        sum = (uint64_t) sizeof(struct bus_header) + (uint64_t) ALIGN8(b) + (uint64_t) a;
+        sum = (uint64_t) sizeof(BusMessageHeader) + (uint64_t) ALIGN8(b) + (uint64_t) a;
         if (sum >= BUS_MESSAGE_SIZE_MAX)
                 return -ENOBUFS;
 
@@ -1300,11 +1427,10 @@ int bus_socket_read_message(sd_bus *bus) {
                 } else
                         handle_cmsg = true;
         }
-        if (k < 0) {
-                if (ERRNO_IS_TRANSIENT(k))
-                        return 0;
+        if (ERRNO_IS_NEG_TRANSIENT(k))
+                return 0;
+        if (k < 0)
                 return (int) k;
-        }
         if (k == 0) {
                 if (handle_cmsg)
                         cmsg_close_all(&mh); /* On EOF we shouldn't have gotten an fd, but let's make sure */
@@ -1314,36 +1440,9 @@ int bus_socket_read_message(sd_bus *bus) {
         bus->rbuffer_size += k;
 
         if (handle_cmsg) {
-                struct cmsghdr *cmsg;
-
-                CMSG_FOREACH(cmsg, &mh)
-                        if (cmsg->cmsg_level == SOL_SOCKET &&
-                            cmsg->cmsg_type == SCM_RIGHTS) {
-                                int n, *f, i;
-
-                                n = (cmsg->cmsg_len - CMSG_LEN(0)) / sizeof(int);
-
-                                if (!bus->can_fds) {
-                                        /* Whut? We received fds but this
-                                         * isn't actually enabled? Close them,
-                                         * and fail */
-
-                                        close_many(CMSG_TYPED_DATA(cmsg, int), n);
-                                        return -EIO;
-                                }
-
-                                f = reallocarray(bus->fds, bus->n_fds + n, sizeof(int));
-                                if (!f) {
-                                        close_many(CMSG_TYPED_DATA(cmsg, int), n);
-                                        return -ENOMEM;
-                                }
-
-                                for (i = 0; i < n; i++)
-                                        f[bus->n_fds++] = fd_move_above_stdio(CMSG_TYPED_DATA(cmsg, int)[i]);
-                                bus->fds = f;
-                        } else
-                                log_debug("Got unexpected auxiliary data with level=%d and type=%d",
-                                          cmsg->cmsg_level, cmsg->cmsg_type);
+                r = bus_process_cmsg(bus, &mh, bus->can_fds);
+                if (r < 0)
+                        return r;
         }
 
         r = bus_socket_read_message_need(bus, &need);
@@ -1363,11 +1462,10 @@ int bus_socket_process_opening(sd_bus *b) {
         assert(b->state == BUS_OPENING);
 
         events = fd_wait_for_event(b->output_fd, POLLOUT, 0);
-        if (events < 0) {
-                if (ERRNO_IS_TRANSIENT(events))
-                        return 0;
+        if (ERRNO_IS_NEG_TRANSIENT(events))
+                return 0;
+        if (events < 0)
                 return events;
-        }
         if (!(events & (POLLOUT|POLLERR|POLLHUP)))
                 return 0;
 

@@ -11,9 +11,13 @@ We welcome contributions from everyone. However, please follow the following gui
 
 ## Filing Issues
 
-* We use [GitHub Issues](https://github.com/systemd/systemd/issues) **exclusively** for tracking **bugs** and **feature** **requests** (RFEs) of systemd. If you are looking for help, please try the forums of your distribution first, or [systemd-devel mailing list](https://lists.freedesktop.org/mailman/listinfo/systemd-devel) for general questions about systemd.
-* We only track bugs in the **two** **most** **recently** **released** (non-rc) **versions** of systemd in the GitHub Issue tracker. If you are using an older version of systemd, please contact your distribution's bug tracker instead (see below). See [GitHub Release Page](https://github.com/systemd/systemd/releases) for the list of most recent releases.
-* When filing a feature request issue (RFE), please always check first if the newest upstream version of systemd already implements the feature, and whether there's already an issue filed for your feature by someone else.
+* We use [GitHub Issues](https://github.com/systemd/systemd/issues) **exclusively** for tracking **bugs** and **feature** **requests** (RFEs) of systemd.
+  If you are looking for help, please try the forums of your distribution first, or [systemd-devel mailing list](https://lists.freedesktop.org/mailman/listinfo/systemd-devel) for general questions about systemd.
+* We only track bugs in the **two** **most** **recently** **released** (non-rc) **versions** of systemd in the GitHub Issue tracker.
+  If you are using an older version of systemd, please contact your distribution's bug tracker instead (see below).
+  See [GitHub Release Page](https://github.com/systemd/systemd/releases) for the list of most recent releases.
+* When filing a feature request issue (RFE), please always check first if the newest upstream version of systemd already implements the feature,
+  and whether there's already an issue filed for your feature by someone else.
 * When filing an issue, specify the **systemd** **version** you are experiencing the issue with. Also, indicate which **distribution** you are using.
 * Please include an explanation how to reproduce the issue you are pointing out.
 
@@ -24,26 +28,43 @@ Following these guidelines makes it easier for us to process your issue, and ens
 For older versions that are still supported by your distribution please use respective downstream tracker:
 
 * **Fedora** - [bugzilla](https://bugzilla.redhat.com/enter_bug.cgi?product=Fedora&component=systemd)
-* **RHEL/CentOS stream** - [bugzilla](https://bugzilla.redhat.com/) or [systemd-rhel GitHub](https://github.com/redhat-plumbers)
+* **RHEL/CentOS stream** - [Jira](https://issues.redhat.com/secure/CreateIssueDetails!init.jspa?pid=12332745&issuetype=1&components=12380515&priority=10300) or [contribute to systemd-rhel @GitHub](https://github.com/redhat-plumbers#systemd)
 * **Debian** - [bugs.debian.org](https://bugs.debian.org/cgi-bin/pkgreport.cgi?pkg=systemd)
 
 ## Security vulnerability reports
 
-See [reporting of security vulnerabilities](SECURITY.md).
+See [reporting of security vulnerabilities](https://systemd.io/SECURITY).
 
 ## Posting Pull Requests
 
 * Make sure to post PRs only relative to a recent tip of the `main` branch.
-* Follow our [Coding Style](CODING_STYLE.md) when contributing code. This is a requirement for all code we merge.
-* Please make sure to test your change before submitting the PR. See the [Hacking guide](HACKING.md) for details on how to do this.
-* Make sure to run the test suite locally, before posting your PR. We use a CI system, meaning we don't even look at your PR if the build and tests don't pass.
+* Follow our [Coding Style](https://systemd.io/CODING_STYLE) when contributing code. This is a requirement for all code we merge.
+* Please make sure to test your change before submitting the PR. See the [Hacking guide](https://systemd.io/HACKING) for details on how to do this.
+* Make sure to run the test suite locally, before posting your PR. We use a CI system, meaning we don't even look at a PR if the build fails or the unit tests don't pass.
 * If you need to update the code in an existing PR, force-push into the same branch, overriding old commits with new versions.
-* After you have pushed a new version, add a comment explaining the latest changes. If you are a member of the systemd project on GitHub, remove the `reviewed/needs-rework`/`ci-fails/needs-rework`/`needs-rebase` labels.
-* If you are copying existing code from another source (eg: a compat header), please make sure the license is compatible with `LGPL-2.1-or-later`. If the license is not `LGPL-2.1-or-later`, please add a note to [`LICENSES/README.md`](https://github.com/systemd/systemd/blob/main/LICENSES/README.md).
-* If the pull request stalls without review, post a ping in a comment after some time has passed. We are always short on reviewer time, and pull requests which haven't seen any recent activity can be easily forgotten.
-* Github will automatically add the `please-review` label when a pull request is opened or updated. If you need
-more information after a review, you can comment `/please-review` on the pull request to have Github add the
-`please-review` label to the pull request.
+* After you have pushed a new version, add a comment explaining the latest changes.
+* If you are copying existing code from another source (eg: a compat header), please make sure the license is compatible with `LGPL-2.1-or-later`.
+  If the license is not `LGPL-2.1-or-later`, please add a note to [`LICENSES/README.md`](https://github.com/systemd/systemd/blob/main/LICENSES/README.md).
+* If the pull request stalls without review, post a ping in a comment after some time has passed.
+  We are always short on reviewer time, and pull requests which haven't seen any recent activity can be easily forgotten.
+* Github will automatically add the `please-review` label when a pull request is opened or updated.
+  If you need more information after a review, you can comment `/please-review` on the pull request to have Github add the `please-review` label to the pull request.
+
+## Using AI Code Generators
+
+If you use an AI code generator such as ChatGPT, Claude, Copilot, Llama or a similar tool, this must be
+disclosed in the commit messages and pull request description.
+
+The quality bar for contributions to this project is high, and unlikely to be met by an unattended AI tool,
+without significant manual corrections. Always thoroughly review and correct any such outputs, for example
+ensuring it accurately follows [Coding Style](https://systemd.io/CODING_STYLE) at the very minimum. Please do
+not fire-and-forget pull requests without any human intervention and review, as that will likely result in
+low-quality results that will not be accepted, and if done repeatedly, may result in the account being
+blocked. As with any other submissions, authors are responsible for doing due diligence and ensuring their
+submissions are compatible with the project's license as documented in LICENSES/README.md.
+
+As a guideline, if someone notices that a contribution (code, issues, comments) was made with the help of AI,
+there was likely a lack of human review of the AI generated output.
 
 ## Reviewing Pull Requests
 
@@ -69,9 +90,9 @@ Thank you very much for your contributions!
 
 # Backward Compatibility And External Dependencies
 
-We strive to keep backward compatibility where possible and reasonable. The following are general guidelines, not hard
-rules, and case-by-case exceptions might be applied at the discretion of the maintainers. The current set of build-time
-and runtime dependencies are documented in the [README](https://github.com/systemd/systemd/blob/main/README).
+We strive to keep backward compatibility where possible and reasonable.
+The following are general guidelines, not hard rules, and case-by-case exceptions might be applied at the discretion of the maintainers.
+The current set of build-time and runtime dependencies are documented in the [README](https://github.com/systemd/systemd/blob/main/README).
 
 ## New features
 
@@ -102,9 +123,9 @@ for existing functionality.
 
 ## `libsystemd.so`
 
-`libsystemd.so` is a shared public library, so breaking ABI/API compatibility would create lot of work for everyone, and is not allowed. Instead, always add a new interface instead of modifying
-the signature of an existing function. It is fine to mark an interface as deprecated to gently nudge users toward a newer one,
-but support for the old one must be maintained.
+`libsystemd.so` is a shared public library, so breaking ABI/API compatibility would create lot of work for everyone, and is not allowed.
+Instead, always add a new interface instead of modifying the signature of an existing function.
+It is fine to mark an interface as deprecated to gently nudge users toward a newer one, but support for the old one must be maintained.
 Symbol versioning and the compiler's deprecated attribute should be used when managing the lifetime of a public interface.
 
 ## `libudev.so`

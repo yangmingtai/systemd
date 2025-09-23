@@ -1,11 +1,9 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-typedef struct ImagePolicy ImagePolicy;
-
-#include "conf-parser.h"
-#include "dissect-image.h"
-#include "errno-list.h"
+#include "conf-parser-forward.h"
+#include "forward.h"
+#include "gpt.h"
 
 typedef enum PartitionPolicyFlags {
         /* Not all policy flags really make sense on all partition types, see comments. But even if they
@@ -48,19 +46,20 @@ typedef struct PartitionPolicy {
         PartitionPolicyFlags flags;
 } PartitionPolicy;
 
-struct ImagePolicy {
+typedef struct ImagePolicy {
         PartitionPolicyFlags default_flags;  /* for any designator not listed in the list below */
         size_t n_policies;
         PartitionPolicy policies[];          /* sorted by designator, hence suitable for binary search */
-};
+} ImagePolicy;
 
-/* Default policies for various usecases */
+/* Default policies for various use cases */
 extern const ImagePolicy image_policy_allow;
 extern const ImagePolicy image_policy_deny;
 extern const ImagePolicy image_policy_ignore;
-extern const ImagePolicy image_policy_sysext;        /* No verity required */
-extern const ImagePolicy image_policy_sysext_strict; /* Signed verity required */
-extern const ImagePolicy image_policy_confext;       /* No verity required */
+extern const ImagePolicy image_policy_sysext;         /* No verity required */
+extern const ImagePolicy image_policy_sysext_strict;  /* Signed verity required */
+extern const ImagePolicy image_policy_confext;        /* No verity required */
+extern const ImagePolicy image_policy_confext_strict; /* Signed verity required */
 extern const ImagePolicy image_policy_container;
 extern const ImagePolicy image_policy_service;
 extern const ImagePolicy image_policy_host;
@@ -79,6 +78,7 @@ static inline size_t image_policy_n_entries(const ImagePolicy *policy) {
 }
 
 PartitionPolicyFlags partition_policy_flags_extend(PartitionPolicyFlags flags);
+PartitionPolicyFlags partition_policy_flags_reduce(PartitionPolicyFlags flags);
 
 PartitionPolicyFlags partition_policy_flags_from_string(const char *s);
 int partition_policy_flags_to_string(PartitionPolicyFlags flags, bool simplify, char **ret);
@@ -94,11 +94,13 @@ bool image_policy_equiv_deny(const ImagePolicy *policy);
 bool image_policy_equal(const ImagePolicy *a, const ImagePolicy *b);       /* checks if defined the same way, i.e. has literally the same ruleset */
 int image_policy_equivalent(const ImagePolicy *a, const ImagePolicy *b);   /* checks if the outcome is the same, i.e. for all partitions results in the same decisions. */
 
-static inline ImagePolicy* image_policy_free(ImagePolicy *p) {
-        return mfree(p);
-}
+int image_policy_intersect(const ImagePolicy *a, const ImagePolicy *b, ImagePolicy **ret);
+
+ImagePolicy* image_policy_free(ImagePolicy *p);
 
 DEFINE_TRIVIAL_CLEANUP_FUNC(ImagePolicy*, image_policy_free);
 
 CONFIG_PARSER_PROTOTYPE(config_parse_image_policy);
 int parse_image_policy_argument(const char *s, ImagePolicy **policy);
+
+int image_policy_ignore_designators(const ImagePolicy *p, const PartitionDesignator table[], size_t n_table, ImagePolicy **ret);

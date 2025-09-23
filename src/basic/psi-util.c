@@ -1,18 +1,16 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <stdio.h>
-#include <unistd.h>
+#include <threads.h>
 
 #include "alloc-util.h"
 #include "errno-util.h"
 #include "extract-word.h"
 #include "fd-util.h"
 #include "fileio.h"
-#include "missing_threads.h"
 #include "parse-util.h"
 #include "psi-util.h"
 #include "string-util.h"
-#include "stat-util.h"
 #include "strv.h"
 
 int read_resource_pressure(const char *path, PressureType type, ResourcePressure *ret) {
@@ -118,12 +116,10 @@ int is_pressure_supported(void) {
 
         FOREACH_STRING(p, "/proc/pressure/cpu", "/proc/pressure/io", "/proc/pressure/memory") {
                 r = read_virtual_file(p, 0, NULL, NULL);
-                if (r < 0) {
-                        if (r == -ENOENT || ERRNO_IS_NOT_SUPPORTED(r))
-                                return (cached = false);
-
+                if (r == -ENOENT || ERRNO_IS_NEG_NOT_SUPPORTED(r))
+                        return (cached = false);
+                if (r < 0)
                         return r;
-                }
         }
 
         return (cached = true);

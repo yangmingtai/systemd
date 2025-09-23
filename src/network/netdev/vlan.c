@@ -1,26 +1,26 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <errno.h>
-#include <net/if.h>
 #include <linux/if_arp.h>
 #include <linux/if_vlan.h>
 
+#include "sd-netlink.h"
+
+#include "alloc-util.h"
+#include "extract-word.h"
 #include "parse-util.h"
-#include "vlan-util.h"
+#include "set.h"
+#include "siphash24.h"
+#include "string-util.h"
 #include "vlan.h"
+#include "vlan-util.h"
 
 static int netdev_vlan_fill_message_create(NetDev *netdev, Link *link, sd_netlink_message *req) {
-        struct ifla_vlan_flags flags = {};
-        VLan *v;
-        int r;
-
-        assert(netdev);
         assert(link);
         assert(req);
 
-        v = VLAN(netdev);
-
-        assert(v);
+        struct ifla_vlan_flags flags = {};
+        VLan *v = VLAN(netdev);
+        int r;
 
         r = sd_netlink_message_append_u16(req, IFLA_VLAN_ID, v->id);
         if (r < 0)
@@ -96,8 +96,8 @@ static int netdev_vlan_fill_message_create(NetDev *netdev, Link *link, sd_netlin
 }
 
 static void vlan_qos_maps_hash_func(const struct ifla_vlan_qos_mapping *x, struct siphash *state) {
-        siphash24_compress(&x->from, sizeof(x->from), state);
-        siphash24_compress(&x->to, sizeof(x->to), state);
+        siphash24_compress_typesafe(x->from, state);
+        siphash24_compress_typesafe(x->to, state);
 }
 
 static int vlan_qos_maps_compare_func(const struct ifla_vlan_qos_mapping *a, const struct ifla_vlan_qos_mapping *b) {
@@ -144,6 +144,7 @@ int config_parse_vlan_qos_maps(
         for (const char *p = rvalue;;) {
                 _cleanup_free_ struct ifla_vlan_qos_mapping *m = NULL;
                 _cleanup_free_ char *w = NULL;
+                unsigned from, to;
 
                 r = extract_first_word(&p, &w, NULL, EXTRACT_CUNESCAPE|EXTRACT_UNQUOTE);
                 if (r == -ENOMEM)
@@ -155,20 +156,20 @@ int config_parse_vlan_qos_maps(
                 if (r == 0)
                         return 0;
 
-                m = new0(struct ifla_vlan_qos_mapping, 1);
-                if (!m)
-                        return log_oom();
-
-                r = parse_range(w, &m->from, &m->to);
+                r = parse_range(w, &from, &to);
                 if (r < 0) {
                         log_syntax(unit, LOG_WARNING, filename, line, r, "Failed to parse %s, ignoring: %s", lvalue, w);
                         continue;
                 }
 
-                if (m->to > m->from || m->to == 0 || m->from == 0) {
-                        log_syntax(unit, LOG_WARNING, filename, line, 0, "Invalid %s, ignoring: %s", lvalue, w);
-                        continue;
-                }
+                m = new(struct ifla_vlan_qos_mapping, 1);
+                if (!m)
+                        return log_oom();
+
+                *m = (struct ifla_vlan_qos_mapping) {
+                        .from = from,
+                        .to = to,
+                };
 
                 r = set_ensure_consume(s, &vlan_qos_maps_hash_ops, TAKE_PTR(m));
                 if (r < 0) {
@@ -179,14 +180,9 @@ int config_parse_vlan_qos_maps(
 }
 
 static int netdev_vlan_verify(NetDev *netdev, const char *filename) {
-        VLan *v;
-
-        assert(netdev);
         assert(filename);
 
-        v = VLAN(netdev);
-
-        assert(v);
+        VLan *v = VLAN(netdev);
 
         if (v->id == VLANID_INVALID) {
                 log_netdev_warning(netdev, "VLAN without valid Id (%"PRIu16") configured in %s.", v->id, filename);
@@ -196,12 +192,8 @@ static int netdev_vlan_verify(NetDev *netdev, const char *filename) {
         return 0;
 }
 
-static void vlan_done(NetDev *n) {
-        VLan *v;
-
-        v = VLAN(n);
-
-        assert(v);
+static void vlan_done(NetDev *netdev) {
+        VLan *v = VLAN(netdev);
 
         set_free(v->egress_qos_maps);
         set_free(v->ingress_qos_maps);
@@ -209,9 +201,6 @@ static void vlan_done(NetDev *n) {
 
 static void vlan_init(NetDev *netdev) {
         VLan *v = VLAN(netdev);
-
-        assert(netdev);
-        assert(v);
 
         v->id = VLANID_INVALID;
         v->protocol = -1;

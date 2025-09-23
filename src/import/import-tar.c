@@ -1,33 +1,35 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <linux/fs.h>
+#include <sys/stat.h>
 
 #include "sd-daemon.h"
 #include "sd-event.h"
 
 #include "alloc-util.h"
 #include "btrfs-util.h"
-#include "copy.h"
+#include "errno-util.h"
 #include "fd-util.h"
-#include "fileio.h"
-#include "fs-util.h"
-#include "hostname-util.h"
+#include "format-util.h"
 #include "import-common.h"
 #include "import-compress.h"
 #include "import-tar.h"
+#include "import-util.h"
 #include "install-file.h"
 #include "io-util.h"
-#include "machine-pool.h"
+#include "log.h"
 #include "mkdir-label.h"
 #include "path-util.h"
+#include "pidref.h"
+#include "pretty-print.h"
 #include "process-util.h"
-#include "qcow2-util.h"
 #include "ratelimit.h"
 #include "rm-rf.h"
 #include "string-util.h"
+#include "terminal-util.h"
+#include "time-util.h"
 #include "tmpfile-util.h"
 
-struct TarImport {
+typedef struct TarImport {
         sd_event *event;
 
         char *image_root;
@@ -48,7 +50,7 @@ struct TarImport {
 
         sd_event_source *input_event_source;
 
-        uint8_t buffer[16*1024];
+        uint8_t buffer[IMPORT_BUFFER_SIZE];
         size_t buffer_size;
 
         uint64_t written_compressed;
@@ -56,11 +58,11 @@ struct TarImport {
 
         struct stat input_stat;
 
-        pid_t tar_pid;
+        PidRef tar_pid;
 
         unsigned last_percent;
         RateLimit progress_ratelimit;
-};
+} TarImport;
 
 TarImport* tar_import_unref(TarImport *i) {
         if (!i)
@@ -68,8 +70,7 @@ TarImport* tar_import_unref(TarImport *i) {
 
         sd_event_source_unref(i->input_event_source);
 
-        if (i->tar_pid > 1)
-                sigkill_wait(i->tar_pid);
+        pidref_done_sigkill_wait(&i->tar_pid);
 
         rm_rf_subvolume_and_free(i->temp_path);
 
@@ -97,8 +98,9 @@ int tar_import_new(
         int r;
 
         assert(ret);
+        assert(image_root);
 
-        root = strdup(image_root ?: "/var/lib/machines");
+        root = strdup(image_root);
         if (!root)
                 return -ENOMEM;
 
@@ -114,6 +116,7 @@ int tar_import_new(
                 .last_percent = UINT_MAX,
                 .image_root = TAKE_PTR(root),
                 .progress_ratelimit = { 100 * USEC_PER_MSEC, 1 },
+                .tar_pid = PIDREF_NULL,
         };
 
         if (event)
@@ -148,8 +151,17 @@ static void tar_import_report_progress(TarImport *i) {
         if (!ratelimit_below(&i->progress_ratelimit))
                 return;
 
-        sd_notifyf(false, "X_IMPORT_PROGRESS=%u", percent);
-        log_info("Imported %u%%.", percent);
+        sd_notifyf(false, "X_IMPORT_PROGRESS=%u%%", percent);
+
+        if (isatty_safe(STDERR_FILENO))
+                (void) draw_progress_barf(
+                                percent,
+                                "%s %s/%s",
+                                glyph(GLYPH_ARROW_RIGHT),
+                                FORMAT_BYTES(i->written_compressed),
+                                FORMAT_BYTES(i->input_stat.st_size));
+        else
+                log_info("Imported %u%%.", percent);
 
         i->last_percent = percent;
 }
@@ -163,10 +175,13 @@ static int tar_import_finish(TarImport *i) {
 
         i->tar_fd = safe_close(i->tar_fd);
 
-        if (i->tar_pid > 0) {
-                r = wait_for_terminate_and_check("tar", TAKE_PID(i->tar_pid), WAIT_LOG);
+        if (pidref_is_set(&i->tar_pid)) {
+                r = pidref_wait_for_terminate_and_check("tar", &i->tar_pid, WAIT_LOG);
                 if (r < 0)
                         return r;
+
+                pidref_done(&i->tar_pid);
+
                 if (r != EXIT_SUCCESS)
                         return -EPROTO;
         }
@@ -225,7 +240,7 @@ static int tar_import_fork_tar(TarImport *i) {
                 (void) rm_rf(d, REMOVE_ROOT|REMOVE_PHYSICAL|REMOVE_SUBVOLUME);
 
         if (i->flags & IMPORT_BTRFS_SUBVOL)
-                r = btrfs_subvol_make_fallback(d, 0755);
+                r = btrfs_subvol_make_fallback(AT_FDCWD, d, 0755);
         else
                 r = RET_NERRNO(mkdir(d, 0755));
         if (r == -EEXIST && (i->flags & IMPORT_DIRECT)) /* EEXIST is OK if in direct mode, but not otherwise,
@@ -250,7 +265,7 @@ static int tar_import_write(const void *p, size_t sz, void *userdata) {
         TarImport *i = userdata;
         int r;
 
-        r = loop_write(i->tar_fd, p, sz, false);
+        r = loop_write(i->tar_fd, p, sz);
         if (r < 0)
                 return r;
 
@@ -272,6 +287,11 @@ static int tar_import_process(TarImport *i) {
                         return 0;
 
                 r = log_error_errno(errno, "Failed to read input file: %m");
+                goto finish;
+        }
+
+        if ((size_t) l > sizeof(i->buffer) - i->buffer_size) {
+                r = log_error_errno(SYNTHETIC_ERRNO(EBADMSG), "Read input file exceeded maximum size.");
                 goto finish;
         }
 
@@ -316,6 +336,9 @@ static int tar_import_process(TarImport *i) {
         return 0;
 
 finish:
+        if (r >= 0 && isatty_safe(STDERR_FILENO))
+                clear_progress_bar(/* prefix= */ NULL);
+
         if (i->on_finished)
                 i->on_finished(i, r, i->userdata);
         else

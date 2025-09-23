@@ -1,9 +1,8 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-typedef struct Scope Scope;
-
 #include "cgroup.h"
+#include "core-forward.h"
 #include "kill.h"
 #include "unit.h"
 
@@ -16,11 +15,12 @@ typedef enum ScopeResult {
         _SCOPE_RESULT_INVALID = -EINVAL,
 } ScopeResult;
 
-struct Scope {
+typedef struct Scope {
         Unit meta;
 
         CGroupContext cgroup_context;
         KillContext kill_context;
+        CGroupRuntime *cgroup_runtime;
 
         ScopeState state, deserialized_state;
         ScopeResult result;
@@ -40,7 +40,7 @@ struct Scope {
         char *group;
 
         OOMPolicy oom_policy;
-};
+} Scope;
 
 extern const UnitVTable scope_vtable;
 

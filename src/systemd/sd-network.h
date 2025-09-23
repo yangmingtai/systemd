@@ -17,10 +17,6 @@
   along with systemd; If not, see <https://www.gnu.org/licenses/>.
 ***/
 
-#include <inttypes.h>
-#include <sys/stat.h>
-#include <sys/types.h>
-
 #include "_sd-common.h"
 
 /*
@@ -43,6 +39,8 @@
  */
 
 _SD_BEGIN_DECLARATIONS;
+
+struct stat;
 
 /* Get overall operational state
  * Possible states: down, up, dormant, carrier, degraded, routable
@@ -122,6 +120,12 @@ int sd_network_link_get_network_file(int ifindex, char **ret);
 /* Get paths to .network file dropins applied to link */
 int sd_network_link_get_network_file_dropins(int ifindex, char ***ret);
 
+/* Get path to .netdev file associated with link */
+int sd_network_link_get_netdev_file(int ifindex, char **ret);
+
+/* Get path to .netdev file dropins associated with link */
+int sd_network_link_get_netdev_file_dropins(int ifindex, char ***ret);
+
 /* Get DNS entries for a given link. These are string representations of
  * IP addresses */
 int sd_network_link_get_dns(int ifindex, char ***ret);
@@ -133,6 +137,9 @@ int sd_network_link_get_ntp(int ifindex, char ***ret);
 /* Get SIP entries for a given link. These are string
  * representations of IP addresses */
 int sd_network_link_get_sip(int ifindex, char ***ret);
+
+/* Get the captive portal address for a given link. */
+int sd_network_link_get_captive_portal(int ifindex, char **ret);
 
 /* Indicates whether or not LLMNR should be enabled for the link
  * Possible levels of support: yes, no, resolve

@@ -9,18 +9,19 @@
 #include "dbus-util.h"
 #include "fd-util.h"
 #include "ip-protocol-list.h"
-#include "parse-util.h"
 #include "path-util.h"
 #include "socket.h"
 #include "socket-netlink.h"
 #include "socket-util.h"
 #include "string-util.h"
+#include "strv.h"
 #include "unit.h"
 
 static BUS_DEFINE_PROPERTY_GET_ENUM(property_get_result, socket_result, SocketResult);
 static BUS_DEFINE_PROPERTY_GET_ENUM(property_get_bind_ipv6_only, socket_address_bind_ipv6_only, SocketAddressBindIPv6Only);
 static BUS_DEFINE_PROPERTY_GET(property_get_fdname, "s", Socket, socket_fdname);
 static BUS_DEFINE_PROPERTY_GET_ENUM(property_get_timestamping, socket_timestamping, SocketTimestamping);
+static BUS_DEFINE_PROPERTY_GET_ENUM(property_get_defer_trigger, socket_defer_trigger, SocketDeferTrigger);
 
 static int property_get_listen(
                 sd_bus *bus,
@@ -44,30 +45,12 @@ static int property_get_listen(
 
         LIST_FOREACH(port, p, s->ports) {
                 _cleanup_free_ char *address = NULL;
-                const char *a;
 
-                switch (p->type) {
-                        case SOCKET_SOCKET: {
-                                r = socket_address_print(&p->address, &address);
-                                if (r)
-                                        return r;
+                r = socket_port_to_address(p, &address);
+                if (r < 0)
+                        return r;
 
-                                a = address;
-                                break;
-                        }
-
-                        case SOCKET_SPECIAL:
-                        case SOCKET_MQUEUE:
-                        case SOCKET_FIFO:
-                        case SOCKET_USB_FUNCTION:
-                                a = p->path;
-                                break;
-
-                        default:
-                                assert_not_reached();
-                }
-
-                r = sd_bus_message_append(reply, "(ss)", socket_port_type_to_string(p), a);
+                r = sd_bus_message_append(reply, "(ss)", socket_port_type_to_string(p), address);
                 if (r < 0)
                         return r;
         }
@@ -104,8 +87,10 @@ const sd_bus_vtable bus_socket_vtable[] = {
         SD_BUS_PROPERTY("Transparent", "b", bus_property_get_bool, offsetof(Socket, transparent), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("Broadcast", "b", bus_property_get_bool, offsetof(Socket, broadcast), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("PassCredentials", "b", bus_property_get_bool, offsetof(Socket, pass_cred), SD_BUS_VTABLE_PROPERTY_CONST),
+        SD_BUS_PROPERTY("PassPIDFD", "b", bus_property_get_bool, offsetof(Socket, pass_pidfd), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("PassSecurity", "b", bus_property_get_bool, offsetof(Socket, pass_sec), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("PassPacketInfo", "b", bus_property_get_bool, offsetof(Socket, pass_pktinfo), SD_BUS_VTABLE_PROPERTY_CONST),
+        SD_BUS_PROPERTY("AcceptFileDescriptors", "b", bus_property_get_bool, offsetof(Socket, pass_rights), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("Timestamping", "s", property_get_timestamping, offsetof(Socket, timestamping), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("RemoveOnStop", "b", bus_property_get_bool, offsetof(Socket, remove_on_stop), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("Listen", "a(ss)", property_get_listen, 0, SD_BUS_VTABLE_PROPERTY_CONST),
@@ -129,8 +114,13 @@ const sd_bus_vtable bus_socket_vtable[] = {
         SD_BUS_PROPERTY("SocketProtocol", "i", bus_property_get_int, offsetof(Socket, socket_protocol), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("TriggerLimitIntervalUSec", "t", bus_property_get_usec, offsetof(Socket, trigger_limit.interval), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("TriggerLimitBurst", "u", bus_property_get_unsigned, offsetof(Socket, trigger_limit.burst), SD_BUS_VTABLE_PROPERTY_CONST),
+        SD_BUS_PROPERTY("PollLimitIntervalUSec", "t", bus_property_get_usec, offsetof(Socket, poll_limit.interval), SD_BUS_VTABLE_PROPERTY_CONST),
+        SD_BUS_PROPERTY("PollLimitBurst", "u", bus_property_get_unsigned, offsetof(Socket, poll_limit.burst), SD_BUS_VTABLE_PROPERTY_CONST),
+        SD_BUS_PROPERTY("DeferTrigger", "s", property_get_defer_trigger, offsetof(Socket, defer_trigger), SD_BUS_VTABLE_PROPERTY_CONST),
+        SD_BUS_PROPERTY("DeferTriggerMaxUSec", "t", bus_property_get_usec, offsetof(Socket, defer_trigger_max_usec), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("UID", "u", bus_property_get_uid, offsetof(Unit, ref_uid), SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
         SD_BUS_PROPERTY("GID", "u", bus_property_get_gid, offsetof(Unit, ref_gid), SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
+        SD_BUS_PROPERTY("PassFileDescriptorsToExec", "b", bus_property_get_bool, offsetof(Socket, pass_fds_to_exec), SD_BUS_VTABLE_PROPERTY_CONST),
         BUS_EXEC_COMMAND_LIST_VTABLE("ExecStartPre", offsetof(Socket, exec_command[SOCKET_EXEC_START_PRE]), SD_BUS_VTABLE_PROPERTY_EMITS_INVALIDATION),
         BUS_EXEC_COMMAND_LIST_VTABLE("ExecStartPost", offsetof(Socket, exec_command[SOCKET_EXEC_START_POST]), SD_BUS_VTABLE_PROPERTY_EMITS_INVALIDATION),
         BUS_EXEC_COMMAND_LIST_VTABLE("ExecStopPre", offsetof(Socket, exec_command[SOCKET_EXEC_STOP_PRE]), SD_BUS_VTABLE_PROPERTY_EMITS_INVALIDATION),
@@ -146,7 +136,7 @@ static const char* socket_protocol_to_string(int32_t i) {
         if (i == IPPROTO_IP)
                 return "";
 
-        if (!IN_SET(i, IPPROTO_UDPLITE, IPPROTO_SCTP))
+        if (!IN_SET(i, IPPROTO_UDPLITE, IPPROTO_SCTP, IPPROTO_MPTCP))
                 return NULL;
 
         return ip_protocol_to_name(i);
@@ -161,6 +151,7 @@ static BUS_DEFINE_SET_TRANSIENT_STRING_WITH_CHECK(ifname, ifname_valid);
 static BUS_DEFINE_SET_TRANSIENT_TO_STRING_ALLOC(ip_tos, "i", int32_t, int, "%" PRIi32, ip_tos_to_string_alloc);
 static BUS_DEFINE_SET_TRANSIENT_TO_STRING(socket_protocol, "i", int32_t, int, "%" PRIi32, socket_protocol_to_string);
 static BUS_DEFINE_SET_TRANSIENT_PARSE(socket_timestamping, SocketTimestamping, socket_timestamping_from_string_harder);
+static BUS_DEFINE_SET_TRANSIENT_PARSE(socket_defer_trigger, SocketDeferTrigger, socket_defer_trigger_from_string);
 
 static int bus_socket_set_transient_property(
                 Socket *s,
@@ -206,11 +197,17 @@ static int bus_socket_set_transient_property(
         if (streq(name, "PassCredentials"))
                 return bus_set_transient_bool(u, name, &s->pass_cred, message, flags, error);
 
+        if (streq(name, "PassPIDFD"))
+                return bus_set_transient_bool(u, name, &s->pass_pidfd, message, flags, error);
+
         if (streq(name, "PassSecurity"))
                 return bus_set_transient_bool(u, name, &s->pass_sec, message, flags, error);
 
         if (streq(name, "PassPacketInfo"))
                 return bus_set_transient_bool(u, name, &s->pass_pktinfo, message, flags, error);
+
+        if (streq(name, "AcceptFileDescriptors"))
+                return bus_set_transient_bool(u, name, &s->pass_rights, message, flags, error);
 
         if (streq(name, "Timestamping"))
                 return bus_set_transient_socket_timestamping(u, name, &s->timestamping, message, flags, error);
@@ -248,6 +245,9 @@ static int bus_socket_set_transient_property(
         if (streq(name, "TriggerLimitBurst"))
                 return bus_set_transient_unsigned(u, name, &s->trigger_limit.burst, message, flags, error);
 
+        if (streq(name, "PollLimitBurst"))
+                return bus_set_transient_unsigned(u, name, &s->poll_limit.burst, message, flags, error);
+
         if (streq(name, "SocketMode"))
                 return bus_set_transient_mode_t(u, name, &s->socket_mode, message, flags, error);
 
@@ -274,6 +274,15 @@ static int bus_socket_set_transient_property(
 
         if (streq(name, "TriggerLimitIntervalUSec"))
                 return bus_set_transient_usec(u, name, &s->trigger_limit.interval, message, flags, error);
+
+        if (streq(name, "PollLimitIntervalUSec"))
+                return bus_set_transient_usec(u, name, &s->poll_limit.interval, message, flags, error);
+
+        if (streq(name, "DeferTrigger"))
+                return bus_set_transient_socket_defer_trigger(u, name, &s->defer_trigger, message, flags, error);
+
+        if (streq(name, "DeferTriggerMaxUSec"))
+                return bus_set_transient_usec_fix_0(u, name, &s->defer_trigger_max_usec, message, flags, error);
 
         if (streq(name, "SmackLabel"))
                 return bus_set_transient_string(u, name, &s->smack, message, flags, error);
@@ -317,6 +326,9 @@ static int bus_socket_set_transient_property(
         if (streq(name, "SocketProtocol"))
                 return bus_set_transient_socket_protocol(u, name, &s->socket_protocol, message, flags, error);
 
+        if (streq(name, "PassFileDescriptorsToExec"))
+                return bus_set_transient_bool(u, name, &s->pass_fds_to_exec, message, flags, error);
+
         ci = socket_exec_command_from_string(name);
         if (ci >= 0)
                 return bus_set_transient_exec_command(u, name,
@@ -354,8 +366,9 @@ static int bus_socket_set_transient_property(
                 }
 
                 return 1;
+        }
 
-        } else if (streq(name, "Listen")) {
+        if (streq(name, "Listen")) {
                 const char *t, *a;
                 bool empty = true;
 
@@ -364,7 +377,7 @@ static int bus_socket_set_transient_property(
                         return r;
 
                 while ((r = sd_bus_message_read(message, "(ss)", &t, &a)) > 0) {
-                        _cleanup_free_ SocketPort *p = NULL;
+                        _cleanup_(socket_port_freep) SocketPort *p = NULL;
 
                         p = new(SocketPort, 1);
                         if (!p)
@@ -383,11 +396,9 @@ static int bus_socket_set_transient_property(
                                 if (!path_is_absolute(a) || !path_is_valid(a))
                                         return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Invalid socket path: %s", a);
 
-                                p->path = strdup(a);
-                                if (!p->path)
-                                        return log_oom();
-
-                                path_simplify(p->path);
+                                r = path_simplify_alloc(a, &p->path);
+                                if (r < 0)
+                                        return r;
 
                         } else if (streq(t, "Netlink")) {
                                 r = socket_address_parse_netlink(&p->address, a);
@@ -476,7 +487,7 @@ int bus_socket_set_property(
 int bus_socket_commit_properties(Unit *u) {
         assert(u);
 
-        unit_realize_cgroup(u);
+        (void) unit_realize_cgroup(u);
 
         return 0;
 }

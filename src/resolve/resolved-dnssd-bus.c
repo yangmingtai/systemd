@@ -1,17 +1,21 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
+#include "sd-bus.h"
+
 #include "alloc-util.h"
+#include "bus-object.h"
 #include "bus-polkit.h"
-#include "missing_capability.h"
-#include "resolved-dnssd-bus.h"
+#include "hashmap.h"
+#include "log.h"
+#include "resolved-dns-scope.h"
 #include "resolved-dnssd.h"
+#include "resolved-dnssd-bus.h"
 #include "resolved-link.h"
 #include "resolved-manager.h"
 #include "strv.h"
-#include "user-util.h"
 
 int bus_dnssd_method_unregister(sd_bus_message *message, void *userdata, sd_bus_error *error) {
-        DnssdService *s = ASSERT_PTR(userdata);
+        DnssdRegisteredService *s = ASSERT_PTR(userdata);
         Manager *m;
         Link *l;
         int r;
@@ -20,10 +24,14 @@ int bus_dnssd_method_unregister(sd_bus_message *message, void *userdata, sd_bus_
 
         m = s->manager;
 
-        r = bus_verify_polkit_async(message, CAP_SYS_ADMIN,
-                                    "org.freedesktop.resolve1.unregister-service",
-                                    NULL, false, s->originator,
-                                    &m->polkit_registry, error);
+        r = bus_verify_polkit_async_full(
+                        message,
+                        "org.freedesktop.resolve1.unregister-service",
+                        /* details= */ NULL,
+                        /* good_user= */ s->originator,
+                        /* flags= */ 0,
+                        &m->polkit_registry,
+                        error);
         if (r < 0)
                 return r;
         if (r == 0)
@@ -36,6 +44,7 @@ int bus_dnssd_method_unregister(sd_bus_message *message, void *userdata, sd_bus_
                                 log_warning_errno(r, "Failed to send goodbye messages in IPv4 scope: %m");
 
                         dns_zone_remove_rr(&l->mdns_ipv4_scope->zone, s->ptr_rr);
+                        dns_zone_remove_rr(&l->mdns_ipv4_scope->zone, s->sub_ptr_rr);
                         dns_zone_remove_rr(&l->mdns_ipv4_scope->zone, s->srv_rr);
                         LIST_FOREACH(items, txt_data, s->txt_data_items)
                                 dns_zone_remove_rr(&l->mdns_ipv4_scope->zone, txt_data->rr);
@@ -47,13 +56,14 @@ int bus_dnssd_method_unregister(sd_bus_message *message, void *userdata, sd_bus_
                                 log_warning_errno(r, "Failed to send goodbye messages in IPv6 scope: %m");
 
                         dns_zone_remove_rr(&l->mdns_ipv6_scope->zone, s->ptr_rr);
+                        dns_zone_remove_rr(&l->mdns_ipv6_scope->zone, s->sub_ptr_rr);
                         dns_zone_remove_rr(&l->mdns_ipv6_scope->zone, s->srv_rr);
                         LIST_FOREACH(items, txt_data, s->txt_data_items)
                                 dns_zone_remove_rr(&l->mdns_ipv6_scope->zone, txt_data->rr);
                 }
         }
 
-        dnssd_service_free(s);
+        dnssd_registered_service_free(s);
 
         manager_refresh_rrs(m);
 
@@ -63,7 +73,7 @@ int bus_dnssd_method_unregister(sd_bus_message *message, void *userdata, sd_bus_
 static int dnssd_object_find(sd_bus *bus, const char *path, const char *interface, void *userdata, void **found, sd_bus_error *error) {
         _cleanup_free_ char *name = NULL;
         Manager *m = ASSERT_PTR(userdata);
-        DnssdService *service;
+        DnssdRegisteredService *service;
         int r;
 
         assert(bus);
@@ -75,7 +85,7 @@ static int dnssd_object_find(sd_bus *bus, const char *path, const char *interfac
         if (r <= 0)
                 return 0;
 
-        service = hashmap_get(m->dnssd_services, name);
+        service = hashmap_get(m->dnssd_registered_services, name);
         if (!service)
                 return 0;
 
@@ -86,7 +96,7 @@ static int dnssd_object_find(sd_bus *bus, const char *path, const char *interfac
 static int dnssd_node_enumerator(sd_bus *bus, const char *path, void *userdata, char ***nodes, sd_bus_error *error) {
         _cleanup_strv_free_ char **l = NULL;
         Manager *m = ASSERT_PTR(userdata);
-        DnssdService *service;
+        DnssdRegisteredService *service;
         unsigned c = 0;
         int r;
 
@@ -94,14 +104,14 @@ static int dnssd_node_enumerator(sd_bus *bus, const char *path, void *userdata, 
         assert(path);
         assert(nodes);
 
-        l = new0(char*, hashmap_size(m->dnssd_services) + 1);
+        l = new0(char*, hashmap_size(m->dnssd_registered_services) + 1);
         if (!l)
                 return -ENOMEM;
 
-        HASHMAP_FOREACH(service, m->dnssd_services) {
+        HASHMAP_FOREACH(service, m->dnssd_registered_services) {
                 char *p;
 
-                r = sd_bus_path_encode("/org/freedesktop/resolve1/dnssd", service->name, &p);
+                r = sd_bus_path_encode("/org/freedesktop/resolve1/dnssd", service->id, &p);
                 if (r < 0)
                         return r;
 

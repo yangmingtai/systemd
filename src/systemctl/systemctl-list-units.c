@@ -1,18 +1,27 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
+#include "sd-bus.h"
 #include "sd-login.h"
 
+#include "alloc-util.h"
+#include "ansi-color.h"
 #include "bus-error.h"
 #include "bus-locator.h"
+#include "bus-message-util.h"
+#include "bus-unit-util.h"
+#include "bus-util.h"
 #include "format-table.h"
-#include "locale-util.h"
+#include "glyph-util.h"
 #include "path-util.h"
 #include "set.h"
 #include "sort-util.h"
+#include "string-util.h"
+#include "strv.h"
+#include "systemctl.h"
 #include "systemctl-list-units.h"
 #include "systemctl-util.h"
-#include "systemctl.h"
-#include "terminal-util.h"
+#include "unit-def.h"
+#include "unit-name.h"
 
 static int get_unit_list_recursive(
                 sd_bus *bus,
@@ -127,49 +136,69 @@ static int output_units_list(const UnitInfo *unit_infos, size_t c) {
         table_set_ersatz_string(table, TABLE_ERSATZ_DASH);
 
         FOREACH_ARRAY(u, unit_infos, c) {
+                const char *on_loaded = NULL, *on_active = NULL, *on_sub = NULL, *on_circle = NULL;
                 _cleanup_free_ char *id = NULL;
-                const char *on_underline = "", *on_loaded = "", *on_active = "", *on_circle = "";
-                bool circle = false, underline = false;
+                bool circle = false, underline;
 
-                if (u + 1 < unit_infos + c &&
-                    !streq(unit_type_suffix(u->id), unit_type_suffix((u + 1)->id))) {
-                        on_underline = ansi_underline();
-                        underline = true;
+                underline = u + 1 < unit_infos + c && !streq(unit_type_suffix(u->id), unit_type_suffix((u + 1)->id));
+
+                if (streq(u->load_state, "not-found")) {
+                        on_circle = on_loaded = ansi_highlight_yellow();
+                        circle = true;
+                } else if (STR_IN_SET(u->load_state, "bad-setting", "error", "masked")) {
+                        on_loaded = ansi_highlight_red();
+                        on_circle = ansi_highlight_yellow();
+                        circle = true;
                 }
 
-                if (STR_IN_SET(u->load_state, "error", "not-found", "bad-setting", "masked") && !arg_plain) {
-                        on_circle = underline ? ansi_highlight_yellow_underline() : ansi_highlight_yellow();
+                if (streq(u->active_state, "failed")) {
+                        on_sub = on_active = ansi_highlight_red();
+
+                        /* Here override any load_state highlighting */
+                        on_circle = ansi_highlight_red();
                         circle = true;
-                        on_loaded = underline ? ansi_highlight_red_underline() : ansi_highlight_red();
-                } else if (streq(u->active_state, "failed") && !arg_plain) {
-                        on_circle = underline ? ansi_highlight_red_underline() : ansi_highlight_red();
-                        circle = true;
-                        on_active = underline ? ansi_highlight_red_underline() : ansi_highlight_red();
-                } else {
-                        on_circle = on_underline;
-                        on_active = on_underline;
-                        on_loaded = on_underline;
-                }
+                } else if (STR_IN_SET(u->active_state, "reloading", "activating", "maintenance", "refreshing", "deactivating")) {
+                        on_sub = on_active = ansi_highlight();
+
+                        if (!circle) { /* Here we let load_state highlighting win */
+                                on_circle = ansi_highlight();
+                                circle = true;
+                        }
+                } else if (streq(u->active_state, "inactive"))
+                        on_sub = on_active = ansi_grey();
+
+                /* As a special case, when this is a service which has not process running, let's grey out
+                 * its state, to highlight that a bit */
+                if (!on_sub && endswith(u->id, ".service") && streq(u->sub_state, "exited"))
+                        on_sub = ansi_grey();
+
+                if (arg_plain)
+                        circle = false;
 
                 id = format_unit_id(u->id, u->machine);
                 if (!id)
                         return log_oom();
 
                 r = table_add_many(table,
-                                   TABLE_STRING, circle ? special_glyph(SPECIAL_GLYPH_BLACK_CIRCLE) : " ",
-                                   TABLE_SET_BOTH_COLORS, on_circle,
+                                   TABLE_STRING, circle ? glyph(GLYPH_BLACK_CIRCLE) : " ",
+                                   TABLE_SET_COLOR, on_circle,
+                                   TABLE_SET_BOTH_UNDERLINES, underline,
                                    TABLE_STRING, id,
-                                   TABLE_SET_BOTH_COLORS, on_active,
+                                   TABLE_SET_COLOR, on_active,
+                                   TABLE_SET_BOTH_UNDERLINES, underline,
                                    TABLE_STRING, u->load_state,
-                                   TABLE_SET_BOTH_COLORS, on_loaded,
+                                   TABLE_SET_COLOR, on_loaded,
+                                   TABLE_SET_BOTH_UNDERLINES, underline,
                                    TABLE_STRING, u->active_state,
-                                   TABLE_SET_BOTH_COLORS, on_active,
+                                   TABLE_SET_COLOR, on_active,
+                                   TABLE_SET_BOTH_UNDERLINES, underline,
                                    TABLE_STRING, u->sub_state,
-                                   TABLE_SET_BOTH_COLORS, on_active,
+                                   TABLE_SET_COLOR, on_sub,
+                                   TABLE_SET_BOTH_UNDERLINES, underline,
                                    TABLE_STRING, u->job_id ? u->job_type: "",
-                                   TABLE_SET_BOTH_COLORS, on_underline,
+                                   TABLE_SET_BOTH_UNDERLINES, underline,
                                    TABLE_STRING, u->description,
-                                   TABLE_SET_BOTH_COLORS, on_underline);
+                                   TABLE_SET_BOTH_UNDERLINES, underline);
                 if (r < 0)
                         return table_log_add_error(r);
 
@@ -193,25 +222,35 @@ static int output_units_list(const UnitInfo *unit_infos, size_t c) {
                 size_t records = table_get_rows(table) - 1;
 
                 if (records > 0) {
-                        puts("\n"
-                             "LOAD   = Reflects whether the unit definition was properly loaded.\n"
-                             "ACTIVE = The high-level unit activation state, i.e. generalization of SUB.\n"
-                             "SUB    = The low-level unit activation state, values depend on unit type.");
+                        printf("\n"
+                               "%1$sLegend: LOAD   %2$s Reflects whether the unit definition was properly loaded.%3$s\n"
+                               "%1$s        ACTIVE %2$s The high-level unit activation state, i.e. generalization of SUB.%3$s\n"
+                               "%1$s        SUB    %2$s The low-level unit activation state, values depend on unit type.%3$s\n",
+                               ansi_grey(),
+                               glyph(GLYPH_ARROW_RIGHT),
+                               ansi_normal());
                         if (job_count > 0)
-                                puts("JOB    = Pending job for the unit.\n");
+                                printf("%s        JOB    %s Pending job for the unit.%s\n",
+                                       ansi_grey(),
+                                       glyph(GLYPH_ARROW_RIGHT),
+                                       ansi_normal());
                 }
+
+                putchar('\n');
 
                 on = records > 0 ? ansi_highlight() : ansi_highlight_red();
                 off = ansi_normal();
 
                 if (arg_all || strv_contains(arg_states, "inactive"))
                         printf("%s%zu loaded units listed.%s\n"
-                               "To show all installed unit files use 'systemctl list-unit-files'.\n",
-                               on, records, off);
+                               "%sTo show all installed unit files use 'systemctl list-unit-files'.%s\n",
+                               on, records, off,
+                               ansi_grey(), ansi_normal());
                 else if (!arg_states)
-                        printf("%s%zu loaded units listed.%s Pass --all to see loaded but inactive units, too.\n"
-                               "To show all installed unit files use 'systemctl list-unit-files'.\n",
-                               on, records, off);
+                        printf("%s%zu loaded units listed.%s %sPass --all to see loaded but inactive units, too.%s\n"
+                               "%sTo show all installed unit files use 'systemctl list-unit-files'.%s\n",
+                               on, records, off,
+                               ansi_grey(), ansi_normal(), ansi_grey(), ansi_normal());
                 else
                         printf("%zu loaded units listed.\n", records);
         }
@@ -536,9 +575,10 @@ static int get_next_elapse(
 static int get_last_trigger(
                 sd_bus *bus,
                 const char *path,
-                usec_t *last) {
+                dual_timestamp *last) {
 
         _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
+        dual_timestamp t;
         int r;
 
         assert(bus);
@@ -553,10 +593,23 @@ static int get_last_trigger(
                         "LastTriggerUSec",
                         &error,
                         't',
-                        last);
+                        &t.realtime);
         if (r < 0)
                 return log_error_errno(r, "Failed to get last trigger time: %s", bus_error_message(&error, r));
 
+        r = sd_bus_get_property_trivial(
+                        bus,
+                        "org.freedesktop.systemd1",
+                        path,
+                        "org.freedesktop.systemd1.Timer",
+                        "LastTriggerUSecMonotonic",
+                        &error,
+                        't',
+                        &t.monotonic);
+        if (r < 0)
+                return log_error_errno(r, "Failed to get last trigger time: %s", bus_error_message(&error, r));
+
+        *last = t;
         return 0;
 }
 
@@ -564,7 +617,7 @@ typedef struct TimerInfo {
         const char* machine;
         const char* id;
         usec_t next_elapse;
-        usec_t last_trigger;
+        dual_timestamp last_trigger;
         char **triggered;
 } TimerInfo;
 
@@ -623,8 +676,8 @@ static int output_timers_list(const TimerInfo *timers, size_t n_timers) {
                 r = table_add_many(table,
                                    TABLE_TIMESTAMP, t->next_elapse,
                                    TABLE_TIMESTAMP_LEFT, t->next_elapse,
-                                   TABLE_TIMESTAMP, t->last_trigger,
-                                   TABLE_TIMESTAMP_RELATIVE, t->last_trigger,
+                                   TABLE_TIMESTAMP, t->last_trigger.realtime,
+                                   TABLE_TIMESTAMP_RELATIVE_MONOTONIC, t->last_trigger.monotonic,
                                    TABLE_STRING, unit);
                 if (r < 0)
                         return table_log_add_error(r);
@@ -677,8 +730,8 @@ static int add_timer_info(
                 size_t *n_timers) {
 
         _cleanup_strv_free_ char **triggered = NULL;
-        dual_timestamp next = DUAL_TIMESTAMP_NULL;
-        usec_t m, last = 0;
+        dual_timestamp next, last;
+        usec_t m;
         int r;
 
         assert(bus);
@@ -747,7 +800,7 @@ int verb_list_timers(int argc, char *argv[], void *userdata) {
                 if (n < 0)
                         return n;
 
-                dual_timestamp_get(&nw);
+                dual_timestamp_now(&nw);
 
                 FOREACH_ARRAY(u, unit_infos, n) {
                         r = add_timer_info(bus, u, &nw, &timers, &n_timers);

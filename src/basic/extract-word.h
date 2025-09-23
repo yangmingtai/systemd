@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include "macro.h"
+#include "forward.h"
 
 typedef enum ExtractFlags {
         EXTRACT_RELAX                    = 1 << 0, /* Allow unbalanced quote and eat up trailing backslash. */
@@ -19,4 +19,7 @@ typedef enum ExtractFlags {
 
 int extract_first_word(const char **p, char **ret, const char *separators, ExtractFlags flags);
 int extract_first_word_and_warn(const char **p, char **ret, const char *separators, ExtractFlags flags, const char *unit, const char *filename, unsigned line, const char *rvalue);
-int extract_many_words(const char **p, const char *separators, unsigned flags, ...) _sentinel_;
+
+int extract_many_words_internal(const char **p, const char *separators, unsigned flags, ...) _sentinel_;
+#define extract_many_words(p, separators, flags, ...) \
+        extract_many_words_internal(p, separators, flags, ##__VA_ARGS__, NULL)

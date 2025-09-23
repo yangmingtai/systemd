@@ -1,17 +1,11 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <errno.h>
-#include <stdio.h>
-#include <unistd.h>
-
-#include "format-util.h"
-#include "install-printf.h"
+#include "alloc-util.h"
 #include "install.h"
-#include "macro.h"
+#include "install-printf.h"
 #include "specifier.h"
 #include "string-util.h"
 #include "unit-name.h"
-#include "user-util.h"
 
 static int specifier_prefix_and_instance(char specifier, const void *data, const char *root, const void *userdata, char **ret) {
         const InstallInfo *i = ASSERT_PTR(userdata);
@@ -37,16 +31,11 @@ static int specifier_prefix_and_instance(char specifier, const void *data, const
 
 static int specifier_name(char specifier, const void *data, const char *root, const void *userdata, char **ret) {
         const InstallInfo *i = ASSERT_PTR(userdata);
-        char *ans;
 
         if (unit_name_is_valid(i->name, UNIT_NAME_TEMPLATE) && i->default_instance)
                 return unit_name_replace_instance(i->name, i->default_instance, ret);
 
-        ans = strdup(i->name);
-        if (!ans)
-                return -ENOMEM;
-        *ret = ans;
-        return 0;
+        return strdup_to(ret, i->name);
 }
 
 static int specifier_prefix(char specifier, const void *data, const char *root, const void *userdata, char **ret) {
@@ -86,14 +75,10 @@ static int specifier_last_component(char specifier, const void *data, const char
                 return r;
 
         dash = strrchr(prefix, '-');
-        if (dash) {
-                dash = strdup(dash + 1);
-                if (!dash)
-                        return -ENOMEM;
-                *ret = dash;
-        } else
-                *ret = TAKE_PTR(prefix);
+        if (dash)
+                return strdup_to(ret, dash + 1);
 
+        *ret = TAKE_PTR(prefix);
         return 0;
 }
 

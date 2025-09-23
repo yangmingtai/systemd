@@ -1,11 +1,21 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: LGPL-2.1-or-later
 
-# pylint: disable=missing-docstring,redefined-outer-name,invalid-name
+# The tests can be called via pytest:
+#   PATH=build/:$PATH pytest -v src/ukify/test/test_ukify.py
+# or directly:
+#   PATH=build/:$PATH src/ukify/test/test_ukify.py
+# or via the meson test machinery output:
+#   meson test -C build test-ukify -v
+# or without verbose output:
+#   meson test -C build test-ukify
+
 # pylint: disable=unused-import,import-outside-toplevel,useless-else-on-loop
 # pylint: disable=consider-using-with,wrong-import-position,unspecified-encoding
+# pylint: disable=protected-access,redefined-outer-name
 
 import base64
+import glob
 import json
 import os
 import pathlib
@@ -35,6 +45,28 @@ except ImportError as e:
 sys.path.append(os.path.dirname(__file__) + '/..')
 import ukify
 
+# Skip if we're running on an architecture that does not use UEFI.
+try:
+    ukify.guess_efi_arch()
+except ValueError as e:
+    print(str(e), file=sys.stderr)
+    sys.exit(77)
+
+build_root = os.getenv('PROJECT_BUILD_ROOT')
+try:
+    slow_tests = bool(int(os.getenv('SYSTEMD_SLOW_TESTS', '1')))
+except ValueError:
+    slow_tests = True
+
+arg_tools = ['--tools', build_root] if build_root else []
+if build_root and (
+        p := pathlib.Path(f"{build_root}/linux{ukify.guess_efi_arch()}.efi.stub")
+).exists():
+    arg_tools += ['--stub', p]
+
+def systemd_measure():
+    opts = ukify.create_parser().parse_args(arg_tools)
+    return ukify.find_tool('systemd-measure', opts=opts)
 
 def test_guess_efi_arch():
     arch = ukify.guess_efi_arch()
@@ -50,9 +82,9 @@ def test_round_up():
     assert ukify.round_up(4097) == 8192
 
 def test_namespace_creation():
-    ns = ukify.create_parser().parse_args(('A','B'))
-    assert ns.linux == pathlib.Path('A')
-    assert ns.initrd == [pathlib.Path('B')]
+    ns = ukify.create_parser().parse_args(())
+    assert ns.linux is None
+    assert ns.initrd is None
 
 def test_config_example():
     ex = ukify.config_example()
@@ -87,7 +119,7 @@ def test_apply_config(tmp_path):
         Phases = {':'.join(ukify.KNOWN_PHASES)}
         '''))
 
-    ns = ukify.create_parser().parse_args(('A','B'))
+    ns = ukify.create_parser().parse_args(['build'])
     ns.linux = None
     ns.initrd = []
     ukify.apply_config(ns, config)
@@ -106,11 +138,11 @@ def test_apply_config(tmp_path):
     assert ns.signing_engine == 'engine1'
     assert ns.sb_key == 'some/path5'
     assert ns.sb_cert == 'some/path6'
-    assert ns.sign_kernel == False
+    assert ns.sign_kernel is False
 
     assert ns._groups == ['NAME']
-    assert ns.pcr_private_keys == [pathlib.Path('some/path7')]
-    assert ns.pcr_public_keys == [pathlib.Path('some/path8')]
+    assert ns.pcr_private_keys == ['some/path7']
+    assert ns.pcr_public_keys == ['some/path8']
     assert ns.phase_path_groups == [['enter-initrd:leave-initrd:sysinit:ready:shutdown:final']]
 
     ukify.finalize_options(ns)
@@ -128,22 +160,25 @@ def test_apply_config(tmp_path):
     assert ns.pcr_banks == ['sha512', 'sha1']
     assert ns.signing_engine == 'engine1'
     assert ns.sb_key == 'some/path5'
-    assert ns.sb_cert == 'some/path6'
-    assert ns.sign_kernel == False
+    assert ns.sb_cert == pathlib.Path('some/path6')
+    assert ns.sign_kernel is False
 
     assert ns._groups == ['NAME']
-    assert ns.pcr_private_keys == [pathlib.Path('some/path7')]
-    assert ns.pcr_public_keys == [pathlib.Path('some/path8')]
+    assert ns.pcr_private_keys == ['some/path7']
+    assert ns.pcr_public_keys == ['some/path8']
     assert ns.phase_path_groups == [['enter-initrd:leave-initrd:sysinit:ready:shutdown:final']]
 
 def test_parse_args_minimal():
+    with pytest.raises(ValueError):
+        ukify.parse_args([])
+
     opts = ukify.parse_args('arg1 arg2'.split())
     assert opts.linux == pathlib.Path('arg1')
     assert opts.initrd == [pathlib.Path('arg2')]
     assert opts.os_release in (pathlib.Path('/etc/os-release'),
                                pathlib.Path('/usr/lib/os-release'))
 
-def test_parse_args_many():
+def test_parse_args_many_deprecated():
     opts = ukify.parse_args(
         ['/ARG1', '///ARG2', '/ARG3 WITH SPACE',
          '--cmdline=a b c',
@@ -175,20 +210,71 @@ def test_parse_args_many():
     assert opts.pcrpkey == pathlib.Path('PATH')
     assert opts.uname == '1.2.3'
     assert opts.stub == pathlib.Path('STUBPATH')
-    assert opts.pcr_private_keys == [pathlib.Path('PKEY1')]
-    assert opts.pcr_public_keys == [pathlib.Path('PKEY2')]
+    assert opts.pcr_private_keys == ['PKEY1']
+    assert opts.pcr_public_keys == ['PKEY2']
     assert opts.pcr_banks == ['SHA1', 'SHA256']
     assert opts.signing_engine == 'ENGINE'
     assert opts.sb_key == 'SBKEY'
-    assert opts.sb_cert == 'SBCERT'
+    assert opts.sb_cert == pathlib.Path('SBCERT')
     assert opts.sign_kernel is False
     assert opts.tools == [pathlib.Path('TOOLZ/')]
     assert opts.output == pathlib.Path('OUTPUT')
     assert opts.measure is False
 
+def test_parse_args_many():
+    opts = ukify.parse_args(
+        ['build',
+         '--linux=/ARG1',
+         '--initrd=///ARG2',
+         '--initrd=/ARG3 WITH SPACE',
+         '--cmdline=a b c',
+         '--os-release=K1=V1\nK2=V2',
+         '--devicetree=DDDDTTTT',
+         '--splash=splash',
+         '--pcrpkey=PATH',
+         '--uname=1.2.3',
+         '--stub=STUBPATH',
+         '--pcr-private-key=PKEY1',
+         '--pcr-public-key=PKEY2',
+         '--pcr-banks=SHA1,SHA256',
+         '--signing-engine=ENGINE',
+         '--secureboot-private-key=SBKEY',
+         '--secureboot-certificate=SBCERT',
+         '--sign-kernel',
+         '--no-sign-kernel',
+         '--tools=TOOLZ///',
+         '--output=OUTPUT',
+         '--measure',
+         '--no-measure',
+         '--policy-digest',
+         '--no-policy-digest',
+         ])
+    assert opts.linux == pathlib.Path('/ARG1')
+    assert opts.initrd == [pathlib.Path('/ARG2'), pathlib.Path('/ARG3 WITH SPACE')]
+    assert opts.cmdline == 'a b c'
+    assert opts.os_release == 'K1=V1\nK2=V2'
+    assert opts.devicetree == pathlib.Path('DDDDTTTT')
+    assert opts.splash == pathlib.Path('splash')
+    assert opts.pcrpkey == pathlib.Path('PATH')
+    assert opts.uname == '1.2.3'
+    assert opts.stub == pathlib.Path('STUBPATH')
+    assert opts.pcr_private_keys == ['PKEY1']
+    assert opts.pcr_public_keys == ['PKEY2']
+    assert opts.pcr_banks == ['SHA1', 'SHA256']
+    assert opts.signing_engine == 'ENGINE'
+    assert opts.sb_key == 'SBKEY'
+    assert opts.sb_cert == pathlib.Path('SBCERT')
+    assert opts.sign_kernel is False
+    assert opts.tools == [pathlib.Path('TOOLZ/')]
+    assert opts.output == pathlib.Path('OUTPUT')
+    assert opts.measure is False
+    assert opts.policy_digest is False
+
 def test_parse_sections():
     opts = ukify.parse_args(
-        ['/ARG1', '/ARG2',
+        ['build',
+         '--linux=/ARG1',
+         '--initrd=/ARG2',
          '--section=test:TESTTESTTEST',
          '--section=test2:@FILE',
          ])
@@ -209,6 +295,7 @@ def test_parse_sections():
 
 def test_config_priority(tmp_path):
     config = tmp_path / 'config1.conf'
+    # config: use pesign and give certdir + certname
     config.write_text(textwrap.dedent(
         f'''
         [UKI]
@@ -225,10 +312,8 @@ def test_config_priority(tmp_path):
         Stub = some/path4
         PCRBanks = sha512,sha1
         SigningEngine = engine1
-        SignTool = pesign
-        SecureBootPrivateKey = some/path5
-        SecureBootCertificate = some/path6
-        SecureBootCertificateDir = some/path7
+        SecureBootSigningTool = pesign
+        SecureBootCertificateDir = some/path5
         SecureBootCertificateName = some/name1
         SignKernel = no
 
@@ -238,8 +323,12 @@ def test_config_priority(tmp_path):
         Phases = {':'.join(ukify.KNOWN_PHASES)}
         '''))
 
+    # args: use sbsign and give key + cert, should override pesign
     opts = ukify.parse_args(
-        ['/ARG1', '///ARG2', '/ARG3 WITH SPACE',
+        ['build',
+         '--linux=/ARG1',
+         '--initrd=///ARG2',
+         '--initrd=/ARG3 WITH SPACE',
          '--cmdline= a  b  c ',
          '--os-release=K1=V1\nK2=V2',
          '--devicetree=DDDDTTTT',
@@ -251,11 +340,9 @@ def test_config_priority(tmp_path):
          '--pcr-public-key=PKEY2',
          '--pcr-banks=SHA1,SHA256',
          '--signing-engine=ENGINE',
-         '--signtool=pesign',
+         '--signtool=sbsign',
          '--secureboot-private-key=SBKEY',
          '--secureboot-certificate=SBCERT',
-         '--secureboot-certificate-dir=SBPATH',
-         '--secureboot-certificate-name=SBNAME',
          '--sign-kernel',
          '--no-sign-kernel',
          '--tools=TOOLZ///',
@@ -279,17 +366,15 @@ def test_config_priority(tmp_path):
     assert opts.pcrpkey == pathlib.Path('PATH')
     assert opts.uname == '1.2.3'
     assert opts.stub == pathlib.Path('STUBPATH')
-    assert opts.pcr_private_keys == [pathlib.Path('PKEY1'),
-                                     pathlib.Path('some/path7')]
-    assert opts.pcr_public_keys == [pathlib.Path('PKEY2'),
-                                    pathlib.Path('some/path8')]
+    assert opts.pcr_private_keys == ['PKEY1', 'some/path7']
+    assert opts.pcr_public_keys == ['PKEY2', 'some/path8']
     assert opts.pcr_banks == ['SHA1', 'SHA256']
     assert opts.signing_engine == 'ENGINE'
-    assert opts.signtool == 'pesign'
-    assert opts.sb_key == 'SBKEY'
-    assert opts.sb_cert == 'SBCERT'
-    assert opts.sb_certdir == 'SBPATH'
-    assert opts.sb_cert_name == 'SBNAME'
+    assert opts.signtool == 'sbsign' # from args
+    assert opts.sb_key == 'SBKEY' # from args
+    assert opts.sb_cert == pathlib.Path('SBCERT') # from args
+    assert opts.sb_certdir == 'some/path5' # from config
+    assert opts.sb_cert_name == 'some/name1' # from config
     assert opts.sign_kernel is False
     assert opts.tools == [pathlib.Path('TOOLZ/')]
     assert opts.output == pathlib.Path('OUTPUT')
@@ -302,7 +387,14 @@ def test_help(capsys):
     assert '--section' in out.out
     assert not out.err
 
-def test_help_error(capsys):
+def test_help_display(capsys):
+    with pytest.raises(SystemExit):
+        ukify.parse_args(['inspect', '--help'])
+    out = capsys.readouterr()
+    assert '--section' in out.out
+    assert not out.err
+
+def test_help_error_deprecated(capsys):
     with pytest.raises(SystemExit):
         ukify.parse_args(['a', 'b', '--no-such-option'])
     out = capsys.readouterr()
@@ -310,25 +402,29 @@ def test_help_error(capsys):
     assert '--no-such-option' in out.err
     assert len(out.err.splitlines()) == 1
 
+def test_help_error(capsys):
+    with pytest.raises(SystemExit):
+        ukify.parse_args(['build', '--no-such-option'])
+    out = capsys.readouterr()
+    assert not out.out
+    assert '--no-such-option' in out.err
+    assert len(out.err.splitlines()) == 1
+
 @pytest.fixture(scope='session')
 def kernel_initrd():
-    try:
-        text = subprocess.check_output(['bootctl', 'list', '--json=short'],
-                                       text=True)
-    except subprocess.CalledProcessError:
+    items = sorted(glob.glob('/lib/modules/*/vmlinuz'))
+    if not items:
+        items = sorted(glob.glob('/boot/vmlinuz*'))
+    if not items:
         return None
 
-    items = json.loads(text)
+    # This doesn't necessarily give us the latest version, since we're just
+    # using alphanumeric ordering. But this is fine, a predictable result is
+    # enough.
+    linux = items[-1]
 
-    for item in items:
-        try:
-            linux = f"{item['root']}{item['linux']}"
-            initrd = f"{item['root']}{item['initrd'][0].split(' ')[0]}"
-        except (KeyError, IndexError):
-            continue
-        return [linux, initrd]
-    else:
-        return None
+    # We don't look _into_ the initrd. Any file is OK.
+    return ['--linux', linux, '--initrd', ukify.__file__]
 
 def test_check_splash():
     try:
@@ -340,12 +436,16 @@ def test_check_splash():
     with pytest.raises(OSError):
         ukify.check_splash(os.devnull)
 
-def test_basic_operation(kernel_initrd, tmpdir):
+def test_basic_operation(kernel_initrd, tmp_path):
     if kernel_initrd is None:
         pytest.skip('linux+initrd not found')
 
-    output = f'{tmpdir}/basic.efi'
-    opts = ukify.parse_args(kernel_initrd + [f'--output={output}'])
+    output = f'{tmp_path}/basic.efi'
+    opts = ukify.parse_args([
+        'build',
+        *kernel_initrd,
+        f'--output={output}',
+    ])
     try:
         ukify.check_inputs(opts)
     except OSError as e:
@@ -356,12 +456,15 @@ def test_basic_operation(kernel_initrd, tmpdir):
     # let's check that objdump likes the resulting file
     subprocess.check_output(['objdump', '-h', output])
 
-def test_sections(kernel_initrd, tmpdir):
+    shutil.rmtree(tmp_path)
+
+def test_sections(kernel_initrd, tmp_path):
     if kernel_initrd is None:
         pytest.skip('linux+initrd not found')
 
-    output = f'{tmpdir}/basic.efi'
+    output = f'{tmp_path}/basic.efi'
     opts = ukify.parse_args([
+        'build',
         *kernel_initrd,
         f'--output={output}',
         '--uname=1.2.3',
@@ -381,19 +484,35 @@ def test_sections(kernel_initrd, tmpdir):
     dump = subprocess.check_output(['objdump', '-h', output], text=True)
 
     for sect in 'text osrel cmdline linux initrd uname test'.split():
-        assert re.search(fr'^\s*\d+\s+.{sect}\s+0', dump, re.MULTILINE)
+        assert re.search(fr'^\s*\d+\s+\.{sect}\s+[0-9a-f]+', dump, re.MULTILINE)
 
-def test_addon(kernel_initrd, tmpdir):
-    output = f'{tmpdir}/addon.efi'
-    opts = ukify.parse_args([
+    shutil.rmtree(tmp_path)
+
+def test_addon(tmp_path):
+    output = f'{tmp_path}/addon.efi'
+    args = [
+        'build',
         f'--output={output}',
         '--cmdline=ARG1 ARG2 ARG3',
+        """--sbat=sbat,1,foo
+foo,1
+bar,2
+""",
         '--section=.test:CONTENTZ',
-    ])
+        """--sbat=sbat,1,foo
+baz,3
+"""
+    ]
+    if stub := os.getenv('EFI_ADDON'):
+        args += [f'--stub={stub}']
+        expected_exceptions = ()
+    else:
+        expected_exceptions = (FileNotFoundError,)
 
+    opts = ukify.parse_args(args)
     try:
         ukify.check_inputs(opts)
-    except OSError as e:
+    except expected_exceptions as e:
         pytest.skip(str(e))
 
     ukify.make_uki(opts)
@@ -401,9 +520,20 @@ def test_addon(kernel_initrd, tmpdir):
     # let's check that objdump likes the resulting file
     dump = subprocess.check_output(['objdump', '-h', output], text=True)
 
-    for sect in 'text cmdline test'.split():
-        assert re.search(fr'^\s*\d+\s+.{sect}\s+0', dump, re.MULTILINE)
+    for sect in 'text cmdline test sbat'.split():
+        assert re.search(fr'^\s*\d+\s+\.{sect}\s+[0-9a-f]+', dump, re.MULTILINE)
 
+    pe = pefile.PE(output, fast_load=True)
+    found = False
+
+    for section in pe.sections:
+        if section.Name.rstrip(b"\x00").decode() == ".sbat":
+            assert found is False
+            split = section.get_data().rstrip(b"\x00").decode().splitlines()
+            assert split == ["sbat,1,SBAT Version,sbat,1,https://github.com/rhboot/shim/blob/main/SBAT.md", "foo,1", "bar,2", "baz,3"]
+            found = True
+
+    assert found is True
 
 def unbase64(filename):
     tmp = tempfile.NamedTemporaryFile()
@@ -411,15 +541,17 @@ def unbase64(filename):
     tmp.flush()
     return tmp
 
-
 def test_uname_scraping(kernel_initrd):
     if kernel_initrd is None:
         pytest.skip('linux+initrd not found')
 
-    uname = ukify.Uname.scrape(kernel_initrd[0])
+    assert kernel_initrd[0] == '--linux'
+    uname = ukify.Uname.scrape(kernel_initrd[1])
     assert re.match(r'\d+\.\d+\.\d+', uname)
 
-def test_efi_signing_sbsign(kernel_initrd, tmpdir):
+@pytest.mark.skipif(not slow_tests, reason='slow')
+@pytest.mark.parametrize("days", [365*10, None])
+def test_efi_signing_sbsign(days, kernel_initrd, tmp_path):
     if kernel_initrd is None:
         pytest.skip('linux+initrd not found')
     if not shutil.which('sbsign'):
@@ -429,15 +561,20 @@ def test_efi_signing_sbsign(kernel_initrd, tmpdir):
     cert = unbase64(ourdir / 'example.signing.crt.base64')
     key = unbase64(ourdir / 'example.signing.key.base64')
 
-    output = f'{tmpdir}/signed.efi'
-    opts = ukify.parse_args([
+    output = f'{tmp_path}/signed.efi'
+    args = [
+        'build',
         *kernel_initrd,
         f'--output={output}',
         '--uname=1.2.3',
         '--cmdline=ARG1 ARG2 ARG3',
         f'--secureboot-certificate={cert.name}',
         f'--secureboot-private-key={key.name}',
-    ])
+    ]
+    if days is not None:
+        args += [f'--secureboot-certificate-validity={days}']
+
+    opts = ukify.parse_args(args)
 
     try:
         ukify.check_inputs(opts)
@@ -456,13 +593,16 @@ def test_efi_signing_sbsign(kernel_initrd, tmpdir):
 
         assert 'Signature verification OK' in dump
 
-def test_efi_signing_pesign(kernel_initrd, tmpdir):
+    shutil.rmtree(tmp_path)
+
+@pytest.mark.skipif(not slow_tests, reason='slow')
+def test_efi_signing_pesign(kernel_initrd, tmp_path):
     if kernel_initrd is None:
         pytest.skip('linux+initrd not found')
     if not shutil.which('pesign'):
         pytest.skip('pesign not found')
 
-    nss_db = f'{tmpdir}/nss_db'
+    nss_db = f'{tmp_path}/nss_db'
     name = 'Test_Secureboot'
     author = 'systemd'
 
@@ -472,8 +612,9 @@ def test_efi_signing_pesign(kernel_initrd, tmpdir):
     cmd = f'efikeygen -d {nss_db} -S -k -c CN={author} -n {name}'.split(' ')
     subprocess.check_call(cmd)
 
-    output = f'{tmpdir}/signed.efi'
+    output = f'{tmp_path}/signed.efi'
     opts = ukify.parse_args([
+        'build',
         *kernel_initrd,
         f'--output={output}',
         '--uname=1.2.3',
@@ -490,7 +631,7 @@ def test_efi_signing_pesign(kernel_initrd, tmpdir):
 
     ukify.make_uki(opts)
 
-    # let's check that sbverify likes the resulting file
+    # let's check that pesign likes the resulting file
     dump = subprocess.check_output([
         'pesign', '-S',
         '-i', output,
@@ -498,74 +639,138 @@ def test_efi_signing_pesign(kernel_initrd, tmpdir):
 
     assert f"The signer's common name is {author}" in dump
 
-def test_pcr_signing(kernel_initrd, tmpdir):
+    shutil.rmtree(tmp_path)
+
+def test_inspect(kernel_initrd, tmp_path, capsys):
     if kernel_initrd is None:
         pytest.skip('linux+initrd not found')
-    if os.getuid() != 0:
-        pytest.skip('must be root to access tpm2')
-    if subprocess.call(['systemd-creds', 'has-tpm2', '-q']) != 0:
-        pytest.skip('tpm2 is not available')
+    if not shutil.which('sbsign'):
+        pytest.skip('sbsign not found')
+
+    ourdir = pathlib.Path(__file__).parent
+    cert = unbase64(ourdir / 'example.signing.crt.base64')
+    key = unbase64(ourdir / 'example.signing.key.base64')
+
+    output = f'{tmp_path}/signed2.efi'
+    uname_arg='1.2.3'
+    osrel_arg='Linux'
+    cmdline_arg='ARG1 ARG2 ARG3'
+
+    args = [
+        'build',
+        *kernel_initrd,
+        f'--cmdline={cmdline_arg}',
+        f'--os-release={osrel_arg}',
+        f'--uname={uname_arg}',
+        f'--output={output}',
+    ] + arg_tools
+    if slow_tests:
+        args += [
+            f'--secureboot-certificate={cert.name}',
+            f'--secureboot-private-key={key.name}',
+        ]
+
+    opts = ukify.parse_args(args)
+
+    ukify.check_inputs(opts)
+    ukify.make_uki(opts)
+
+    opts = ukify.parse_args(['inspect', output])
+    ukify.inspect_sections(opts)
+
+    text = capsys.readouterr().out
+
+    expected_osrel = f'.osrel:\n  size: {len(osrel_arg)}'
+    assert expected_osrel in text
+    expected_cmdline = f'.cmdline:\n  size: {len(cmdline_arg)}'
+    assert expected_cmdline in text
+    expected_uname = f'.uname:\n  size: {len(uname_arg)}'
+    assert expected_uname in text
+
+    expected_initrd = '.initrd:\n  size:'
+    assert expected_initrd in text
+    expected_linux = '.linux:\n  size:'
+    assert expected_linux in text
+
+    shutil.rmtree(tmp_path)
+
+@pytest.mark.skipif(not slow_tests, reason='slow')
+def test_pcr_signing(kernel_initrd, tmp_path):
+    if kernel_initrd is None:
+        pytest.skip('linux+initrd not found')
+    try:
+        systemd_measure()
+    except ValueError:
+        pytest.skip('systemd-measure not found')
 
     ourdir = pathlib.Path(__file__).parent
     pub = unbase64(ourdir / 'example.tpm2-pcr-public.pem.base64')
     priv = unbase64(ourdir / 'example.tpm2-pcr-private.pem.base64')
 
-    output = f'{tmpdir}/signed.efi'
-    opts = ukify.parse_args([
+    output = f'{tmp_path}/signed.efi'
+    args = [
+        'build',
         *kernel_initrd,
         f'--output={output}',
         '--uname=1.2.3',
         '--cmdline=ARG1 ARG2 ARG3',
         '--os-release=ID=foobar\n',
-        '--pcr-banks=sha1',   # use sha1 as that is most likely to be supported
-        f'--pcrpkey={pub.name}',
-        f'--pcr-public-key={pub.name}',
+        '--pcr-banks=sha384',   # sha1 might not be allowed, use something else
         f'--pcr-private-key={priv.name}',
-    ])
+    ] + arg_tools
 
-    try:
-        ukify.check_inputs(opts)
-    except OSError as e:
-        pytest.skip(str(e))
+    # If the public key is not explicitly specified, it is derived
+    # automatically. Let's make sure everything works as expected both when the
+    # public keys is specified explicitly and when it is derived from the
+    # private key.
+    for extra in ([f'--pcrpkey={pub.name}', f'--pcr-public-key={pub.name}'], []):
+        opts = ukify.parse_args(args + extra)
+        try:
+            ukify.check_inputs(opts)
+        except OSError as e:
+            pytest.skip(str(e))
 
-    ukify.make_uki(opts)
+        ukify.make_uki(opts)
 
-    # let's check that objdump likes the resulting file
-    dump = subprocess.check_output(['objdump', '-h', output], text=True)
+        # let's check that objdump likes the resulting file
+        dump = subprocess.check_output(['objdump', '-h', output], text=True)
 
-    for sect in 'text osrel cmdline linux initrd uname pcrsig'.split():
-        assert re.search(fr'^\s*\d+\s+.{sect}\s+0', dump, re.MULTILINE)
+        for sect in 'text osrel cmdline linux initrd uname pcrsig'.split():
+            assert re.search(fr'^\s*\d+\s+\.{sect}\s+[0-9a-f]+', dump, re.MULTILINE)
 
-    # objcopy fails when called without an output argument (EPERM).
-    # It also fails when called with /dev/null (file truncated).
-    # It also fails when called with /dev/zero (because it reads the
-    # output file, infinitely in this case.)
-    # So let's just call it with a dummy output argument.
-    subprocess.check_call([
-        'objcopy',
-        *(f'--dump-section=.{n}={tmpdir}/out.{n}' for n in (
-            'pcrpkey', 'pcrsig', 'osrel', 'uname', 'cmdline')),
-        output,
-        tmpdir / 'dummy',
-    ],
-        text=True)
+        # objcopy fails when called without an output argument (EPERM).
+        # It also fails when called with /dev/null (file truncated).
+        # It also fails when called with /dev/zero (because it reads the
+        # output file, infinitely in this case.)
+        # So let's just call it with a dummy output argument.
+        subprocess.check_call([
+            'objcopy',
+            *(f'--dump-section=.{n}={tmp_path}/out.{n}' for n in (
+                'pcrpkey', 'pcrsig', 'osrel', 'uname', 'cmdline')),
+            output,
+            tmp_path / 'dummy',
+        ],
+            text=True)
 
-    assert open(tmpdir / 'out.pcrpkey').read() == open(pub.name).read()
-    assert open(tmpdir / 'out.osrel').read() == 'ID=foobar\n'
-    assert open(tmpdir / 'out.uname').read() == '1.2.3'
-    assert open(tmpdir / 'out.cmdline').read() == 'ARG1 ARG2 ARG3'
-    sig = open(tmpdir / 'out.pcrsig').read()
-    sig = json.loads(sig)
-    assert list(sig.keys()) == ['sha1']
-    assert len(sig['sha1']) == 4   # four items for four phases
+        assert open(tmp_path / 'out.pcrpkey').read() == open(pub.name).read()
+        assert open(tmp_path / 'out.osrel').read() == 'ID=foobar\n'
+        assert open(tmp_path / 'out.uname').read() == '1.2.3'
+        assert open(tmp_path / 'out.cmdline').read() == 'ARG1 ARG2 ARG3'
+        sig = open(tmp_path / 'out.pcrsig').read()
+        sig = json.loads(sig)
+        assert list(sig.keys()) == ['sha384']
+        assert len(sig['sha384']) == 4   # four items for four phases
 
-def test_pcr_signing2(kernel_initrd, tmpdir):
+    shutil.rmtree(tmp_path)
+
+@pytest.mark.skipif(not slow_tests, reason='slow')
+def test_pcr_signing2(kernel_initrd, tmp_path):
     if kernel_initrd is None:
         pytest.skip('linux+initrd not found')
-    if os.getuid() != 0:
-        pytest.skip('must be root to access tpm2')
-    if subprocess.call(['systemd-creds', 'has-tpm2', '-q']) != 0:
-        pytest.skip('tpm2 is not available')
+    try:
+        systemd_measure()
+    except ValueError:
+        pytest.skip('systemd-measure not found')
 
     ourdir = pathlib.Path(__file__).parent
     pub = unbase64(ourdir / 'example.tpm2-pcr-public.pem.base64')
@@ -574,17 +779,21 @@ def test_pcr_signing2(kernel_initrd, tmpdir):
     priv2 = unbase64(ourdir / 'example.tpm2-pcr-private2.pem.base64')
 
     # simulate a microcode file
-    with open(f'{tmpdir}/microcode', 'wb') as microcode:
+    with open(f'{tmp_path}/microcode', 'wb') as microcode:
         microcode.write(b'1234567890')
 
-    output = f'{tmpdir}/signed.efi'
+    output = f'{tmp_path}/signed.efi'
+    assert kernel_initrd[0] == '--linux'
     opts = ukify.parse_args([
-        kernel_initrd[0], microcode.name, kernel_initrd[1],
+        'build',
+        *kernel_initrd[:2],
+        f'--initrd={microcode.name}',
+        *kernel_initrd[2:],
         f'--output={output}',
         '--uname=1.2.3',
         '--cmdline=ARG1 ARG2 ARG3',
         '--os-release=ID=foobar\n',
-        '--pcr-banks=sha1',   # use sha1 as that is most likely to be supported
+        '--pcr-banks=sha384',
         f'--pcrpkey={pub2.name}',
         f'--pcr-public-key={pub.name}',
         f'--pcr-private-key={priv.name}',
@@ -592,7 +801,7 @@ def test_pcr_signing2(kernel_initrd, tmpdir):
         f'--pcr-public-key={pub2.name}',
         f'--pcr-private-key={priv2.name}',
         '--phases=sysinit ready shutdown final',  # yes, those phase paths are not reachable
-    ])
+    ] + arg_tools)
 
     try:
         ukify.check_inputs(opts)
@@ -605,27 +814,149 @@ def test_pcr_signing2(kernel_initrd, tmpdir):
     dump = subprocess.check_output(['objdump', '-h', output], text=True)
 
     for sect in 'text osrel cmdline linux initrd uname pcrsig'.split():
-        assert re.search(fr'^\s*\d+\s+.{sect}\s+0', dump, re.MULTILINE)
+        assert re.search(fr'^\s*\d+\s+\.{sect}\s+[0-9a-f]+', dump, re.MULTILINE)
 
     subprocess.check_call([
         'objcopy',
-        *(f'--dump-section=.{n}={tmpdir}/out.{n}' for n in (
+        *(f'--dump-section=.{n}={tmp_path}/out.{n}' for n in (
             'pcrpkey', 'pcrsig', 'osrel', 'uname', 'cmdline', 'initrd')),
         output,
-        tmpdir / 'dummy',
+        tmp_path / 'dummy',
     ],
         text=True)
 
-    assert open(tmpdir / 'out.pcrpkey').read() == open(pub2.name).read()
-    assert open(tmpdir / 'out.osrel').read() == 'ID=foobar\n'
-    assert open(tmpdir / 'out.uname').read() == '1.2.3'
-    assert open(tmpdir / 'out.cmdline').read() == 'ARG1 ARG2 ARG3'
-    assert open(tmpdir / 'out.initrd', 'rb').read(10) == b'1234567890'
+    assert open(tmp_path / 'out.pcrpkey').read() == open(pub2.name).read()
+    assert open(tmp_path / 'out.osrel').read() == 'ID=foobar\n'
+    assert open(tmp_path / 'out.uname').read() == '1.2.3'
+    assert open(tmp_path / 'out.cmdline').read() == 'ARG1 ARG2 ARG3'
+    assert open(tmp_path / 'out.initrd', 'rb').read(10) == b'1234567890'
 
-    sig = open(tmpdir / 'out.pcrsig').read()
+    sig = open(tmp_path / 'out.pcrsig').read()
     sig = json.loads(sig)
-    assert list(sig.keys()) == ['sha1']
-    assert len(sig['sha1']) == 6   # six items for six phases paths
+    assert list(sig.keys()) == ['sha384']
+    assert len(sig['sha384']) == 6   # six items for six phases paths
+
+    shutil.rmtree(tmp_path)
+
+def test_key_cert_generation(tmp_path):
+    opts = ukify.parse_args([
+        'genkey',
+        f"--pcr-public-key={tmp_path / 'pcr1.pub.pem'}",
+        f"--pcr-private-key={tmp_path / 'pcr1.priv.pem'}",
+        '--phases=enter-initrd enter-initrd:leave-initrd',
+        f"--pcr-public-key={tmp_path / 'pcr2.pub.pem'}",
+        f"--pcr-private-key={tmp_path / 'pcr2.priv.pem'}",
+        '--phases=sysinit ready',
+        f"--secureboot-private-key={tmp_path / 'sb.priv.pem'}",
+        f"--secureboot-certificate={tmp_path / 'sb.cert.pem'}",
+    ])
+    assert opts.verb == 'genkey'
+    ukify.check_cert_and_keys_nonexistent(opts)
+
+    pytest.importorskip('cryptography')
+
+    ukify.generate_keys(opts)
+
+    if not shutil.which('openssl'):
+        return
+
+    for key in (tmp_path / 'pcr1.priv.pem',
+                tmp_path / 'pcr2.priv.pem',
+                tmp_path / 'sb.priv.pem'):
+        out = subprocess.check_output([
+            'openssl', 'rsa',
+            '-in', key,
+            '-text',
+            '-noout',
+        ], text = True)
+        assert 'Private-Key' in out
+        assert '2048 bit' in out
+
+    for pub in (tmp_path / 'pcr1.pub.pem',
+                tmp_path / 'pcr2.pub.pem'):
+        out = subprocess.check_output([
+            'openssl', 'rsa',
+            '-pubin',
+            '-in', pub,
+            '-text',
+            '-noout',
+        ], text = True)
+        assert 'Public-Key' in out
+        assert '2048 bit' in out
+
+    out = subprocess.check_output([
+        'openssl', 'x509',
+        '-in', tmp_path / 'sb.cert.pem',
+        '-text',
+        '-noout',
+    ], text = True)
+    assert 'Certificate' in out
+    assert re.search(r'Issuer: CN\s?=\s?SecureBoot signing key on host', out)
+
+@pytest.mark.skipif(not slow_tests, reason='slow')
+def test_join_pcrsig(capsys, kernel_initrd, tmp_path):
+    if kernel_initrd is None:
+        pytest.skip('linux+initrd not found')
+    try:
+        systemd_measure()
+    except ValueError:
+        pytest.skip('systemd-measure not found')
+
+    ourdir = pathlib.Path(__file__).parent
+    pub = unbase64(ourdir / 'example.tpm2-pcr-public.pem.base64')
+
+    output = tmp_path / 'basic.efi'
+    args = [
+        'build',
+        *kernel_initrd,
+        f'--output={output}',
+        f'--pcr-public-key={pub.name}',
+        '--json=short',
+        '--policy-digest',
+    ] + arg_tools
+    opts = ukify.parse_args(args)
+    try:
+        ukify.check_inputs(opts)
+    except OSError as e:
+        pytest.skip(str(e))
+
+    ukify.make_uki(opts)
+    pcrs = json.loads(capsys.readouterr().out)
+    for bank, sigs in pcrs.items():
+        for sig in sigs:
+            sig['sig'] = 'a' * int(bank[3:])
+
+    opts = ukify.parse_args(['inspect', str(output)])
+    ukify.inspect_sections(opts)
+    text = capsys.readouterr().out
+    assert re.search(r'\.pcrpkey', text, re.MULTILINE)
+    assert re.search(r'\.pcrsig', text, re.MULTILINE)
+    assert not re.search(r'"sig":', text, re.MULTILINE)
+
+    output_sig = tmp_path / 'pcrsig.efi'
+    args = [
+        'build',
+        f'--output={output_sig}',
+        f'--join-pcrsig={output}',
+        f'--pcrsig={json.dumps(pcrs)}',
+        '--json=short',
+    ] + arg_tools
+    opts = ukify.parse_args(args)
+    try:
+        ukify.check_inputs(opts)
+    except OSError as e:
+        pytest.skip(str(e))
+
+    ukify.make_uki(opts)
+
+    opts = ukify.parse_args(['inspect', str(output_sig)])
+    ukify.inspect_sections(opts)
+    text = capsys.readouterr().out
+    assert re.search(r'\.pcrpkey', text, re.MULTILINE)
+    assert re.search(r'\.pcrsig', text, re.MULTILINE)
+    assert re.search(r'"sig":', text, re.MULTILINE)
+
+    shutil.rmtree(tmp_path)
 
 if __name__ == '__main__':
     sys.exit(pytest.main(sys.argv))

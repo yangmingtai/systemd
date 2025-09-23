@@ -2,18 +2,21 @@
 
 #include <resolv.h>
 #include <sys/stat.h>
-#include <sys/types.h>
-#include <unistd.h>
 
 #include "alloc-util.h"
-#include "dns-domain.h"
 #include "fd-util.h"
 #include "fileio.h"
 #include "fs-util.h"
-#include "label.h"
+#include "label-util.h"
+#include "log.h"
 #include "ordered-set.h"
-#include "resolved-conf.h"
+#include "path-util.h"
+#include "resolved-dns-cache.h"
+#include "resolved-dns-scope.h"
+#include "resolved-dns-search-domain.h"
 #include "resolved-dns-server.h"
+#include "resolved-dns-stub.h"
+#include "resolved-manager.h"
 #include "resolved-resolv-conf.h"
 #include "stat-util.h"
 #include "string-table.h"
@@ -103,7 +106,7 @@ int manager_read_resolv_conf(Manager *m) {
                 if (errno == ENOENT)
                         return 0;
 
-                r = log_warning_errno(errno, "Failed to open /etc/resolv.conf: %m");
+                r = log_warning_errno(errno, "Failed to open %s: %m", "/etc/resolv.conf");
                 goto clear;
         }
 
@@ -121,9 +124,8 @@ int manager_read_resolv_conf(Manager *m) {
         for (;;) {
                 _cleanup_free_ char *line = NULL;
                 const char *a;
-                char *l;
 
-                r = read_line(f, LONG_LINE_MAX, &line);
+                r = read_stripped_line(f, LONG_LINE_MAX, &line);
                 if (r < 0) {
                         log_error_errno(r, "Failed to read /etc/resolv.conf: %m");
                         goto clear;
@@ -133,11 +135,10 @@ int manager_read_resolv_conf(Manager *m) {
 
                 n++;
 
-                l = strstrip(line);
-                if (IN_SET(*l, '#', ';', 0))
+                if (IN_SET(*line, '#', ';', 0))
                         continue;
 
-                a = first_word(l, "nameserver");
+                a = first_word(line, "nameserver");
                 if (a) {
                         r = manager_parse_dns_server_string_and_warn(m, DNS_SERVER_SYSTEM, a);
                         if (r < 0)
@@ -146,9 +147,9 @@ int manager_read_resolv_conf(Manager *m) {
                         continue;
                 }
 
-                a = first_word(l, "domain");
+                a = first_word(line, "domain");
                 if (!a) /* We treat "domain" lines, and "search" lines as equivalent, and add both to our list. */
-                        a = first_word(l, "search");
+                        a = first_word(line, "search");
                 if (a) {
                         r = manager_parse_search_domains_and_warn(m, a);
                         if (r < 0)
@@ -157,7 +158,7 @@ int manager_read_resolv_conf(Manager *m) {
                         continue;
                 }
 
-                log_syntax(NULL, LOG_DEBUG, "/etc/resolv.conf", n, 0, "Ignoring resolv.conf line: %s", l);
+                log_syntax(NULL, LOG_DEBUG, "/etc/resolv.conf", n, 0, "Ignoring resolv.conf line: %s", line);
         }
 
         m->resolv_conf_stat = st;
@@ -371,7 +372,12 @@ int manager_write_resolv_conf(Manager *m) {
 
                 temp_path_stub = mfree(temp_path_stub); /* free the string explicitly, so that we don't unlink anymore */
         } else {
-                r = symlink_atomic_label(basename(PRIVATE_UPLINK_RESOLV_CONF), PRIVATE_STUB_RESOLV_CONF);
+                _cleanup_free_ char *fname = NULL;
+                r = path_extract_filename(PRIVATE_UPLINK_RESOLV_CONF, &fname);
+                if (r < 0)
+                        return log_warning_errno(r, "Failed to extract filename from path '" PRIVATE_UPLINK_RESOLV_CONF "', ignoring: %m");
+
+                r = symlinkat_atomic_full(fname, AT_FDCWD, PRIVATE_STUB_RESOLV_CONF, SYMLINK_LABEL);
                 if (r < 0)
                         log_warning_errno(r, "Failed to symlink %s, ignoring: %m", PRIVATE_STUB_RESOLV_CONF);
         }

@@ -1,31 +1,30 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <sched.h>
-#include <sys/prctl.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "sd-event.h"
+
 #include "alloc-util.h"
-#include "btrfs-util.h"
 #include "capability-util.h"
-#include "chattr-util.h"
 #include "dirent-util.h"
 #include "fd-util.h"
 #include "fileio.h"
 #include "fs-util.h"
-#include "hostname-util.h"
 #include "import-common.h"
+#include "log.h"
 #include "os-util.h"
+#include "pidref.h"
 #include "process-util.h"
 #include "selinux-util.h"
-#include "signal-util.h"
 #include "stat-util.h"
 #include "tmpfile-util.h"
 
-int import_fork_tar_x(const char *path, pid_t *ret) {
-        _cleanup_close_pair_ int pipefd[2] = PIPE_EBADF;
+int import_fork_tar_x(const char *path, PidRef *ret) {
+        _cleanup_(pidref_done) PidRef pid = PIDREF_NULL;
+        _cleanup_close_pair_ int pipefd[2] = EBADF_PAIR;
         bool use_selinux;
-        pid_t pid;
         int r;
 
         assert(path);
@@ -34,12 +33,16 @@ int import_fork_tar_x(const char *path, pid_t *ret) {
         if (pipe2(pipefd, O_CLOEXEC) < 0)
                 return log_error_errno(errno, "Failed to create pipe for tar: %m");
 
+        (void) fcntl(pipefd[0], F_SETPIPE_SZ, IMPORT_BUFFER_SIZE);
+
         use_selinux = mac_selinux_use();
 
-        r = safe_fork_full("(tar)",
-                           (int[]) { pipefd[0], -EBADF, STDERR_FILENO },
-                           NULL, 0,
-                           FORK_RESET_SIGNALS|FORK_CLOSE_ALL_FDS|FORK_DEATHSIG|FORK_REARRANGE_STDIO|FORK_LOG, &pid);
+        r = pidref_safe_fork_full(
+                        "(tar)",
+                        (int[]) { pipefd[0], -EBADF, STDERR_FILENO },
+                        NULL, 0,
+                        FORK_RESET_SIGNALS|FORK_CLOSE_ALL_FDS|FORK_DEATHSIG_SIGTERM|FORK_REARRANGE_STDIO|FORK_LOG,
+                        &pid);
         if (r < 0)
                 return r;
         if (r == 0) {
@@ -86,15 +89,15 @@ int import_fork_tar_x(const char *path, pid_t *ret) {
                 _exit(EXIT_FAILURE);
         }
 
-        *ret = pid;
+        *ret = TAKE_PIDREF(pid);
 
         return TAKE_FD(pipefd[1]);
 }
 
-int import_fork_tar_c(const char *path, pid_t *ret) {
-        _cleanup_close_pair_ int pipefd[2] = PIPE_EBADF;
+int import_fork_tar_c(const char *path, PidRef *ret) {
+        _cleanup_close_pair_ int pipefd[2] = EBADF_PAIR;
+        _cleanup_(pidref_done) PidRef pid = PIDREF_NULL;
         bool use_selinux;
-        pid_t pid;
         int r;
 
         assert(path);
@@ -103,12 +106,16 @@ int import_fork_tar_c(const char *path, pid_t *ret) {
         if (pipe2(pipefd, O_CLOEXEC) < 0)
                 return log_error_errno(errno, "Failed to create pipe for tar: %m");
 
+        (void) fcntl(pipefd[0], F_SETPIPE_SZ, IMPORT_BUFFER_SIZE);
+
         use_selinux = mac_selinux_use();
 
-        r = safe_fork_full("(tar)",
-                           (int[]) { -EBADF, pipefd[1], STDERR_FILENO },
-                           NULL, 0,
-                           FORK_RESET_SIGNALS|FORK_CLOSE_ALL_FDS|FORK_DEATHSIG|FORK_REARRANGE_STDIO|FORK_LOG, &pid);
+        r = pidref_safe_fork_full(
+                        "(tar)",
+                        (int[]) { -EBADF, pipefd[1], STDERR_FILENO },
+                        NULL, 0,
+                        FORK_RESET_SIGNALS|FORK_CLOSE_ALL_FDS|FORK_DEATHSIG_SIGTERM|FORK_REARRANGE_STDIO|FORK_LOG,
+                        &pid);
         if (r < 0)
                 return r;
         if (r == 0) {
@@ -141,7 +148,7 @@ int import_fork_tar_c(const char *path, pid_t *ret) {
                 _exit(EXIT_FAILURE);
         }
 
-        *ret = pid;
+        *ret = TAKE_PIDREF(pid);
 
         return TAKE_FD(pipefd[0]);
 }
@@ -276,7 +283,7 @@ bool import_validate_local(const char *name, ImportFlags flags) {
         if (FLAGS_SET(flags, IMPORT_DIRECT))
                 return path_is_valid(name);
 
-        return hostname_is_valid(name, 0);
+        return image_name_is_valid(name);
 }
 
 static int interrupt_signal_handler(sd_event_source *s, const struct signalfd_siginfo *si, void *userdata) {
@@ -295,9 +302,8 @@ int import_allocate_event_with_signals(sd_event **ret) {
         if (r < 0)
                 return log_error_errno(r, "Failed to allocate event loop: %m");
 
-        assert_se(sigprocmask_many(SIG_BLOCK, NULL, SIGTERM, SIGINT, -1) >= 0);
-        (void) sd_event_add_signal(event, NULL, SIGTERM, interrupt_signal_handler,  NULL);
-        (void) sd_event_add_signal(event, NULL, SIGINT, interrupt_signal_handler, NULL);
+        (void) sd_event_add_signal(event, NULL, SIGTERM|SD_EVENT_SIGNAL_PROCMASK, interrupt_signal_handler,  NULL);
+        (void) sd_event_add_signal(event, NULL, SIGINT|SD_EVENT_SIGNAL_PROCMASK, interrupt_signal_handler, NULL);
 
         *ret = TAKE_PTR(event);
         return 0;

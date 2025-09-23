@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include <errno.h>
+#include "forward.h"
 
 typedef enum EnrollType {
         ENROLL_PASSWORD,
@@ -17,6 +17,7 @@ typedef enum UnlockType {
         UNLOCK_PASSWORD,
         UNLOCK_KEYFILE,
         UNLOCK_FIDO2,
+        UNLOCK_TPM2,
         _UNLOCK_TYPE_MAX,
         _UNLOCK_TYPE_INVALID = -EINVAL,
 } UnlockType;

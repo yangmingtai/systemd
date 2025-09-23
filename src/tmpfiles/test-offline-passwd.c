@@ -2,9 +2,9 @@
 
 #include <getopt.h>
 
-#include "offline-passwd.h"
-#include "user-util.h"
 #include "format-util.h"
+#include "hashmap.h"
+#include "offline-passwd.h"
 #include "tests.h"
 
 static char *arg_root = NULL;
@@ -17,7 +17,7 @@ static void test_resolve_one(const char *name) {
 
         log_info("/* %s(\"%s\") */", __func__, name);
 
-        _cleanup_(hashmap_freep) Hashmap *uid_cache = NULL, *gid_cache = NULL;
+        _cleanup_hashmap_free_ Hashmap *uid_cache = NULL, *gid_cache = NULL;
         uid_t uid = UID_INVALID;
         gid_t gid = GID_INVALID;
         int r;

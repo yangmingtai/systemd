@@ -1,52 +1,52 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <errno.h>
 #include <unistd.h>
+#include "sd-bus.h"
+#include "sd-event.h"
 
 #include "alloc-util.h"
 #include "bus-common-errors.h"
 #include "bus-error.h"
+#include "bus-locator.h"
 #include "bus-util.h"
-#include "cgroup-util.h"
 #include "clean-ipc.h"
 #include "env-file.h"
+#include "errno-util.h"
 #include "escape.h"
 #include "fd-util.h"
-#include "fileio.h"
 #include "format-util.h"
 #include "fs-util.h"
 #include "hashmap.h"
-#include "label.h"
 #include "limits-util.h"
+#include "logind-session.h"
+#include "logind.h"
 #include "logind-dbus.h"
-#include "logind-user-dbus.h"
+#include "logind-seat.h"
 #include "logind-user.h"
+#include "logind-user-dbus.h"
 #include "mkdir-label.h"
 #include "parse-util.h"
-#include "path-util.h"
 #include "percent-util.h"
-#include "rm-rf.h"
 #include "serialize.h"
 #include "special.h"
 #include "stdio-util.h"
 #include "string-table.h"
+#include "string-util.h"
 #include "strv.h"
 #include "tmpfile-util.h"
-#include "uid-alloc-range.h"
+#include "uid-classification.h"
 #include "unit-name.h"
+#include "user-record.h"
 #include "user-util.h"
 
-int user_new(User **ret,
-             Manager *m,
-             UserRecord *ur) {
-
+int user_new(Manager *m, UserRecord *ur, User **ret) {
         _cleanup_(user_freep) User *u = NULL;
         char lu[DECIMAL_STR_MAX(uid_t) + 1];
         int r;
 
-        assert(ret);
         assert(m);
         assert(ur);
+        assert(ret);
 
         if (!ur->user_name)
                 return -EINVAL;
@@ -62,6 +62,7 @@ int user_new(User **ret,
                 .manager = m,
                 .user_record = user_record_ref(ur),
                 .last_session_timestamp = USEC_INFINITY,
+                .gc_mode = USER_GC_BY_ANY,
         };
 
         if (asprintf(&u->state_file, "/run/systemd/users/" UID_FMT, ur->uid) < 0)
@@ -75,11 +76,11 @@ int user_new(User **ret,
         if (r < 0)
                 return r;
 
-        r = unit_name_build("user", lu, ".service", &u->service);
+        r = unit_name_build("user-runtime-dir", lu, ".service", &u->runtime_dir_unit);
         if (r < 0)
                 return r;
 
-        r = unit_name_build("user-runtime-dir", lu, ".service", &u->runtime_dir_service);
+        r = unit_name_build("user", lu, ".service", &u->service_manager_unit);
         if (r < 0)
                 return r;
 
@@ -91,11 +92,11 @@ int user_new(User **ret,
         if (r < 0)
                 return r;
 
-        r = hashmap_put(m->user_units, u->service, u);
+        r = hashmap_put(m->user_units, u->runtime_dir_unit, u);
         if (r < 0)
                 return r;
 
-        r = hashmap_put(m->user_units, u->runtime_dir_service, u);
+        r = hashmap_put(m->user_units, u->service_manager_unit, u);
         if (r < 0)
                 return r;
 
@@ -113,26 +114,29 @@ User *user_free(User *u) {
         while (u->sessions)
                 session_free(u->sessions);
 
-        if (u->service)
-                hashmap_remove_value(u->manager->user_units, u->service, u);
-
-        if (u->runtime_dir_service)
-                hashmap_remove_value(u->manager->user_units, u->runtime_dir_service, u);
-
-        if (u->slice)
-                hashmap_remove_value(u->manager->user_units, u->slice, u);
-
-        hashmap_remove_value(u->manager->users, UID_TO_PTR(u->user_record->uid), u);
-
         sd_event_source_unref(u->timer_event_source);
 
-        u->service_job = mfree(u->service_job);
+        if (u->service_manager_unit) {
+                (void) hashmap_remove_value(u->manager->user_units, u->service_manager_unit, u);
+                free(u->service_manager_job);
+                free(u->service_manager_unit);
+        }
 
-        u->service = mfree(u->service);
-        u->runtime_dir_service = mfree(u->runtime_dir_service);
-        u->slice = mfree(u->slice);
-        u->runtime_path = mfree(u->runtime_path);
-        u->state_file = mfree(u->state_file);
+        if (u->runtime_dir_unit) {
+                (void) hashmap_remove_value(u->manager->user_units, u->runtime_dir_unit, u);
+                free(u->runtime_dir_job);
+                free(u->runtime_dir_unit);
+        }
+
+        if (u->slice) {
+                (void) hashmap_remove_value(u->manager->user_units, u->slice, u);
+                free(u->slice);
+        }
+
+        (void) hashmap_remove_value(u->manager->users, UID_TO_PTR(u->user_record->uid), u);
+
+        free(u->runtime_path);
+        free(u->state_file);
 
         user_record_unref(u->user_record);
 
@@ -140,8 +144,6 @@ User *user_free(User *u) {
 }
 
 static int user_save_internal(User *u) {
-        _cleanup_(unlink_and_freep) char *temp_path = NULL;
-        _cleanup_fclose_ FILE *f = NULL;
         int r;
 
         assert(u);
@@ -149,32 +151,34 @@ static int user_save_internal(User *u) {
 
         r = mkdir_safe_label("/run/systemd/users", 0755, 0, 0, MKDIR_WARN_MODE);
         if (r < 0)
-                goto fail;
+                return log_error_errno(r, "Failed to create /run/systemd/users/: %m");
 
-        r = fopen_temporary(u->state_file, &f, &temp_path);
+        _cleanup_(unlink_and_freep) char *temp_path = NULL;
+        _cleanup_fclose_ FILE *f = NULL;
+        r = fopen_tmpfile_linkable(u->state_file, O_WRONLY|O_CLOEXEC, &temp_path, &f);
         if (r < 0)
-                goto fail;
+                return log_error_errno(r, "Failed to create state file '%s': %m", u->state_file);
 
-        (void) fchmod(fileno(f), 0644);
+        if (fchmod(fileno(f), 0644) < 0)
+                return log_error_errno(errno, "Failed to set access mode for state file '%s' to 0644: %m", u->state_file);
 
         fprintf(f,
                 "# This is private data. Do not parse.\n"
                 "NAME=%s\n"
                 "STATE=%s\n"         /* friendly user-facing state */
-                "STOPPING=%s\n",     /* low-level state */
+                "STOPPING=%s\n"      /* low-level state */
+                "GC_MODE=%s\n",
                 u->user_record->user_name,
                 user_state_to_string(user_get_state(u)),
-                yes_no(u->stopping));
+                yes_no(u->stopping),
+                user_gc_mode_to_string(u->gc_mode));
 
         /* LEGACY: no-one reads RUNTIME= anymore, drop it at some point */
-        if (u->runtime_path)
-                fprintf(f, "RUNTIME=%s\n", u->runtime_path);
-
-        if (u->service_job)
-                fprintf(f, "SERVICE_JOB=%s\n", u->service_job);
-
+        env_file_fputs_assignment(f, "RUNTIME=", u->runtime_path);
+        env_file_fputs_assignment(f, "RUNTIME_DIR_JOB=", u->runtime_dir_job);
+        env_file_fputs_assignment(f, "SERVICE_JOB=", u->service_manager_job);
         if (u->display)
-                fprintf(f, "DISPLAY=%s\n", u->display->id);
+                env_file_fputs_assignment(f, "DISPLAY=", u->display->id);
 
         if (dual_timestamp_is_set(&u->timestamp))
                 fprintf(f,
@@ -273,22 +277,12 @@ static int user_save_internal(User *u) {
                 fputc('\n', f);
         }
 
-        r = fflush_and_check(f);
+        r = flink_tmpfile(f, temp_path, u->state_file, LINK_TMPFILE_REPLACE);
         if (r < 0)
-                goto fail;
+                return log_error_errno(r, "Failed to move '%s' into place: %m", u->state_file);
 
-        if (rename(temp_path, u->state_file) < 0) {
-                r = -errno;
-                goto fail;
-        }
-
-        temp_path = mfree(temp_path);
+        temp_path = mfree(temp_path); /* disarm auto-destroy: temporary file does not exist anymore */
         return 0;
-
-fail:
-        (void) unlink(u->state_file);
-
-        return log_error_errno(r, "Failed to save user data %s: %m", u->state_file);
 }
 
 int user_save(User *u) {
@@ -301,17 +295,19 @@ int user_save(User *u) {
 }
 
 int user_load(User *u) {
-        _cleanup_free_ char *realtime = NULL, *monotonic = NULL, *stopping = NULL, *last_session_timestamp = NULL;
+        _cleanup_free_ char *realtime = NULL, *monotonic = NULL, *stopping = NULL, *last_session_timestamp = NULL, *gc_mode = NULL;
         int r;
 
         assert(u);
 
         r = parse_env_file(NULL, u->state_file,
-                           "SERVICE_JOB",            &u->service_job,
+                           "RUNTIME_DIR_JOB",        &u->runtime_dir_job,
+                           "SERVICE_JOB",            &u->service_manager_job,
                            "STOPPING",               &stopping,
                            "REALTIME",               &realtime,
                            "MONOTONIC",              &monotonic,
-                           "LAST_SESSION_TIMESTAMP", &last_session_timestamp);
+                           "LAST_SESSION_TIMESTAMP", &last_session_timestamp,
+                           "GC_MODE",                &gc_mode);
         if (r == -ENOENT)
                 return 0;
         if (r < 0)
@@ -321,8 +317,11 @@ int user_load(User *u) {
                 r = parse_boolean(stopping);
                 if (r < 0)
                         log_debug_errno(r, "Failed to parse 'STOPPING' boolean: %s", stopping);
-                else
+                else {
                         u->stopping = r;
+                        if (u->stopping && !u->runtime_dir_job)
+                                log_debug("User '%s' is stopping, but no job is being tracked.", u->user_record->user_name);
+                }
         }
 
         if (realtime)
@@ -332,25 +331,74 @@ int user_load(User *u) {
         if (last_session_timestamp)
                 (void) deserialize_usec(last_session_timestamp, &u->last_session_timestamp);
 
+        u->gc_mode = user_gc_mode_from_string(gc_mode);
+        if (u->gc_mode < 0)
+                u->gc_mode = USER_GC_BY_PIN;
+
         return 0;
 }
 
-static void user_start_service(User *u) {
+static int user_start_runtime_dir(User *u) {
         _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
         int r;
 
         assert(u);
+        assert(!u->stopping);
+        assert(u->manager);
+        assert(u->runtime_dir_unit);
 
-        /* Start the service containing the "systemd --user" instance (user@.service). Note that we don't explicitly
-         * start the per-user slice or the systemd-runtime-dir@.service instance, as those are pulled in both by
-         * user@.service and the session scopes as dependencies. */
+        u->runtime_dir_job = mfree(u->runtime_dir_job);
 
-        u->service_job = mfree(u->service_job);
-
-        r = manager_start_unit(u->manager, u->service, &error, &u->service_job);
+        r = manager_start_unit(u->manager, u->runtime_dir_unit, &error, &u->runtime_dir_job);
         if (r < 0)
-                log_full_errno(sd_bus_error_has_name(&error, BUS_ERROR_UNIT_MASKED) ? LOG_DEBUG : LOG_WARNING, r,
-                               "Failed to start user service '%s', ignoring: %s", u->service, bus_error_message(&error, r));
+                return log_full_errno(sd_bus_error_has_name(&error, BUS_ERROR_UNIT_MASKED) ? LOG_DEBUG : LOG_ERR,
+                                      r, "Failed to start user service '%s': %s",
+                                      u->runtime_dir_unit, bus_error_message(&error, r));
+
+        return 0;
+}
+
+static bool user_wants_service_manager(const User *u) {
+        assert(u);
+
+        LIST_FOREACH(sessions_by_user, s, u->sessions)
+                if (SESSION_CLASS_WANTS_SERVICE_MANAGER(s->class))
+                        return true;
+
+        if (user_check_linger_file(u) > 0)
+                return true;
+
+        return false;
+}
+
+int user_start_service_manager(User *u) {
+        _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
+        int r;
+
+        assert(u);
+        assert(!u->stopping);
+        assert(u->manager);
+        assert(u->service_manager_unit);
+
+        if (u->service_manager_started)
+                return 1;
+
+        /* Only start user service manager if there's at least one session which wants it */
+        if (!user_wants_service_manager(u))
+                return 0;
+
+        u->service_manager_job = mfree(u->service_manager_job);
+
+        r = manager_start_unit(u->manager, u->service_manager_unit, &error, &u->service_manager_job);
+        if (r < 0) {
+                if (sd_bus_error_has_name(&error, BUS_ERROR_UNIT_MASKED))
+                        return 0;
+
+                return log_error_errno(r, "Failed to start user service '%s': %s",
+                                       u->service_manager_unit, bus_error_message(&error, r));
+        }
+
+        return (u->service_manager_started = true);
 }
 
 static int update_slice_callback(sd_bus_message *m, void *userdata, sd_bus_error *ret_error) {
@@ -388,13 +436,7 @@ static int user_update_slice(User *u) {
             u->user_record->io_weight == UINT64_MAX)
                 return 0;
 
-        r = sd_bus_message_new_method_call(
-                        u->manager->bus,
-                        &m,
-                        "org.freedesktop.systemd1",
-                        "/org/freedesktop/systemd1",
-                        "org.freedesktop.systemd1.Manager",
-                        "SetUnitProperties");
+        r = bus_message_new_method_call(u->manager->bus, &m, bus_systemd_mgr, "SetUnitProperties");
         if (r < 0)
                 return bus_log_create_error(r);
 
@@ -417,12 +459,14 @@ static int user_update_slice(User *u) {
                 { "IOWeight",   u->user_record->io_weight   },
         };
 
-        for (size_t i = 0; i < ELEMENTSOF(settings); i++)
-                if (settings[i].value != UINT64_MAX) {
-                        r = sd_bus_message_append(m, "(sv)", settings[i].name, "t", settings[i].value);
-                        if (r < 0)
-                                return bus_log_create_error(r);
-                }
+        FOREACH_ELEMENT(st, settings) {
+                if (st->value == UINT64_MAX)
+                        continue;
+
+                r = sd_bus_message_append(m, "(sv)", st->name, "t", st->value);
+                if (r < 0)
+                        return bus_log_create_error(r);
+        }
 
         r = sd_bus_message_close_container(m);
         if (r < 0)
@@ -439,33 +483,47 @@ static int user_update_slice(User *u) {
 }
 
 int user_start(User *u) {
+        int r;
+
         assert(u);
 
-        if (u->started && !u->stopping)
+        if (u->service_manager_started) {
+                /* Everything is up. No action needed. */
+                assert(u->started && !u->stopping);
                 return 0;
+        }
 
-        /* If u->stopping is set, the user is marked for removal and service stop-jobs are queued. We have to clear
-         * that flag before queueing the start-jobs again. If they succeed, the user object can be re-used just fine
-         * (pid1 takes care of job-ordering and proper restart), but if they fail, we want to force another user_stop()
-         * so possibly pending units are stopped. */
-        u->stopping = false;
+        if (!u->started || u->stopping) {
+                /* If u->stopping is set, the user is marked for removal and service stop-jobs are queued.
+                 * We have to clear that flag before queueing the start-jobs again. If they succeed, the
+                 * user object can be reused just fine (pid1 takes care of job-ordering and proper restart),
+                 * but if they fail, we want to force another user_stop() so possibly pending units are
+                 * stopped. */
+                u->stopping = false;
 
-        if (!u->started)
-                log_debug("Starting services for new user %s.", u->user_record->user_name);
+                if (!u->started)
+                        log_debug("Tracking new user %s.", u->user_record->user_name);
 
-        /* Save the user data so far, because pam_systemd will read the XDG_RUNTIME_DIR out of it while starting up
-         * systemd --user.  We need to do user_save_internal() because we have not "officially" started yet. */
-        user_save_internal(u);
+                /* Save the user data so far, because pam_systemd will read the XDG_RUNTIME_DIR out of it
+                 * while starting up systemd --user. We need to do user_save_internal() because we have not
+                 * "officially" started yet. */
+                user_save_internal(u);
 
-        /* Set slice parameters */
-        (void) user_update_slice(u);
+                /* Set slice parameters */
+                (void) user_update_slice(u);
 
-        /* Start user@UID.service */
-        user_start_service(u);
+                (void) user_start_runtime_dir(u);
+        }
+
+        /* Start user@UID.service if needed. */
+        r = user_start_service_manager(u);
+        if (r < 0)
+                return r;
 
         if (!u->started) {
                 if (!dual_timestamp_is_set(&u->timestamp))
-                        dual_timestamp_get(&u->timestamp);
+                        dual_timestamp_now(&u->timestamp);
+
                 user_send_signal(u, true);
                 u->started = true;
         }
@@ -481,16 +539,22 @@ static void user_stop_service(User *u, bool force) {
         int r;
 
         assert(u);
-        assert(u->service);
+        assert(u->manager);
+        assert(u->runtime_dir_unit);
 
-        /* The reverse of user_start_service(). Note that we only stop user@UID.service here, and let StopWhenUnneeded=
-         * deal with the slice and the user-runtime-dir@.service instance. */
+        /* Note that we only stop user-runtime-dir@.service here, and let BindsTo= deal with the user@.service
+         * instance. However, we still need to clear service_manager_job here, so that if the stop is
+         * interrupted, the new sessions won't be confused by leftovers. */
 
-        u->service_job = mfree(u->service_job);
+        u->service_manager_job = mfree(u->service_manager_job);
+        u->service_manager_started = false;
 
-        r = manager_stop_unit(u->manager, u->service, force ? "replace" : "fail", &error, &u->service_job);
+        u->runtime_dir_job = mfree(u->runtime_dir_job);
+
+        r = manager_stop_unit(u->manager, u->runtime_dir_unit, force ? "replace" : "fail", &error, &u->runtime_dir_job);
         if (r < 0)
-                log_warning_errno(r, "Failed to stop user service '%s', ignoring: %s", u->service, bus_error_message(&error, r));
+                log_warning_errno(r, "Failed to stop user service '%s', ignoring: %s",
+                                  u->runtime_dir_unit, bus_error_message(&error, r));
 }
 
 int user_stop(User *u, bool force) {
@@ -511,13 +575,8 @@ int user_stop(User *u, bool force) {
                 return 0;
         }
 
-        LIST_FOREACH(sessions_by_user, s, u->sessions) {
-                int k;
-
-                k = session_stop(s, force);
-                if (k < 0)
-                        r = k;
-        }
+        LIST_FOREACH(sessions_by_user, s, u->sessions)
+                RET_GATHER(r, session_stop(s, force));
 
         user_stop_service(u, force);
 
@@ -529,7 +588,7 @@ int user_stop(User *u, bool force) {
 }
 
 int user_finalize(User *u) {
-        int r = 0, k;
+        int r = 0;
 
         assert(u);
 
@@ -537,13 +596,10 @@ int user_finalize(User *u) {
          * done. This is called as a result of an earlier user_done() when all jobs are completed. */
 
         if (u->started)
-                log_debug("User %s logged out.", u->user_record->user_name);
+                log_debug("User %s exited.", u->user_record->user_name);
 
-        LIST_FOREACH(sessions_by_user, s, u->sessions) {
-                k = session_finalize(s);
-                if (k < 0)
-                        r = k;
-        }
+        LIST_FOREACH(sessions_by_user, s, u->sessions)
+                RET_GATHER(r, session_finalize(s));
 
         /* Clean SysV + POSIX IPC objects, but only if this is not a system user. Background: in many setups cronjobs
          * are run in full PAM and thus logind sessions, even if the code run doesn't belong to actual users but to
@@ -551,11 +607,8 @@ int user_finalize(User *u) {
          * cases, as we shouldn't accidentally remove a system service's IPC objects while it is running, just because
          * a cronjob running as the same user just finished. Hence: exclude system users generally from IPC clean-up,
          * and do it only for normal users. */
-        if (u->manager->remove_ipc && !uid_is_system(u->user_record->uid)) {
-                k = clean_ipc_by_uid(u->user_record->uid);
-                if (k < 0)
-                        r = k;
-        }
+        if (u->manager->remove_ipc && !uid_is_system(u->user_record->uid))
+                RET_GATHER(r, clean_ipc_by_uid(u->user_record->uid));
 
         (void) unlink(u->state_file);
         user_add_to_gc_queue(u);
@@ -577,6 +630,9 @@ int user_get_idle_hint(User *u, dual_timestamp *t) {
         LIST_FOREACH(sessions_by_user, s, u->sessions) {
                 dual_timestamp k;
                 int ih;
+
+                if (!SESSION_CLASS_CAN_IDLE(s->class))
+                        continue;
 
                 ih = session_get_idle_hint(s, &k);
                 if (ih < 0)
@@ -603,9 +659,12 @@ int user_get_idle_hint(User *u, dual_timestamp *t) {
         return idle_hint;
 }
 
-int user_check_linger_file(User *u) {
+int user_check_linger_file(const User *u) {
         _cleanup_free_ char *cc = NULL;
-        char *p = NULL;
+        const char *p;
+
+        assert(u);
+        assert(u->user_record);
 
         cc = cescape(u->user_record->user_name);
         if (!cc)
@@ -625,11 +684,11 @@ int user_check_linger_file(User *u) {
 static bool user_unit_active(User *u) {
         int r;
 
-        assert(u->service);
-        assert(u->runtime_dir_service);
         assert(u->slice);
+        assert(u->runtime_dir_unit);
+        assert(u->service_manager_unit);
 
-        FOREACH_STRING(i, u->service, u->runtime_dir_service, u->slice) {
+        FOREACH_STRING(i, u->slice, u->runtime_dir_unit, u->service_manager_unit) {
                 _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
 
                 r = manager_unit_is_active(u->manager, i, &error);
@@ -654,6 +713,29 @@ static usec_t user_get_stop_delay(User *u) {
         return u->manager->user_stop_delay;
 }
 
+static bool user_pinned_by_sessions(User *u) {
+        assert(u);
+
+        /* Returns true if at least one session exists that shall keep the user tracking alive. That
+         * generally means one session that isn't the service manager still exists. */
+
+        switch (u->gc_mode) {
+
+        case USER_GC_BY_ANY:
+                return u->sessions;
+
+        case USER_GC_BY_PIN:
+                LIST_FOREACH(sessions_by_user, i, u->sessions)
+                        if (SESSION_CLASS_PIN_USER(i->class))
+                                return true;
+
+                return false;
+
+        default:
+                assert_not_reached();
+        }
+}
+
 bool user_may_gc(User *u, bool drop_not_started) {
         int r;
 
@@ -662,7 +744,7 @@ bool user_may_gc(User *u, bool drop_not_started) {
         if (drop_not_started && !u->started)
                 return true;
 
-        if (u->sessions)
+        if (user_pinned_by_sessions(u))
                 return false;
 
         if (u->last_session_timestamp != USEC_INFINITY) {
@@ -686,18 +768,23 @@ bool user_may_gc(User *u, bool drop_not_started) {
                 return false;
 
         /* Check if our job is still pending */
-        if (u->service_job) {
+        const char *j;
+        FOREACH_ARGUMENT(j, u->runtime_dir_job, u->service_manager_job) {
                 _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
 
-                r = manager_job_is_active(u->manager, u->service_job, &error);
+                if (!j)
+                        continue;
+
+                r = manager_job_is_active(u->manager, j, &error);
                 if (r < 0)
-                        log_debug_errno(r, "Failed to determine whether job '%s' is pending, ignoring: %s", u->service_job, bus_error_message(&error, r));
+                        log_debug_errno(r, "Failed to determine whether job '%s' is pending, ignoring: %s",
+                                        j, bus_error_message(&error, r));
                 if (r != 0)
                         return false;
         }
 
-        /* Note that we don't care if the three units we manage for each user object are up or not, as we are managing
-         * their state rather than tracking it. */
+        /* Note that we don't care if the three units we manage for each user object are up or not, as we are
+         * managing their state rather than tracking it. */
 
         return true;
 }
@@ -718,29 +805,33 @@ UserState user_get_state(User *u) {
         if (u->stopping)
                 return USER_CLOSING;
 
-        if (!u->started || u->service_job)
+        if (!u->started || u->runtime_dir_job)
                 return USER_OPENING;
 
-        if (u->sessions) {
-                bool all_closing = true;
+        /* USER_GC_BY_PIN: Only pinning sessions count. None -> closing
+         * USER_GC_BY_ANY: 'manager' sessions also count. However, if lingering is enabled, 'lingering' state
+         *                 shall be preferred. 'online' if the manager is manually started by user. */
 
-                LIST_FOREACH(sessions_by_user, i, u->sessions) {
-                        SessionState state;
+        bool has_pinning = false, all_closing = true;
+        LIST_FOREACH(sessions_by_user, i, u->sessions) {
+                bool pinned = SESSION_CLASS_PIN_USER(i->class);
 
-                        state = session_get_state(i);
-                        if (state == SESSION_ACTIVE)
-                                return USER_ACTIVE;
-                        if (state != SESSION_CLOSING)
-                                all_closing = false;
-                }
+                if (u->gc_mode == USER_GC_BY_PIN && !pinned)
+                        continue;
 
-                return all_closing ? USER_CLOSING : USER_ONLINE;
+                has_pinning = has_pinning || pinned;
+
+                SessionState state = session_get_state(i);
+                if (state == SESSION_ACTIVE && pinned)
+                        return USER_ACTIVE;
+                if (state != SESSION_CLOSING)
+                        all_closing = false;
         }
 
-        if (user_check_linger_file(u) > 0 && user_unit_active(u))
+        if (!has_pinning && user_check_linger_file(u) > 0 && user_unit_active(u))
                 return USER_LINGERING;
 
-        return USER_CLOSING;
+        return all_closing ? USER_CLOSING : USER_ONLINE;
 }
 
 int user_kill(User *u, int signo) {
@@ -753,7 +844,7 @@ static bool elect_display_filter(Session *s) {
         /* Return true if the session is a candidate for the user’s ‘primary session’ or ‘display’. */
         assert(s);
 
-        return IN_SET(s->class, SESSION_USER, SESSION_GREETER) && s->started && !s->stopping;
+        return SESSION_CLASS_CAN_DISPLAY(s->class) && s->started && !s->stopping;
 }
 
 static int elect_display_compare(Session *s1, Session *s2) {
@@ -784,6 +875,9 @@ static int elect_display_compare(Session *s1, Session *s2) {
 
         if ((s1->class != SESSION_USER) != (s2->class != SESSION_USER))
                 return (s1->class != SESSION_USER) - (s2->class != SESSION_USER);
+
+        if ((s1->class != SESSION_USER_EARLY) != (s2->class != SESSION_USER_EARLY))
+                return (s1->class != SESSION_USER_EARLY) - (s2->class != SESSION_USER_EARLY);
 
         if ((s1->type == _SESSION_TYPE_INVALID) != (s2->type == _SESSION_TYPE_INVALID))
                 return (s1->type == _SESSION_TYPE_INVALID) - (s2->type == _SESSION_TYPE_INVALID);
@@ -828,7 +922,7 @@ void user_update_last_session_timer(User *u) {
 
         assert(u);
 
-        if (u->sessions) {
+        if (user_pinned_by_sessions(u)) {
                 /* There are sessions, turn off the timer */
                 u->last_session_timestamp = USEC_INFINITY;
                 u->timer_event_source = sd_event_source_unref(u->timer_event_source);
@@ -866,18 +960,25 @@ void user_update_last_session_timer(User *u) {
 }
 
 static const char* const user_state_table[_USER_STATE_MAX] = {
-        [USER_OFFLINE] = "offline",
-        [USER_OPENING] = "opening",
+        [USER_OFFLINE]   = "offline",
+        [USER_OPENING]   = "opening",
         [USER_LINGERING] = "lingering",
-        [USER_ONLINE] = "online",
-        [USER_ACTIVE] = "active",
-        [USER_CLOSING] = "closing"
+        [USER_ONLINE]    = "online",
+        [USER_ACTIVE]    = "active",
+        [USER_CLOSING]   = "closing"
 };
 
 DEFINE_STRING_TABLE_LOOKUP(user_state, UserState);
 
+static const char* const user_gc_mode_table[_USER_GC_MODE_MAX] = {
+        [USER_GC_BY_PIN] = "pin",
+        [USER_GC_BY_ANY] = "any",
+};
+
+DEFINE_STRING_TABLE_LOOKUP(user_gc_mode, UserGCMode);
+
 int config_parse_tmpfs_size(
-                const char* unit,
+                const char *unit,
                 const char *filename,
                 unsigned line,
                 const char *section,

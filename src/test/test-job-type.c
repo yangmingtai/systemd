@@ -3,17 +3,20 @@
 #include <stdio.h>
 
 #include "service.h"
+#include "tests.h"
 #include "unit.h"
 
 int main(int argc, char *argv[]) {
         const ServiceState test_states[] = { SERVICE_DEAD, SERVICE_RUNNING };
 
-        for (size_t i = 0; i < ELEMENTSOF(test_states); i++) {
+        test_setup_logging(LOG_DEBUG);
+
+        FOREACH_ELEMENT(state, test_states) {
                 /* fake a unit */
                 Service s = {
                         .meta.load_state = UNIT_LOADED,
                         .type = SERVICE_SIMPLE,
-                        .state = test_states[i],
+                        .state = *state,
                 };
                 Unit *u = UNIT(&s);
 

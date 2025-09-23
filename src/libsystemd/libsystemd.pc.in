@@ -9,7 +9,7 @@
 
 prefix={{PREFIX}}
 exec_prefix={{PREFIX}}
-libdir={{ROOTLIBDIR}}
+libdir={{LIBDIR}}
 includedir={{INCLUDE_DIR}}
 
 Name: systemd
@@ -18,3 +18,4 @@ URL: {{PROJECT_URL}}
 Version: {{PROJECT_VERSION}}
 Libs: -L${libdir} -lsystemd
 Cflags: -I${includedir}
+Requires.private: libcap

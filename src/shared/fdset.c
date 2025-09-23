@@ -1,30 +1,29 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <errno.h>
 #include <fcntl.h>
-#include <stddef.h>
+#include <unistd.h>
 
 #include "sd-daemon.h"
 
 #include "alloc-util.h"
+#include "async.h"
 #include "dirent-util.h"
 #include "fd-util.h"
 #include "fdset.h"
 #include "log.h"
-#include "macro.h"
 #include "parse-util.h"
-#include "path-util.h"
 #include "set.h"
 #include "stat-util.h"
+#include "string-util.h"
 
 #define MAKE_SET(s) ((Set*) s)
 #define MAKE_FDSET(s) ((FDSet*) s)
 
-FDSet *fdset_new(void) {
+FDSet* fdset_new(void) {
         return MAKE_FDSET(set_new(NULL));
 }
 
-static inline void fdset_shallow_freep(FDSet **s) {
+static void fdset_shallow_freep(FDSet **s) {
         /* Destroys the set, but does not free the fds inside, like fdset_free()! */
         set_free(MAKE_SET(*ASSERT_PTR(s)));
 }
@@ -40,8 +39,8 @@ int fdset_new_array(FDSet **ret, const int fds[], size_t n_fds) {
         if (!s)
                 return -ENOMEM;
 
-        for (size_t i = 0; i < n_fds; i++) {
-                r = fdset_put(s, fds[i]);
+        FOREACH_ARRAY(fd, fds, n_fds) {
+                r = fdset_put(s, *fd);
                 if (r < 0)
                         return r;
         }
@@ -50,10 +49,20 @@ int fdset_new_array(FDSet **ret, const int fds[], size_t n_fds) {
         return 0;
 }
 
-void fdset_close(FDSet *s) {
+int fdset_steal_first(FDSet *fds) {
         void *p;
 
-        while ((p = set_steal_first(MAKE_SET(s)))) {
+        p = set_steal_first(MAKE_SET(fds));
+        if (!p)
+                return -ENOENT;
+
+        return PTR_TO_FD(p);
+}
+
+void fdset_close(FDSet *fds, bool async) {
+        int fd;
+
+        while ((fd = fdset_steal_first(fds)) >= 0) {
                 /* Valgrind's fd might have ended up in this set here, due to fdset_new_fill(). We'll ignore
                  * all failures here, so that the EBADFD that valgrind will return us on close() doesn't
                  * influence us */
@@ -62,13 +71,28 @@ void fdset_close(FDSet *s) {
                  * which has no effect at all, since they are only duplicates. So don't be surprised about
                  * these log messages. */
 
-                log_debug("Closing set fd %i", PTR_TO_FD(p));
-                (void) close_nointr(PTR_TO_FD(p));
+                if (DEBUG_LOGGING) {
+                        _cleanup_free_ char *path = NULL;
+
+                        (void) fd_get_path(fd, &path);
+                        log_debug("Closing set fd %i (%s)", fd, strna(path));
+                }
+
+                if (async)
+                        (void) asynchronous_close(fd);
+                else
+                        (void) close(fd);
         }
 }
 
 FDSet* fdset_free(FDSet *s) {
-        fdset_close(s);
+        fdset_close(s, /* async= */ false);
+        set_free(MAKE_SET(s));
+        return NULL;
+}
+
+FDSet* fdset_free_async(FDSet *s) {
+        fdset_close(s, /* async= */ true);
         set_free(MAKE_SET(s));
         return NULL;
 }
@@ -125,7 +149,7 @@ bool fdset_contains(FDSet *s, int fd) {
                 return false;
         }
 
-        return !!set_get(MAKE_SET(s), FD_TO_PTR(fd));
+        return set_contains(MAKE_SET(s), FD_TO_PTR(fd));
 }
 
 int fdset_remove(FDSet *s, int fd) {
@@ -139,14 +163,18 @@ int fdset_remove(FDSet *s, int fd) {
         return set_remove(MAKE_SET(s), FD_TO_PTR(fd)) ? fd : -ENOENT;
 }
 
-int fdset_new_fill(FDSet **ret) {
+int fdset_new_fill(
+                int filter_cloexec, /* if < 0 takes all fds, otherwise only those with O_CLOEXEC set (1) or unset (0) */
+                FDSet **ret) {
+
         _cleanup_(fdset_shallow_freep) FDSet *s = NULL;
         _cleanup_closedir_ DIR *d = NULL;
         int r;
 
         assert(ret);
 
-        /* Creates an fdset and fills in all currently open file descriptors. */
+        /* Creates an fdset and fills in all currently open file descriptors. Also set all collected fds
+         * to CLOEXEC. */
 
         d = opendir("/proc/self/fd");
         if (!d) {
@@ -161,16 +189,41 @@ int fdset_new_fill(FDSet **ret) {
                 return -ENOMEM;
 
         FOREACH_DIRENT(de, d, return -errno) {
-                int fd = -EBADF;
+                int fd;
 
-                r = safe_atoi(de->d_name, &fd);
-                if (r < 0)
-                        return r;
+                if (!IN_SET(de->d_type, DT_LNK, DT_UNKNOWN))
+                        continue;
+
+                fd = parse_fd(de->d_name);
+                if (fd < 0)
+                        return fd;
 
                 if (fd < 3)
                         continue;
                 if (fd == dirfd(d))
                         continue;
+
+                if (filter_cloexec >= 0) {
+                        int fl;
+
+                        /* If user asked for that filter by O_CLOEXEC. This is useful so that fds that have
+                         * been passed in can be collected and fds which have been created locally can be
+                         * ignored, under the assumption that only the latter have O_CLOEXEC set. */
+
+                        fl = fcntl(fd, F_GETFD);
+                        if (fl < 0)
+                                return -errno;
+
+                        if (FLAGS_SET(fl, FD_CLOEXEC) != !!filter_cloexec)
+                                continue;
+                }
+
+                /* We need to set CLOEXEC manually only if we're collecting non-CLOEXEC fds. */
+                if (filter_cloexec <= 0) {
+                        r = fd_cloexec(fd, true);
+                        if (r < 0)
+                                return r;
+                }
 
                 r = fdset_put(s, fd);
                 if (r < 0)
@@ -182,13 +235,13 @@ int fdset_new_fill(FDSet **ret) {
 }
 
 int fdset_cloexec(FDSet *fds, bool b) {
-        void *p;
         int r;
 
         assert(fds);
 
-        SET_FOREACH(p, MAKE_SET(fds)) {
-                r = fd_cloexec(PTR_TO_FD(p), b);
+        int fd;
+        FDSET_FOREACH(fd, fds) {
+                r = fd_cloexec(fd, b);
                 if (r < 0)
                         return r;
         }
@@ -198,30 +251,36 @@ int fdset_cloexec(FDSet *fds, bool b) {
 
 int fdset_new_listen_fds(FDSet **ret, bool unset) {
         _cleanup_(fdset_shallow_freep) FDSet *s = NULL;
-        int n, fd, r;
+        int n, r;
 
         assert(ret);
 
         /* Creates an fdset and fills in all passed file descriptors */
 
+        n = sd_listen_fds(unset);
+        if (n < 0)
+                return n;
+        if (n == 0) {
+                *ret = NULL;
+                return 0;
+        }
+
         s = fdset_new();
         if (!s)
                 return -ENOMEM;
 
-        n = sd_listen_fds(unset);
-        for (fd = SD_LISTEN_FDS_START; fd < SD_LISTEN_FDS_START + n; fd ++) {
+        for (int fd = SD_LISTEN_FDS_START; fd < SD_LISTEN_FDS_START + n; fd++) {
                 r = fdset_put(s, fd);
                 if (r < 0)
                         return r;
         }
 
         *ret = TAKE_PTR(s);
-        return 0;
+        return n;
 }
 
 int fdset_to_array(FDSet *fds, int **ret) {
         unsigned j = 0, m;
-        void *e;
         int *a;
 
         assert(ret);
@@ -238,8 +297,9 @@ int fdset_to_array(FDSet *fds, int **ret) {
         if (!a)
                 return -ENOMEM;
 
-        SET_FOREACH(e, MAKE_SET(fds))
-                a[j++] = PTR_TO_FD(e);
+        int fd;
+        FDSET_FOREACH(fd, fds)
+                a[j++] = fd;
 
         assert(j == m);
 
@@ -270,16 +330,6 @@ int fdset_iterate(FDSet *s, Iterator *i) {
         void *p;
 
         if (!set_iterate(MAKE_SET(s), i, &p))
-                return -ENOENT;
-
-        return PTR_TO_FD(p);
-}
-
-int fdset_steal_first(FDSet *fds) {
-        void *p;
-
-        p = set_steal_first(MAKE_SET(fds));
-        if (!p)
                 return -ENOENT;
 
         return PTR_TO_FD(p);

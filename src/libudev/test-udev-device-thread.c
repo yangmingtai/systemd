@@ -1,15 +1,15 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <errno.h>
 #include <pthread.h>
 #include <stdio.h>
-#include <stdlib.h>
 
 #include "libudev.h"
 
+#include "tests.h"
+
 #define handle_error_errno(error, msg)                          \
         ({                                                      \
-                errno = abs(error);                             \
+                errno = ABS(error);                             \
                 perror(msg);                                    \
                 EXIT_FAILURE;                                   \
         })
@@ -29,8 +29,12 @@ int main(int argc, char *argv[]) {
         int r;
 
         loopback = udev_device_new_from_syspath(NULL, "/sys/class/net/lo");
-        if (!loopback)
+        if (!loopback) {
+                if (errno == ENODEV)
+                        return log_tests_skipped_errno(errno, "Loopback device not found");
+
                 return handle_error_errno(errno, "Failed to create loopback device object");
+        }
 
         entry = udev_device_get_properties_list_entry(loopback);
         udev_list_entry_foreach(e, entry)

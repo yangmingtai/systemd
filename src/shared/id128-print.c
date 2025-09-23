@@ -8,15 +8,12 @@
 #include "id128-print.h"
 #include "log.h"
 #include "pretty-print.h"
-#include "terminal-util.h"
 
 int id128_pretty_print_sample(const char *name, sd_id128_t id) {
-       _cleanup_free_ char *man_link = NULL, *mod_link = NULL;
-        const char *on, *off;
-        unsigned i;
+        _cleanup_free_ char *man_link = NULL, *mod_link = NULL;
 
-        on = ansi_highlight();
-        off = ansi_normal();
+        const char *on = ansi_highlight(),
+                   *off = ansi_normal();
 
         if (terminal_urlify("man:systemd-id128(1)", "systemd-id128(1)", &man_link) < 0)
                 return log_oom();
@@ -34,8 +31,8 @@ int id128_pretty_print_sample(const char *name, sd_id128_t id) {
                on, SD_ID128_FORMAT_VAL(id), off,
                man_link,
                on, name);
-        for (i = 0; i < 16; i++)
-                printf("%02x%s", id.bytes[i], i != 15 ? "," : "");
+        for (size_t i = 0; i < 16; i++)
+                printf("%02x%s", id.bytes[i], i < 15 ? "," : "");
         printf(")%s\n\n", off);
 
         printf("As Python constant:\n"
@@ -46,7 +43,6 @@ int id128_pretty_print_sample(const char *name, sd_id128_t id) {
 
         return 0;
 }
-
 
 int id128_pretty_print(sd_id128_t id, Id128PrettyPrintMode mode) {
         assert(mode >= 0);

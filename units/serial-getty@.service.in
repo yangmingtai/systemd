@@ -10,7 +10,7 @@
 [Unit]
 Description=Serial Getty on %I
 Documentation=man:agetty(8) man:systemd-getty-generator(8)
-Documentation=http://0pointer.de/blog/projects/serial-console.html
+Documentation=https://0pointer.de/blog/projects/serial-console.html
 BindsTo=dev-%i.device
 After=dev-%i.device systemd-user-sessions.service plymouth-quit-wait.service getty-pre.target
 {% if HAVE_SYSV_COMPAT %}
@@ -30,10 +30,7 @@ Conflicts=rescue.service
 Before=rescue.service
 
 [Service]
-# The '-o' option value tells agetty to replace 'login' arguments with an
-# option to preserve environment (-p), followed by '--' for safety, and then
-# the entered username.
-ExecStart=-/sbin/agetty -o '-p -- \\u' --keep-baud 115200,57600,38400,9600 - $TERM
+ExecStart=-{{AGETTY}} --noreset --noclear --issue-file=/etc/issue:/etc/issue.d:/run/issue.d:/usr/lib/issue.d --keep-baud 115200,57600,38400,9600 - ${TERM}
 Type=idle
 Restart=always
 UtmpIdentifier=%I
@@ -47,6 +44,11 @@ KillMode=process
 {% endif %}
 IgnoreSIGPIPE=no
 SendSIGHUP=yes
+ImportCredential=tty.serial.%I.agetty.*:agetty.
+ImportCredential=tty.serial.%I.login.*:login.
+ImportCredential=agetty.*
+ImportCredential=login.*
+ImportCredential=shell.*
 
 [Install]
 WantedBy=getty.target

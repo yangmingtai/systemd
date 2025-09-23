@@ -1,11 +1,15 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
+#include "sd-bus.h"
+
 #include "alloc-util.h"
-#include "cap-list.h"
+#include "capability-list.h"
 #include "conf-parser.h"
 #include "cpu-set-util.h"
-#include "hostname-util.h"
+#include "extract-word.h"
 #include "namespace-util.h"
+#include "nspawn-expose-ports.h"
+#include "nspawn-mount.h"
 #include "nspawn-network.h"
 #include "nspawn-settings.h"
 #include "parse-util.h"
@@ -132,8 +136,9 @@ Settings* settings_free(Settings *s) {
         strv_free(s->syscall_deny_list);
         rlimit_free_all(s->rlimit);
         free(s->hostname);
-        cpu_set_reset(&s->cpu_set);
+        cpu_set_done(&s->cpu_set);
         strv_free(s->bind_user);
+        free(s->bind_user_shell);
 
         strv_free(s->network_interfaces);
         strv_free(s->network_macvlan);
@@ -232,7 +237,7 @@ int settings_allocate_properties(Settings *s) {
         return 0;
 }
 
-DEFINE_CONFIG_PARSE_ENUM(config_parse_volatile_mode, volatile_mode, VolatileMode, "Failed to parse volatile mode");
+DEFINE_CONFIG_PARSE_ENUM(config_parse_volatile_mode, volatile_mode, VolatileMode);
 
 int config_parse_expose_port(
                 const char *unit,
@@ -813,43 +818,24 @@ int config_parse_oom_score_adjust(
         return 0;
 }
 
-int config_parse_cpu_affinity(
-                const char *unit,
-                const char *filename,
-                unsigned line,
-                const char *section,
-                unsigned section_line,
-                const char *lvalue,
-                int ltype,
-                const char *rvalue,
-                void *data,
-                void *userdata) {
-
-        Settings *settings = ASSERT_PTR(data);
-
-        assert(rvalue);
-
-        return parse_cpu_set_extend(rvalue, &settings->cpu_set, true, unit, filename, line, lvalue);
-}
-
-DEFINE_CONFIG_PARSE_ENUM(config_parse_resolv_conf, resolv_conf_mode, ResolvConfMode, "Failed to parse resolv.conf mode");
+DEFINE_CONFIG_PARSE_ENUM(config_parse_resolv_conf, resolv_conf_mode, ResolvConfMode);
 
 static const char *const resolv_conf_mode_table[_RESOLV_CONF_MODE_MAX] = {
-        [RESOLV_CONF_OFF] = "off",
-        [RESOLV_CONF_COPY_HOST] = "copy-host",
-        [RESOLV_CONF_COPY_STATIC] = "copy-static",
-        [RESOLV_CONF_COPY_UPLINK] = "copy-uplink",
-        [RESOLV_CONF_COPY_STUB] = "copy-stub",
-        [RESOLV_CONF_REPLACE_HOST] = "replace-host",
+        [RESOLV_CONF_OFF]            = "off",
+        [RESOLV_CONF_COPY_HOST]      = "copy-host",
+        [RESOLV_CONF_COPY_STATIC]    = "copy-static",
+        [RESOLV_CONF_COPY_UPLINK]    = "copy-uplink",
+        [RESOLV_CONF_COPY_STUB]      = "copy-stub",
+        [RESOLV_CONF_REPLACE_HOST]   = "replace-host",
         [RESOLV_CONF_REPLACE_STATIC] = "replace-static",
         [RESOLV_CONF_REPLACE_UPLINK] = "replace-uplink",
-        [RESOLV_CONF_REPLACE_STUB] = "replace-stub",
-        [RESOLV_CONF_BIND_HOST] = "bind-host",
-        [RESOLV_CONF_BIND_STATIC] = "bind-static",
-        [RESOLV_CONF_BIND_UPLINK] = "bind-uplink",
-        [RESOLV_CONF_BIND_STUB] = "bind-stub",
-        [RESOLV_CONF_DELETE] = "delete",
-        [RESOLV_CONF_AUTO] = "auto",
+        [RESOLV_CONF_REPLACE_STUB]   = "replace-stub",
+        [RESOLV_CONF_BIND_HOST]      = "bind-host",
+        [RESOLV_CONF_BIND_STATIC]    = "bind-static",
+        [RESOLV_CONF_BIND_UPLINK]    = "bind-uplink",
+        [RESOLV_CONF_BIND_STUB]      = "bind-stub",
+        [RESOLV_CONF_DELETE]         = "delete",
+        [RESOLV_CONF_AUTO]           = "auto",
 };
 
 DEFINE_STRING_TABLE_LOOKUP_WITH_BOOLEAN(resolv_conf_mode, ResolvConfMode, RESOLV_CONF_AUTO);
@@ -914,29 +900,31 @@ int config_parse_link_journal(
         return 0;
 }
 
-DEFINE_CONFIG_PARSE_ENUM(config_parse_timezone, timezone_mode, TimezoneMode, "Failed to parse timezone mode");
+DEFINE_CONFIG_PARSE_ENUM(config_parse_timezone_mode, timezone_mode, TimezoneMode);
 
 static const char *const timezone_mode_table[_TIMEZONE_MODE_MAX] = {
-        [TIMEZONE_OFF] = "off",
-        [TIMEZONE_COPY] = "copy",
-        [TIMEZONE_BIND] = "bind",
+        [TIMEZONE_OFF]     = "off",
+        [TIMEZONE_COPY]    = "copy",
+        [TIMEZONE_BIND]    = "bind",
         [TIMEZONE_SYMLINK] = "symlink",
-        [TIMEZONE_DELETE] = "delete",
-        [TIMEZONE_AUTO] = "auto",
+        [TIMEZONE_DELETE]  = "delete",
+        [TIMEZONE_AUTO]    = "auto",
 };
 
 DEFINE_STRING_TABLE_LOOKUP_WITH_BOOLEAN(timezone_mode, TimezoneMode, TIMEZONE_AUTO);
 
-DEFINE_CONFIG_PARSE_ENUM(config_parse_userns_ownership, user_namespace_ownership, UserNamespaceOwnership, "Failed to parse user namespace ownership mode");
+DEFINE_CONFIG_PARSE_ENUM(config_parse_userns_ownership, user_namespace_ownership, UserNamespaceOwnership);
 
 static const char *const user_namespace_ownership_table[_USER_NAMESPACE_OWNERSHIP_MAX] = {
-        [USER_NAMESPACE_OWNERSHIP_OFF] = "off",
-        [USER_NAMESPACE_OWNERSHIP_CHOWN] = "chown",
-        [USER_NAMESPACE_OWNERSHIP_MAP] = "map",
-        [USER_NAMESPACE_OWNERSHIP_AUTO] = "auto",
+        [USER_NAMESPACE_OWNERSHIP_OFF]     = "off",
+        [USER_NAMESPACE_OWNERSHIP_CHOWN]   = "chown",
+        [USER_NAMESPACE_OWNERSHIP_MAP]     = "map",
+        [USER_NAMESPACE_OWNERSHIP_FOREIGN] = "foreign",
+        [USER_NAMESPACE_OWNERSHIP_AUTO]    = "auto",
 };
 
-DEFINE_STRING_TABLE_LOOKUP(user_namespace_ownership, UserNamespaceOwnership);
+/* Note: while "yes" maps to "auto" here, we don't really document that, in order to make things clearer and less confusing to users. */
+DEFINE_STRING_TABLE_LOOKUP_WITH_BOOLEAN(user_namespace_ownership, UserNamespaceOwnership, USER_NAMESPACE_OWNERSHIP_AUTO);
 
 int config_parse_userns_chown(
                 const char *unit,
@@ -1010,6 +998,48 @@ int config_parse_bind_user(
                 if (strv_consume(bind_user, TAKE_PTR(word)) < 0)
                         return log_oom();
         }
+
+        return 0;
+}
+
+int config_parse_bind_user_shell(
+                const char *unit,
+                const char *filename,
+                unsigned line,
+                const char *section,
+                unsigned section_line,
+                const char *lvalue,
+                int ltype,
+                const char *rvalue,
+                void *data,
+                void *userdata) {
+
+        Settings *settings = ASSERT_PTR(data);
+        char *sh = NULL;
+        bool copy = false;
+        int r;
+
+        assert(rvalue);
+
+        if (isempty(rvalue)) {
+                settings->bind_user_shell = mfree(settings->bind_user_shell);
+                settings->bind_user_shell_copy = false;
+                settings->bind_user_shell_set = false;
+
+                return 0;
+        }
+
+        r = parse_user_shell(rvalue, &sh, &copy);
+        if (r == -ENOMEM)
+                return log_oom();
+        if (r < 0) {
+                log_syntax(unit, LOG_WARNING, filename, line, r, "Failed to parse BindUserShell= value, ignoring: %s", rvalue);
+                return 0;
+        }
+
+        free_and_replace(settings->bind_user_shell, sh);
+        settings->bind_user_shell_copy = copy;
+        settings->bind_user_shell_set = true;
 
         return 0;
 }

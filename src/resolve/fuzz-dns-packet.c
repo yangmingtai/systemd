@@ -1,7 +1,6 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include "fuzz.h"
-#include "memory-util.h"
 #include "resolved-dns-packet.h"
 
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
@@ -9,6 +8,8 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
 
         if (outside_size_range(size, 0, DNS_PACKET_SIZE_MAX))
                 return 0;
+
+        fuzz_setup_logging();
 
         assert_se(dns_packet_new(&p, DNS_PROTOCOL_DNS, 0, DNS_PACKET_SIZE_MAX) >= 0);
         p->size = 0; /* by default append starts after the header, undo that */

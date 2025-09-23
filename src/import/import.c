@@ -2,32 +2,35 @@
 
 #include <getopt.h>
 #include <locale.h>
+#include <unistd.h>
 
 #include "sd-event.h"
-#include "sd-id128.h"
 
 #include "alloc-util.h"
+#include "ansi-color.h"
 #include "build.h"
 #include "discover-image.h"
 #include "env-util.h"
 #include "fd-util.h"
-#include "fs-util.h"
-#include "hostname-util.h"
 #include "import-raw.h"
 #include "import-tar.h"
 #include "import-util.h"
 #include "io-util.h"
+#include "log.h"
 #include "main-func.h"
 #include "parse-argument.h"
 #include "parse-util.h"
+#include "path-util.h"
+#include "runtime-scope.h"
 #include "signal-util.h"
 #include "string-util.h"
-#include "terminal-util.h"
 #include "verbs.h"
 
-static const char *arg_image_root = "/var/lib/machines";
+static const char *arg_image_root = NULL;
 static ImportFlags arg_import_flags = IMPORT_BTRFS_SUBVOL | IMPORT_BTRFS_QUOTA | IMPORT_CONVERT_QCOW2 | IMPORT_SYNC;
 static uint64_t arg_offset = UINT64_MAX, arg_size_max = UINT64_MAX;
+static ImageClass arg_class = IMAGE_MACHINE;
+static RuntimeScope arg_runtime_scope = _RUNTIME_SCOPE_INVALID;
 
 static int normalize_local(const char *local, char **ret) {
         _cleanup_free_ char *ll = NULL;
@@ -53,7 +56,7 @@ static int normalize_local(const char *local, char **ret) {
                                                "Local path name '%s' is not valid.", local);
         } else {
                 if (local) {
-                        if (!hostname_is_valid(local, 0))
+                        if (!image_name_is_valid(local))
                                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                                        "Local image name '%s' is not valid.",
                                                        local);
@@ -61,7 +64,7 @@ static int normalize_local(const char *local, char **ret) {
                         local = "imported";
 
                 if (!FLAGS_SET(arg_import_flags, IMPORT_FORCE)) {
-                        r = image_find(IMAGE_MACHINE, local, NULL, NULL);
+                        r = image_find(arg_runtime_scope, arg_class, local, NULL, NULL);
                         if (r < 0) {
                                 if (r != -ENOENT)
                                         return log_error_errno(r, "Failed to check whether image '%s' exists: %m", local);
@@ -113,6 +116,12 @@ static int open_source(const char *path, const char *local, int *ret_open_fd) {
                         log_info("Importing '%s', saving as '%s'.", strempty(pretty), local);
         }
 
+        if (!FLAGS_SET(arg_import_flags, IMPORT_DIRECT))
+                log_info("Operating on image directory '%s'.", arg_image_root);
+
+        if (!FLAGS_SET(arg_import_flags, IMPORT_SYNC))
+                log_info("File system synchronization on completion is off.");
+
         *ret_open_fd = TAKE_FD(open_fd);
         return retval;
 }
@@ -124,7 +133,7 @@ static void on_tar_finished(TarImport *import, int error, void *userdata) {
         if (error == 0)
                 log_info("Operation completed successfully.");
 
-        sd_event_exit(event, abs(error));
+        sd_event_exit(event, ABS(error));
 }
 
 static int import_tar(int argc, char *argv[], void *userdata) {
@@ -160,14 +169,11 @@ static int import_tar(int argc, char *argv[], void *userdata) {
 
         fd = open_source(path, normalized, &open_fd);
         if (fd < 0)
-                return r;
+                return fd;
 
         r = import_allocate_event_with_signals(&event);
         if (r < 0)
                 return r;
-
-        if (!FLAGS_SET(arg_import_flags, IMPORT_SYNC))
-                log_info("File system synchronization on completion is off.");
 
         r = tar_import_new(&import, event, arg_image_root, on_tar_finished, event);
         if (r < 0)
@@ -196,7 +202,7 @@ static void on_raw_finished(RawImport *import, int error, void *userdata) {
         if (error == 0)
                 log_info("Operation completed successfully.");
 
-        sd_event_exit(event, abs(error));
+        sd_event_exit(event, ABS(error));
 }
 
 static int import_raw(int argc, char *argv[], void *userdata) {
@@ -238,9 +244,6 @@ static int import_raw(int argc, char *argv[], void *userdata) {
         if (r < 0)
                 return r;
 
-        if (!FLAGS_SET(arg_import_flags, IMPORT_SYNC))
-                log_info("File system synchronization on completion is off.");
-
         r = raw_import_new(&import, event, arg_image_root, on_raw_finished, event);
         if (r < 0)
                 return log_error_errno(r, "Failed to allocate importer: %m");
@@ -266,7 +269,7 @@ static int import_raw(int argc, char *argv[], void *userdata) {
 static int help(int argc, char *argv[], void *userdata) {
 
         printf("%1$s [OPTIONS...] {COMMAND} ...\n"
-               "\n%4$sImport container or virtual machine images.%5$s\n"
+               "\n%4$sImport disk images.%5$s\n"
                "\n%2$sCommands:%3$s\n"
                "  tar FILE [NAME]             Import a TAR image\n"
                "  raw FILE [NAME]             Import a RAW image\n"
@@ -285,7 +288,9 @@ static int help(int argc, char *argv[], void *userdata) {
                "                              regular disk images\n"
                "     --sync=BOOL              Controls whether to sync() before completing\n"
                "     --offset=BYTES           Offset to seek to in destination\n"
-               "     --size-max=BYTES         Maximum number of bytes to write to destination\n",
+               "     --size-max=BYTES         Maximum number of bytes to write to destination\n"
+               "     --class=CLASS            Select image class (machine, sysext, confext,\n"
+               "                              portable)\n",
                program_invocation_short_name,
                ansi_underline(),
                ansi_normal(),
@@ -309,6 +314,7 @@ static int parse_argv(int argc, char *argv[]) {
                 ARG_SYNC,
                 ARG_OFFSET,
                 ARG_SIZE_MAX,
+                ARG_CLASS,
         };
 
         static const struct option options[] = {
@@ -324,6 +330,7 @@ static int parse_argv(int argc, char *argv[]) {
                 { "sync",            required_argument, NULL, ARG_SYNC            },
                 { "offset",          required_argument, NULL, ARG_OFFSET          },
                 { "size-max",        required_argument, NULL, ARG_SIZE_MAX        },
+                { "class",           required_argument, NULL, ARG_CLASS           },
                 {}
         };
 
@@ -416,6 +423,13 @@ static int parse_argv(int argc, char *argv[]) {
                         break;
                 }
 
+                case ARG_CLASS:
+                        arg_class = image_class_from_string(optarg);
+                        if (arg_class < 0)
+                                return log_error_errno(arg_class, "Failed to parse --class= argument: %s", optarg);
+
+                        break;
+
                 case '?':
                         return -EINVAL;
 
@@ -431,6 +445,9 @@ static int parse_argv(int argc, char *argv[]) {
 
         if (arg_offset != UINT64_MAX && !FLAGS_SET(arg_import_flags, IMPORT_DIRECT))
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "File offset only supported in --direct mode.");
+
+        if (!arg_image_root)
+                arg_image_root = image_root_to_string(arg_class);
 
         return 1;
 }
@@ -475,8 +492,7 @@ static int run(int argc, char *argv[]) {
         int r;
 
         setlocale(LC_ALL, "");
-        log_parse_environment();
-        log_open();
+        log_setup();
 
         parse_env();
 

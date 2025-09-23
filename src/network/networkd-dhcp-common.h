@@ -3,11 +3,9 @@
 
 #include <netinet/in.h>
 
-#include "conf-parser.h"
-#include "dhcp-identifier.h"
+#include "dhcp-duid-internal.h"
 #include "in-addr-util.h"
-#include "set.h"
-#include "time-util.h"
+#include "networkd-forward.h"
 
 /* Special values for *_uplink_index. */
 #define UPLINK_INDEX_AUTO  0 /* uplink will be selected automatically */
@@ -19,18 +17,6 @@
 #define IPV6RA_ROUTE_METRIC_MEDIUM 1024
 #define IPV6RA_ROUTE_METRIC_LOW    2048
 #define DHCP6PD_ROUTE_METRIC 256
-
-typedef struct Link Link;
-typedef struct Manager Manager;
-typedef struct Network Network;
-
-typedef enum DHCPUseDomains {
-        DHCP_USE_DOMAINS_NO,
-        DHCP_USE_DOMAINS_YES,
-        DHCP_USE_DOMAINS_ROUTE,
-        _DHCP_USE_DOMAINS_MAX,
-        _DHCP_USE_DOMAINS_INVALID = -EINVAL,
-} DHCPUseDomains;
 
 typedef enum DHCPOptionDataType {
         DHCP_OPTION_DATA_UINT8,
@@ -48,13 +34,13 @@ typedef struct DUID {
         DUIDType type;
 
         uint8_t raw_data_len;
-        uint8_t raw_data[MAX_DUID_LEN];
+        uint8_t raw_data[MAX_DUID_DATA_LEN];
         usec_t llt_time;
         bool set;
 } DUID;
 
 uint32_t link_get_dhcp4_route_table(Link *link);
-uint32_t link_get_ipv6_accept_ra_route_table(Link *link);
+uint32_t link_get_ndisc_route_table(Link *link);
 
 bool link_dhcp_enabled(Link *link, int family);
 static inline bool link_dhcp4_enabled(Link *link) {
@@ -85,18 +71,15 @@ static inline bool in6_prefix_is_filtered(const struct in6_addr *prefix, uint8_t
         return address_is_filtered(AF_INET6, &(union in_addr_union) { .in6 = *prefix }, prefixlen, allow_list, deny_list);
 }
 
-const char* dhcp_use_domains_to_string(DHCPUseDomains p) _const_;
-DHCPUseDomains dhcp_use_domains_from_string(const char *s) _pure_;
+int link_get_captive_portal(Link *link, const char **ret);
 
-const char *dhcp_option_data_type_to_string(DHCPOptionDataType d) _const_;
+const char* dhcp_option_data_type_to_string(DHCPOptionDataType d) _const_;
 DHCPOptionDataType dhcp_option_data_type_from_string(const char *d) _pure_;
 
 CONFIG_PARSER_PROTOTYPE(config_parse_dhcp);
 CONFIG_PARSER_PROTOTYPE(config_parse_dhcp_route_metric);
-CONFIG_PARSER_PROTOTYPE(config_parse_ipv6_accept_ra_route_metric);
-CONFIG_PARSER_PROTOTYPE(config_parse_dhcp_use_dns);
-CONFIG_PARSER_PROTOTYPE(config_parse_dhcp_use_domains);
-CONFIG_PARSER_PROTOTYPE(config_parse_dhcp_use_ntp);
+CONFIG_PARSER_PROTOTYPE(config_parse_ndisc_route_metric);
+CONFIG_PARSER_PROTOTYPE(config_parse_dhcp_send_hostname);
 CONFIG_PARSER_PROTOTYPE(config_parse_iaid);
 CONFIG_PARSER_PROTOTYPE(config_parse_dhcp_or_ra_route_table);
 CONFIG_PARSER_PROTOTYPE(config_parse_dhcp_user_or_vendor_class);

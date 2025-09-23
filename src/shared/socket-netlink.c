@@ -1,15 +1,18 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <arpa/inet.h>
-#include <errno.h>
-#include <net/if.h>
+#include <linux/net_namespace.h>
+#include <linux/unix_diag.h>
 #include <string.h>
+#include <sys/stat.h>
+
+#include "sd-netlink.h"
 
 #include "alloc-util.h"
-#include "errno-util.h"
 #include "extract-word.h"
+#include "fd-util.h"
 #include "log.h"
-#include "memory-util.h"
+#include "namespace-util.h"
+#include "netlink-sock-diag.h"
 #include "netlink-util.h"
 #include "parse-util.h"
 #include "socket-netlink.h"
@@ -180,7 +183,7 @@ int make_socket_fd(int log_level, const char* address, int type, int flags) {
 
         a.type = type;
 
-        fd = socket_address_listen(&a, type | flags, SOMAXCONN, SOCKET_ADDRESS_DEFAULT,
+        fd = socket_address_listen(&a, type | flags, SOMAXCONN_DELUXE, SOCKET_ADDRESS_DEFAULT,
                                    NULL, false, false, false, 0755, 0644, NULL);
         if (fd < 0 || log_get_max_level() >= log_level) {
                 _cleanup_free_ char *p = NULL;
@@ -343,6 +346,15 @@ struct in_addr_full *in_addr_full_free(struct in_addr_full *a) {
         return mfree(a);
 }
 
+void in_addr_full_array_free(struct in_addr_full *addrs[], size_t n) {
+        assert(addrs || n == 0);
+
+        FOREACH_ARRAY(a, addrs, n)
+                in_addr_full_freep(a);
+
+        free(addrs);
+}
+
 int in_addr_full_new(
                 int family,
                 const union in_addr_union *a,
@@ -393,7 +405,7 @@ int in_addr_full_new_from_string(const char *s, struct in_addr_full **ret) {
         return in_addr_full_new(family, &a, port, ifindex, server_name, ret);
 }
 
-const char *in_addr_full_to_string(struct in_addr_full *a) {
+const char* in_addr_full_to_string(struct in_addr_full *a) {
         assert(a);
 
         if (!a->cached_server_string)
@@ -406,4 +418,122 @@ const char *in_addr_full_to_string(struct in_addr_full *a) {
                                 &a->cached_server_string);
 
         return a->cached_server_string;
+}
+
+int netns_get_nsid(int netnsfd, uint32_t *ret) {
+        _cleanup_(sd_netlink_message_unrefp) sd_netlink_message *req = NULL, *reply = NULL;
+        _cleanup_(sd_netlink_unrefp) sd_netlink *rtnl = NULL;
+        _cleanup_close_ int _netns_fd = -EBADF;
+        int r;
+
+        if (netnsfd < 0) {
+                _netns_fd = namespace_open_by_type(NAMESPACE_NET);
+                if (_netns_fd < 0)
+                        return _netns_fd;
+
+                netnsfd = _netns_fd;
+        }
+
+        r = sd_netlink_open(&rtnl);
+        if (r < 0)
+                return r;
+
+        r = sd_rtnl_message_new_nsid(rtnl, &req, RTM_GETNSID);
+        if (r < 0)
+                return r;
+
+        r = sd_netlink_message_append_s32(req, NETNSA_FD, netnsfd);
+        if (r < 0)
+                return r;
+
+        r = sd_netlink_call(rtnl, req, 0, &reply);
+        if (r < 0)
+                return r;
+
+        for (sd_netlink_message *m = reply; m; m = sd_netlink_message_next(m)) {
+                uint16_t type;
+
+                r = sd_netlink_message_get_errno(m);
+                if (r < 0)
+                        return r;
+
+                r = sd_netlink_message_get_type(m, &type);
+                if (r < 0)
+                        return r;
+                if (type != RTM_NEWNSID)
+                        continue;
+
+                uint32_t u;
+                r = sd_netlink_message_read_u32(m, NETNSA_NSID, &u);
+                if (r < 0)
+                        return r;
+
+                if (u == (uint32_t) NETNSA_NSID_NOT_ASSIGNED) /* no NSID assigned yet */
+                        return -ENODATA;
+
+                if (ret)
+                        *ret = u;
+
+                return 0;
+        }
+
+        return -ENXIO;
+}
+
+int af_unix_get_qlen(int fd, uint32_t *ret) {
+        int r;
+
+        assert(fd >= 0);
+        assert(ret);
+
+        /* Returns the current queue length for an AF_UNIX listening socket */
+
+        struct stat st;
+        if (fstat(fd, &st) < 0)
+                return -errno;
+        if (!S_ISSOCK(st.st_mode))
+                return -ENOTSOCK;
+
+        _cleanup_(sd_netlink_unrefp) sd_netlink *nl = NULL;
+        r = sd_sock_diag_socket_open(&nl);
+        if (r < 0)
+                return r;
+
+        uint64_t cookie;
+        r = socket_get_cookie(fd, &cookie);
+        if (r < 0)
+                return r;
+
+        _cleanup_(sd_netlink_message_unrefp) sd_netlink_message *message = NULL;
+        r = sd_sock_diag_message_new_unix(nl, &message, st.st_ino, cookie, UDIAG_SHOW_RQLEN);
+        if (r < 0)
+                return r;
+
+        _cleanup_(sd_netlink_message_unrefp) sd_netlink_message *reply = NULL;
+        r = sd_netlink_call(nl, message, /* timeout= */ 0, &reply);
+        if (r < 0)
+                return r;
+
+        for (sd_netlink_message *m = reply; m; m = sd_netlink_message_next(m)) {
+                r = sd_netlink_message_get_errno(m);
+                if (r < 0)
+                        return r;
+
+                _cleanup_free_ void *data = NULL;
+                size_t size = 0;
+
+                r = sd_netlink_message_read_data(m, UNIX_DIAG_RQLEN, &size, &data);
+                if (r == -ENODATA)
+                        continue;
+                if (r < 0)
+                        return r;
+
+                assert(size == sizeof(struct unix_diag_rqlen));
+                const struct unix_diag_rqlen *udrql = ASSERT_PTR(data);
+
+                *ret = udrql->udiag_rqueue;
+                return 0;
+        }
+
+        return -ENODATA;
 }

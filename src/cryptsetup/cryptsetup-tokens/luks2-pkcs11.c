@@ -3,10 +3,12 @@
 #include <p11-kit/p11-kit.h>
 #include <p11-kit/uri.h>
 
+#include "sd-json.h"
+
+#include "alloc-util.h"
 #include "cryptsetup-token-util.h"
 #include "escape.h"
 #include "hexdecoct.h"
-#include "json.h"
 #include "luks2-pkcs11.h"
 #include "memory-util.h"
 #include "pkcs11-util.h"
@@ -50,12 +52,12 @@ static int luks2_pkcs11_callback(
         /* Called for every token matching our URI */
         r = pkcs11_token_login_by_pin(m, session, token_info, token_label, data->pin, data->pin_size);
         if (r == -ENOLCK) {
-                /* Referesh the token info, so that we can prompt knowing the new flags if they changed. */
+                /* Refresh the token info, so that we can prompt knowing the new flags if they changed. */
                 rv = m->C_GetTokenInfo(slot_id, &updated_token_info);
                 if (rv != CKR_OK) {
                         crypt_log_error(data->cd,
                                        "Failed to acquire updated security token information for slot %lu: %s",
-                                       slot_id, p11_kit_strerror(rv));
+                                       slot_id, sym_p11_kit_strerror(rv));
                         return -EIO;
                 }
                 token_info = &updated_token_info;
@@ -157,7 +159,8 @@ static int acquire_luks2_key_systemd(
         assert(params);
 
         data.friendly_name = params->friendly_name;
-        data.headless = params->headless;
+        data.askpw_credential = params->askpw_credential;
+        data.askpw_flags = params->askpw_flags;
         data.until = params->until;
 
         /* The functions called here log about all errors, except for EAGAIN which means "token not found right now" */
@@ -216,7 +219,7 @@ int acquire_luks2_key(
 
         base64_encoded_size = base64mem(decrypted_key, decrypted_key_size, &base64_encoded);
         if (base64_encoded_size < 0)
-                return crypt_log_error_errno(cd, (int) base64_encoded_size, "Can not base64 encode key: %m");
+                return crypt_log_error_errno(cd, (int) base64_encoded_size, "Cannot base64 encode key: %m");
 
         *ret_password = TAKE_PTR(base64_encoded);
         *ret_password_size = base64_encoded_size;
@@ -235,31 +238,31 @@ int parse_luks2_pkcs11_data(
         size_t key_size;
         _cleanup_free_ char *uri = NULL;
         _cleanup_free_ void *key = NULL;
-        _cleanup_(json_variant_unrefp) JsonVariant *v = NULL;
-        JsonVariant *w;
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *v = NULL;
+        sd_json_variant *w;
 
         assert(json);
         assert(ret_uri);
         assert(ret_encrypted_key);
         assert(ret_encrypted_key_size);
 
-        r = json_parse(json, 0, &v, NULL, NULL);
+        r = sd_json_parse(json, 0, &v, NULL, NULL);
         if (r < 0)
                 return r;
 
-        w = json_variant_by_key(v, "pkcs11-uri");
+        w = sd_json_variant_by_key(v, "pkcs11-uri");
         if (!w)
                 return -EINVAL;
 
-        uri = strdup(json_variant_string(w));
+        uri = strdup(sd_json_variant_string(w));
         if (!uri)
                 return -ENOMEM;
 
-        w = json_variant_by_key(v, "pkcs11-key");
+        w = sd_json_variant_by_key(v, "pkcs11-key");
         if (!w)
                 return -EINVAL;
 
-        r = unbase64mem(json_variant_string(w), SIZE_MAX, &key, &key_size);
+        r = sd_json_variant_unbase64(w, &key, &key_size);
         if (r < 0)
                 return crypt_log_debug_errno(cd, r, "Failed to decode base64 encoded key: %m.");
 

@@ -3,18 +3,15 @@
   Copyright © 2014 Axis Communications AB. All rights reserved.
 ***/
 
-#include <errno.h>
 #include <netinet/if_ether.h>
 #include <stdio.h>
-#include <stdlib.h>
-#include <sys/types.h>
-#include <unistd.h>
 
+#include "sd-event.h"
 #include "sd-ipv4ll.h"
 
 #include "arp-util.h"
 #include "fd-util.h"
-#include "socket-util.h"
+#include "in-addr-util.h"
 #include "tests.h"
 
 static bool verbose = false;
@@ -37,7 +34,6 @@ static void basic_request_handler(sd_ipv4ll *ll, int event, void *userdata) {
                         break;
                 default:
                         assert_se(0);
-                        break;
         }
 }
 
@@ -85,33 +81,34 @@ static void test_public_api_setters(sd_event *e) {
         assert_se(sd_ipv4ll_new(&ll) == 0);
         assert_se(ll);
 
-        assert_se(sd_ipv4ll_attach_event(NULL, NULL, 0) == -EINVAL);
+        ASSERT_RETURN_EXPECTED_SE(sd_ipv4ll_attach_event(NULL, NULL, 0) == -EINVAL);
         assert_se(sd_ipv4ll_attach_event(ll, e, 0) == 0);
-        assert_se(sd_ipv4ll_attach_event(ll, e, 0) == -EBUSY);
+        ASSERT_RETURN_EXPECTED_SE(sd_ipv4ll_attach_event(ll, e, 0) == -EBUSY);
 
-        assert_se(sd_ipv4ll_set_callback(NULL, NULL, NULL) == -EINVAL);
+        ASSERT_RETURN_EXPECTED_SE(sd_ipv4ll_set_callback(NULL, NULL, NULL) == -EINVAL);
         assert_se(sd_ipv4ll_set_callback(ll, NULL, NULL) == 0);
 
-        assert_se(sd_ipv4ll_set_address(ll, &address) == -EINVAL);
+        ASSERT_RETURN_EXPECTED_SE(sd_ipv4ll_set_address(ll, &address) == -EINVAL);
         address.s_addr |= htobe32(169U << 24 | 254U << 16);
-        assert_se(sd_ipv4ll_set_address(ll, &address) == -EINVAL);
+        ASSERT_RETURN_EXPECTED_SE(sd_ipv4ll_set_address(ll, &address) == -EINVAL);
         address.s_addr |= htobe32(0x00FF);
-        assert_se(sd_ipv4ll_set_address(ll, &address) == -EINVAL);
+        ASSERT_RETURN_EXPECTED_SE(sd_ipv4ll_set_address(ll, &address) == -EINVAL);
         address.s_addr |= htobe32(0xF000);
         assert_se(sd_ipv4ll_set_address(ll, &address) == 0);
         address.s_addr |= htobe32(0x0F00);
-        assert_se(sd_ipv4ll_set_address(ll, &address) == -EINVAL);
+        ASSERT_RETURN_EXPECTED_SE(sd_ipv4ll_set_address(ll, &address) == -EINVAL);
 
-        assert_se(sd_ipv4ll_set_address_seed(NULL, seed) == -EINVAL);
+        ASSERT_RETURN_EXPECTED_SE(sd_ipv4ll_set_address_seed(NULL, seed) == -EINVAL);
         assert_se(sd_ipv4ll_set_address_seed(ll, seed) == 0);
 
-        assert_se(sd_ipv4ll_set_mac(NULL, NULL) == -EINVAL);
-        assert_se(sd_ipv4ll_set_mac(ll, NULL) == -EINVAL);
+        ASSERT_RETURN_EXPECTED_SE(sd_ipv4ll_set_mac(NULL, NULL) == -EINVAL);
+
+        ASSERT_RETURN_EXPECTED_SE(sd_ipv4ll_set_mac(ll, NULL) == -EINVAL);
         assert_se(sd_ipv4ll_set_mac(ll, &mac_addr) == 0);
 
-        assert_se(sd_ipv4ll_set_ifindex(NULL, -1) == -EINVAL);
-        assert_se(sd_ipv4ll_set_ifindex(ll, -1) == -EINVAL);
-        assert_se(sd_ipv4ll_set_ifindex(ll, -99) == -EINVAL);
+        ASSERT_RETURN_EXPECTED_SE(sd_ipv4ll_set_ifindex(NULL, -1) == -EINVAL);
+        ASSERT_RETURN_EXPECTED_SE(sd_ipv4ll_set_ifindex(ll, -1) == -EINVAL);
+        ASSERT_RETURN_EXPECTED_SE(sd_ipv4ll_set_ifindex(ll, -99) == -EINVAL);
         assert_se(sd_ipv4ll_set_ifindex(ll, 1) == 0);
 
         assert_se(sd_ipv4ll_ref(ll) == ll);
@@ -134,17 +131,17 @@ static void test_basic_request(sd_event *e, const struct in_addr *start_address)
         assert_se(sd_ipv4ll_new(&ll) == 0);
         if (in4_addr_is_set(start_address))
                 assert_se(sd_ipv4ll_set_address(ll, start_address) >= 0);
-        assert_se(sd_ipv4ll_start(ll) == -EINVAL);
+        ASSERT_RETURN_EXPECTED_SE(sd_ipv4ll_start(ll) == -EINVAL);
 
         assert_se(sd_ipv4ll_attach_event(ll, e, 0) == 0);
-        assert_se(sd_ipv4ll_start(ll) == -EINVAL);
+        ASSERT_RETURN_EXPECTED_SE(sd_ipv4ll_start(ll) == -EINVAL);
 
         assert_se(sd_ipv4ll_set_mac(ll, &mac_addr) == 0);
-        assert_se(sd_ipv4ll_start(ll) == -EINVAL);
+        ASSERT_RETURN_EXPECTED_SE(sd_ipv4ll_start(ll) == -EINVAL);
 
         assert_se(sd_ipv4ll_set_callback(ll, basic_request_handler,
                                          basic_request_handler_userdata) == 0);
-        assert_se(sd_ipv4ll_start(ll) == -EINVAL);
+        ASSERT_RETURN_EXPECTED_SE(sd_ipv4ll_start(ll) == -EINVAL);
 
         assert_se(sd_ipv4ll_set_ifindex(ll, 1) == 0);
         assert_se(sd_ipv4ll_start(ll) == 1);

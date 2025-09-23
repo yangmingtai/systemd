@@ -7,27 +7,36 @@
 
 #include <netinet/ip.h>
 #include <netinet/udp.h>
-#include <stdint.h>
 
-#include "macro.h"
+#include "sd-dhcp-protocol.h"
+
+#include "forward.h"
 #include "sparse-endian.h"
+#include "time-util.h"
+
+/* RFC 8925 - IPv6-Only Preferred Option for DHCPv4 3.4.
+ * MIN_V6ONLY_WAIT: The lower boundary for V6ONLY_WAIT. Value: 300 seconds */
+#define MIN_V6ONLY_WAIT_USEC (300U * USEC_PER_SEC)
+
+#define DHCP_MESSAGE_HEADER_DEFINITION \
+        uint8_t op;                    \
+        uint8_t htype;                 \
+        uint8_t hlen;                  \
+        uint8_t hops;                  \
+        be32_t xid;                    \
+        be16_t secs;                   \
+        be16_t flags;                  \
+        be32_t ciaddr;                 \
+        be32_t yiaddr;                 \
+        be32_t siaddr;                 \
+        be32_t giaddr;                 \
+        uint8_t chaddr[16];            \
+        uint8_t sname[64];             \
+        uint8_t file[128];             \
+        be32_t magic;
 
 struct DHCPMessage {
-        uint8_t op;
-        uint8_t htype;
-        uint8_t hlen;
-        uint8_t hops;
-        be32_t xid;
-        be16_t secs;
-        be16_t flags;
-        be32_t ciaddr;
-        be32_t yiaddr;
-        be32_t siaddr;
-        be32_t giaddr;
-        uint8_t chaddr[16];
-        uint8_t sname[64];
-        uint8_t file[128];
-        be32_t magic;
+        DHCP_MESSAGE_HEADER_DEFINITION;
         uint8_t options[];
 } _packed_;
 
@@ -53,20 +62,6 @@ enum {
         DHCP_PORT_SERVER                        = 67,
         DHCP_PORT_CLIENT                        = 68,
 };
-
-enum DHCPState {
-        DHCP_STATE_INIT                         = 0,
-        DHCP_STATE_SELECTING                    = 1,
-        DHCP_STATE_INIT_REBOOT                  = 2,
-        DHCP_STATE_REBOOTING                    = 3,
-        DHCP_STATE_REQUESTING                   = 4,
-        DHCP_STATE_BOUND                        = 5,
-        DHCP_STATE_RENEWING                     = 6,
-        DHCP_STATE_REBINDING                    = 7,
-        DHCP_STATE_STOPPED                      = 8,
-};
-
-typedef enum DHCPState DHCPState;
 
 enum {
         BOOTREQUEST                             = 1,

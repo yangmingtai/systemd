@@ -2,10 +2,9 @@
  * Copyright © 2020 VMware, Inc. */
 
 #include <linux/pkt_sched.h>
+#include "sd-netlink.h"
 
-#include "alloc-util.h"
-#include "conf-parser.h"
-#include "netlink-util.h"
+#include "log.h"
 #include "parse-util.h"
 #include "qdisc.h"
 #include "sfb.h"
@@ -48,7 +47,7 @@ static int stochastic_fair_blue_fill_message(Link *link, QDisc *qdisc, sd_netlin
         return 0;
 }
 
-int config_parse_stochastic_fair_blue_u32(
+int config_parse_sfb_u32(
                 const char *unit,
                 const char *filename,
                 unsigned line,
@@ -60,7 +59,7 @@ int config_parse_stochastic_fair_blue_u32(
                 void *data,
                 void *userdata) {
 
-        _cleanup_(qdisc_free_or_set_invalidp) QDisc *qdisc = NULL;
+        _cleanup_(qdisc_unref_or_set_invalidp) QDisc *qdisc = NULL;
         StochasticFairBlue *sfb;
         Network *network = ASSERT_PTR(data);
         int r;

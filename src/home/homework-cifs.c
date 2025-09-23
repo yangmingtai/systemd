@@ -1,30 +1,33 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <sys/mount.h>
-#if WANT_LINUX_FS_H
-#include <linux/fs.h>
-#endif
+#include <unistd.h>
 
-#include "dirent-util.h"
+#include "alloc-util.h"
+#include "env-util.h"
 #include "fd-util.h"
-#include "fileio.h"
 #include "format-util.h"
 #include "fs-util.h"
+#include "homework.h"
 #include "homework-cifs.h"
 #include "homework-mount.h"
-#include "mkdir.h"
+#include "log.h"
+#include "memfd-util.h"
 #include "mount-util.h"
+#include "path-util.h"
 #include "process-util.h"
 #include "stat-util.h"
+#include "string-util.h"
 #include "strv.h"
-#include "tmpfile-util.h"
+#include "user-record-util.h"
+#include "user-record.h"
 
 int home_setup_cifs(
                 UserRecord *h,
                 HomeSetupFlags flags,
                 HomeSetup *setup) {
 
-        _cleanup_free_ char *chost = NULL, *cservice = NULL, *cdir = NULL, *chost_and_service = NULL, *j = NULL;
+        _cleanup_free_ char *chost = NULL, *cservice = NULL, *cdir = NULL, *chost_and_service = NULL, *j = NULL, *options = NULL;
         int r;
 
         assert(h);
@@ -46,56 +49,57 @@ int home_setup_cifs(
 
         r = parse_cifs_service(h->cifs_service, &chost, &cservice, &cdir);
         if (r < 0)
-                return log_error_errno(r, "Failed parse CIFS service specification: %m");
+                return log_error_errno(r, "Failed to parse CIFS service specification: %m");
 
         /* Just the host and service part, without the directory */
         chost_and_service = strjoin("//", chost, "/", cservice);
         if (!chost_and_service)
                 return log_oom();
 
+        if (asprintf(&options, "user=%s,uid=" UID_FMT ",forceuid,gid=" GID_FMT ",forcegid,file_mode=0%3o,dir_mode=0%3o",
+                     user_record_cifs_user_name(h), h->uid, user_record_gid(h), user_record_access_mode(h),
+                     user_record_access_mode(h)) < 0)
+                return log_oom();
+
+        if (h->cifs_domain)
+                if (strextendf_with_separator(&options, ",", "domain=%s", h->cifs_domain) < 0)
+                        return log_oom();
+
+        if (h->cifs_extra_mount_options)
+                if (!strextend_with_separator(&options, ",", h->cifs_extra_mount_options))
+                        return log_oom();
+
         r = home_unshare_and_mkdir();
         if (r < 0)
                 return r;
 
         STRV_FOREACH(pw, h->password) {
-                _cleanup_(unlink_and_freep) char *p = NULL;
-                _cleanup_free_ char *options = NULL;
-                _cleanup_(fclosep) FILE *f = NULL;
+                _cleanup_close_ int passwd_fd = -EBADF;
                 pid_t mount_pid;
                 int exit_status;
 
-                r = fopen_temporary_child(NULL, &f, &p);
-                if (r < 0)
-                        return log_error_errno(r, "Failed to create temporary credentials file: %m");
+                passwd_fd = memfd_new_and_seal_string("cifspw", *pw);
+                if (passwd_fd < 0)
+                        return log_error_errno(passwd_fd, "Failed to create data FD for password: %m");
 
-                fprintf(f,
-                        "username=%s\n"
-                        "password=%s\n",
-                        user_record_cifs_user_name(h),
-                        *pw);
-
-                if (h->cifs_domain)
-                        fprintf(f, "domain=%s\n", h->cifs_domain);
-
-                r = fflush_and_check(f);
-                if (r < 0)
-                        return log_error_errno(r, "Failed to write temporary credentials file: %m");
-
-                f = safe_fclose(f);
-
-                if (asprintf(&options, "credentials=%s,uid=" UID_FMT ",forceuid,gid=" GID_FMT ",forcegid,file_mode=0%3o,dir_mode=0%3o",
-                             p, h->uid, user_record_gid(h), user_record_access_mode(h), user_record_access_mode(h)) < 0)
-                        return log_oom();
-
-                if (h->cifs_extra_mount_options)
-                        if (!strextend_with_separator(&options, ",", h->cifs_extra_mount_options))
-                                return log_oom();
-
-                r = safe_fork("(mount)", FORK_RESET_SIGNALS|FORK_RLIMIT_NOFILE_SAFE|FORK_DEATHSIG|FORK_LOG|FORK_STDOUT_TO_STDERR, &mount_pid);
+                r = safe_fork("(mount)", FORK_RESET_SIGNALS|FORK_RLIMIT_NOFILE_SAFE|FORK_DEATHSIG_SIGTERM|FORK_LOG|FORK_STDOUT_TO_STDERR, &mount_pid);
                 if (r < 0)
                         return r;
                 if (r == 0) {
                         /* Child */
+
+                        r = fd_cloexec(passwd_fd, false);
+                        if (r < 0) {
+                                log_error_errno(r, "Failed to disable CLOEXEC on password FD: %m");
+                                _exit(EXIT_FAILURE);
+                        }
+
+                        r = setenvf("PASSWD_FD", /* overwrite= */ true, "%d", passwd_fd);
+                        if (r < 0) {
+                                log_error_errno(r, "Failed to set $PASSWD_FD: %m");
+                                _exit(EXIT_FAILURE);
+                        }
+
                         execl("/bin/mount", "/bin/mount", "-n", "-t", "cifs",
                               chost_and_service, HOME_RUNTIME_WORK_DIR,
                               "-o", options, NULL);
@@ -131,7 +135,7 @@ int home_setup_cifs(
                         return log_oom();
 
                 if (FLAGS_SET(flags, HOME_SETUP_CIFS_MKDIR)) {
-                        setup->root_fd = open_mkdir_at(AT_FDCWD, j, O_CLOEXEC, 0700);
+                        setup->root_fd = open_mkdir(j, O_CLOEXEC, 0700);
                         if (setup->root_fd < 0)
                                 return log_error_errno(setup->root_fd, "Failed to create CIFS subdirectory: %m");
                 }

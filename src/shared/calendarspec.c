@@ -1,9 +1,5 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <ctype.h>
-#include <errno.h>
-#include <limits.h>
-#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/mman.h>
@@ -12,8 +8,8 @@
 #include "alloc-util.h"
 #include "calendarspec.h"
 #include "errno-util.h"
-#include "fileio.h"
-#include "macro.h"
+#include "log.h"
+#include "memstream-util.h"
 #include "parse-util.h"
 #include "process-util.h"
 #include "sort-util.h"
@@ -37,8 +33,7 @@ assert_cc(INT_MAX >= USEC_PER_SEC);
 static CalendarComponent* chain_free(CalendarComponent *c) {
         while (c) {
                 CalendarComponent *n = c->next;
-                free(c);
-                c = n;
+                free_and_replace(c, n);
         }
         return NULL;
 }
@@ -336,16 +331,14 @@ static void format_chain(FILE *f, int space, const CalendarComponent *c, bool us
         _format_chain(f, space, c, /* start = */ true, usec);
 }
 
-int calendar_spec_to_string(const CalendarSpec *c, char **p) {
-        char *buf = NULL;
-        size_t sz = 0;
+int calendar_spec_to_string(const CalendarSpec *c, char **ret) {
+        _cleanup_(memstream_done) MemStream m = {};
         FILE *f;
-        int r;
 
         assert(c);
-        assert(p);
+        assert(ret);
 
-        f = open_memstream_unlocked(&buf, &sz);
+        f = memstream_init(&m);
         if (!f)
                 return -ENOMEM;
 
@@ -383,16 +376,7 @@ int calendar_spec_to_string(const CalendarSpec *c, char **p) {
                 }
         }
 
-        r = fflush_and_check(f);
-        fclose(f);
-
-        if (r < 0) {
-                free(buf);
-                return r;
-        }
-
-        *p = buf;
-        return 0;
+        return memstream_finalize(&m, ret, NULL);
 }
 
 static int parse_weekdays(const char **p, CalendarSpec *c) {
@@ -586,8 +570,12 @@ static int calendarspec_from_time_t(CalendarSpec *c, time_t time) {
         struct tm tm;
         int r;
 
-        if (!gmtime_r(&time, &tm))
+        if ((usec_t) time > USEC_INFINITY / USEC_PER_SEC)
                 return -ERANGE;
+
+        r = localtime_or_gmtime_usec((usec_t) time * USEC_PER_SEC, /* utc= */ true, &tm);
+        if (r < 0)
+                return r;
 
         if (tm.tm_year > INT_MAX - 1900)
                 return -ERANGE;
@@ -659,7 +647,7 @@ static int prepend_component(const char **p, bool usec, unsigned nesting, Calend
                 if (repeat == 0)
                         return -ERANGE;
         } else {
-                /* If no repeat value is specified for the µs component, then let's explicitly refuse ranges
+                /* If no repeat value is specified for the μs component, then let's explicitly refuse ranges
                  * below 1s because our default repeat granularity is beyond that. */
 
                 /* Overflow check */
@@ -878,7 +866,7 @@ finish:
         return 0;
 }
 
-int calendar_spec_from_string(const char *p, CalendarSpec **spec) {
+int calendar_spec_from_string(const char *p, CalendarSpec **ret) {
         const char *utc;
         _cleanup_(calendar_spec_freep) CalendarSpec *c = NULL;
         _cleanup_free_ char *p_tmp = NULL;
@@ -1098,18 +1086,18 @@ int calendar_spec_from_string(const char *p, CalendarSpec **spec) {
         if (!calendar_spec_valid(c))
                 return -EINVAL;
 
-        if (spec)
-                *spec = TAKE_PTR(c);
+        if (ret)
+                *ret = TAKE_PTR(c);
         return 0;
 }
 
 static int find_end_of_month(const struct tm *tm, bool utc, int day) {
-        struct tm t = *tm;
+        struct tm t = *ASSERT_PTR(tm);
 
         t.tm_mon++;
         t.tm_mday = 1 - day;
 
-        if (mktime_or_timegm(&t, utc) < 0 ||
+        if (mktime_or_timegm_usec(&t, utc, /* ret= */ NULL) < 0 ||
             t.tm_mon != tm->tm_mon)
                 return -1;
 
@@ -1161,7 +1149,7 @@ static int find_matching_component(
                 } else if (c->repeat > 0) {
                         int k;
 
-                        k = start + c->repeat * DIV_ROUND_UP(*val - start, c->repeat);
+                        k = start + ROUND_UP(*val - start, c->repeat);
 
                         if ((!d_set || k < d) && (stop < 0 || k <= stop)) {
                                 d = k;
@@ -1181,8 +1169,8 @@ static int find_matching_component(
 }
 
 static int tm_within_bounds(struct tm *tm, bool utc) {
-        struct tm t;
-        int cmp;
+        int r;
+
         assert(tm);
 
         /*
@@ -1193,9 +1181,10 @@ static int tm_within_bounds(struct tm *tm, bool utc) {
         if (tm->tm_year + 1900 > MAX_YEAR)
                 return -ERANGE;
 
-        t = *tm;
-        if (mktime_or_timegm(&t, utc) < 0)
-                return negative_errno();
+        struct tm t = *tm;
+        r = mktime_or_timegm_usec(&t, utc, /* ret= */ NULL);
+        if (r < 0)
+                return r;
 
         /*
          * Did any normalization take place? If so, it was out of bounds before.
@@ -1204,6 +1193,7 @@ static int tm_within_bounds(struct tm *tm, bool utc) {
          * out of bounds. Normalization has occurred implies find_matching_component() > 0,
          * other sub time units are already reset in find_next().
          */
+        int cmp;
         if ((cmp = CMP(t.tm_year, tm->tm_year)) != 0)
                 t.tm_mon = 0;
         else if ((cmp = CMP(t.tm_mon, tm->tm_mon)) != 0)
@@ -1232,11 +1222,40 @@ static bool matches_weekday(int weekdays_bits, const struct tm *tm, bool utc) {
                 return true;
 
         t = *tm;
-        if (mktime_or_timegm(&t, utc) < 0)
+        if (mktime_or_timegm_usec(&t, utc, /* ret= */ NULL) < 0)
                 return false;
 
         k = t.tm_wday == 0 ? 6 : t.tm_wday - 1;
         return (weekdays_bits & (1 << k));
+}
+
+static int tm_compare(const struct tm *t1, const struct tm *t2) {
+        int r;
+
+        assert(t1);
+        assert(t2);
+
+        r = CMP(t1->tm_year, t2->tm_year);
+        if (r != 0)
+                return r;
+
+        r = CMP(t1->tm_mon, t2->tm_mon);
+        if (r != 0)
+                return r;
+
+        r = CMP(t1->tm_mday, t2->tm_mday);
+        if (r != 0)
+                return r;
+
+        r = CMP(t1->tm_hour, t2->tm_hour);
+        if (r != 0)
+                return r;
+
+        r = CMP(t1->tm_min, t2->tm_min);
+        if (r != 0)
+                return r;
+
+        return CMP(t1->tm_sec, t2->tm_sec);
 }
 
 /* A safety valve: if we get stuck in the calculation, return an error.
@@ -1245,8 +1264,8 @@ static bool matches_weekday(int weekdays_bits, const struct tm *tm, bool utc) {
 
 static int find_next(const CalendarSpec *spec, struct tm *tm, usec_t *usec) {
         struct tm c;
-        int tm_usec;
-        int r;
+        int tm_usec, r;
+        bool invalidate_dst = false;
 
         /* Returns -ENOENT if the expression is not going to elapse anymore */
 
@@ -1258,8 +1277,9 @@ static int find_next(const CalendarSpec *spec, struct tm *tm, usec_t *usec) {
 
         for (unsigned iteration = 0; iteration < MAX_CALENDAR_ITERATIONS; iteration++) {
                 /* Normalize the current date */
-                (void) mktime_or_timegm(&c, spec->utc);
-                c.tm_isdst = spec->dst;
+                (void) mktime_or_timegm_usec(&c, spec->utc, /* ret= */ NULL);
+                if (!invalidate_dst)
+                        c.tm_isdst = spec->dst;
 
                 c.tm_year += 1900;
                 r = find_matching_component(spec, spec->year, &c, &c.tm_year);
@@ -1349,6 +1369,18 @@ static int find_next(const CalendarSpec *spec, struct tm *tm, usec_t *usec) {
                 if (r == 0)
                         continue;
 
+                r = tm_compare(tm, &c);
+                if (r == 0) {
+                        assert(tm_usec + 1 <= 1000000);
+                        r = CMP(*usec, (usec_t) tm_usec + 1);
+                }
+                if (r >= 0) {
+                        /* We're stuck - advance, let mktime determine DST transition and try again. */
+                        invalidate_dst = true;
+                        c.tm_hour++;
+                        continue;
+                }
+
                 *tm = c;
                 *usec = tm_usec;
                 return 0;
@@ -1364,10 +1396,9 @@ static int find_next(const CalendarSpec *spec, struct tm *tm, usec_t *usec) {
 }
 
 static int calendar_spec_next_usec_impl(const CalendarSpec *spec, usec_t usec, usec_t *ret_next) {
-        struct tm tm;
-        time_t t;
-        int r;
         usec_t tm_usec;
+        struct tm tm;
+        int r;
 
         assert(spec);
 
@@ -1375,20 +1406,22 @@ static int calendar_spec_next_usec_impl(const CalendarSpec *spec, usec_t usec, u
                 return -EINVAL;
 
         usec++;
-        t = (time_t) (usec / USEC_PER_SEC);
-        assert_se(localtime_or_gmtime_r(&t, &tm, spec->utc));
+        r = localtime_or_gmtime_usec(usec, spec->utc, &tm);
+        if (r < 0)
+                return r;
         tm_usec = usec % USEC_PER_SEC;
 
         r = find_next(spec, &tm, &tm_usec);
         if (r < 0)
                 return r;
 
-        t = mktime_or_timegm(&tm, spec->utc);
-        if (t < 0)
-                return -EINVAL;
+        usec_t t;
+        r = mktime_or_timegm_usec(&tm, spec->utc, &t);
+        if (r < 0)
+                return r;
 
         if (ret_next)
-                *ret_next = (usec_t) t * USEC_PER_SEC + tm_usec;
+                *ret_next = t + tm_usec;
 
         return 0;
 }
@@ -1411,7 +1444,7 @@ int calendar_spec_next_usec(const CalendarSpec *spec, usec_t usec, usec_t *ret_n
         if (shared == MAP_FAILED)
                 return negative_errno();
 
-        r = safe_fork("(sd-calendar)", FORK_RESET_SIGNALS|FORK_CLOSE_ALL_FDS|FORK_DEATHSIG|FORK_WAIT, NULL);
+        r = safe_fork("(sd-calendar)", FORK_RESET_SIGNALS|FORK_CLOSE_ALL_FDS|FORK_DEATHSIG_SIGKILL|FORK_WAIT, NULL);
         if (r < 0) {
                 (void) munmap(shared, sizeof *shared);
                 return r;

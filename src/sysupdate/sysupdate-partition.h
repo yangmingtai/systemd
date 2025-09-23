@@ -1,15 +1,9 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include <inttypes.h>
-#include <sys/types.h>
-
 #include "sd-id128.h"
 
-#include "fdisk-util.h"
-#include "macro.h"
-
-typedef struct PartitionInfo PartitionInfo;
+#include "sysupdate-forward.h"
 
 typedef enum PartitionChange {
         PARTITION_FLAGS           = 1 << 0,
@@ -22,17 +16,17 @@ typedef enum PartitionChange {
         _PARTITION_CHANGE_INVALID = -EINVAL,
 } PartitionChange;
 
-struct PartitionInfo {
+typedef struct PartitionInfo {
         size_t partno;
         uint64_t start, size;
         uint64_t flags;
         sd_id128_t type, uuid;
         char *label;
         char *device; /* Note that this might point to some non-existing path in case we operate on a loopback file */
-        bool no_auto:1;
-        bool read_only:1;
-        bool growfs:1;
-};
+        bool no_auto;
+        bool read_only;
+        bool growfs;
+} PartitionInfo;
 
 #define PARTITION_INFO_NULL                     \
         {                                       \

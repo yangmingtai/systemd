@@ -3,16 +3,22 @@
 #include <sys/mount.h>
 
 #include "btrfs-util.h"
+#include "errno-util.h"
 #include "fd-util.h"
+#include "homework-blob.h"
 #include "homework-directory.h"
 #include "homework-mount.h"
 #include "homework-quota.h"
+#include "log.h"
 #include "mkdir.h"
 #include "mount-util.h"
-#include "path-util.h"
+#include "homework.h"
 #include "rm-rf.h"
+#include "string-util.h"
 #include "tmpfile-util.h"
 #include "umask-util.h"
+#include "user-record-util.h"
+#include "user-record.h"
 #include "user-util.h"
 
 int home_setup_directory(UserRecord *h, HomeSetup *setup) {
@@ -131,7 +137,7 @@ int home_create_directory_or_subvolume(UserRecord *h, HomeSetup *setup, UserReco
 
         case USER_SUBVOLUME:
                 WITH_UMASK(0077)
-                        r = btrfs_subvol_make(d);
+                        r = btrfs_subvol_make(AT_FDCWD, d);
 
                 if (r >= 0) {
                         log_info("Subvolume created.");
@@ -152,7 +158,7 @@ int home_create_directory_or_subvolume(UserRecord *h, HomeSetup *setup, UserReco
                                 /* Actually configure the quota. We also ignore errors here, but we do log
                                  * about them loudly, to keep things discoverable even though we don't
                                  * consider lacking quota support in kernel fatal. */
-                                (void) home_update_quota_btrfs(h, d);
+                                (void) home_update_quota_btrfs(h, /* fd= */ -EBADF, d);
                         }
 
                         break;
@@ -168,7 +174,7 @@ int home_create_directory_or_subvolume(UserRecord *h, HomeSetup *setup, UserReco
                 if (mkdir(d, 0700) < 0)
                         return log_error_errno(errno, "Failed to create temporary home directory %s: %m", d);
 
-                (void) home_update_quota_classic(h, d);
+                (void) home_update_quota_classic(h, /* fd= */ -EBADF, d);
                 break;
 
         default:
@@ -265,7 +271,7 @@ int home_resize_directory(
                 UserRecord **ret_home) {
 
         _cleanup_(user_record_unrefp) UserRecord *embedded_home = NULL, *new_home = NULL;
-        int r;
+        int r, reconciled;
 
         assert(h);
         assert(setup);
@@ -276,21 +282,25 @@ int home_resize_directory(
         if (r < 0)
                 return r;
 
-        r = home_load_embedded_identity(h, setup->root_fd, NULL, USER_RECONCILE_REQUIRE_NEWER_OR_EQUAL, cache, &embedded_home, &new_home);
-        if (r < 0)
-                return r;
+        reconciled = home_load_embedded_identity(h, setup->root_fd, NULL, USER_RECONCILE_REQUIRE_NEWER_OR_EQUAL, cache, &embedded_home, &new_home);
+        if (reconciled < 0)
+                return reconciled;
 
         r = home_maybe_shift_uid(h, flags, setup);
         if (r < 0)
                 return r;
 
-        r = home_update_quota_auto(h, NULL);
-        if (ERRNO_IS_NOT_SUPPORTED(r))
+        r = home_update_quota_auto(h, setup->root_fd, /* path= */ NULL);
+        if (ERRNO_IS_NEG_NOT_SUPPORTED(r))
                 return -ESOCKTNOSUPPORT; /* make recognizable */
         if (r < 0)
                 return r;
 
-        r = home_store_embedded_identity(new_home, setup->root_fd, h->uid, embedded_home);
+        r = home_store_embedded_identity(new_home, setup->root_fd, embedded_home);
+        if (r < 0)
+                return r;
+
+        r = home_reconcile_blob_dirs(new_home, setup->root_fd, reconciled);
         if (r < 0)
                 return r;
 

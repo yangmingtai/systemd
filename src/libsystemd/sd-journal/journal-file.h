@@ -2,22 +2,14 @@
 #pragma once
 
 #include <fcntl.h>
-#include <inttypes.h>
-#include <sys/uio.h>
-
-#if HAVE_GCRYPT
-#  include <gcrypt.h>
-#endif
-
-#include "sd-event.h"
-#include "sd-id128.h"
+#include <sys/stat.h>
 
 #include "compress.h"
-#include "hashmap.h"
+#include "forward.h"
+#include "gcrypt-util.h"
 #include "journal-def.h"
 #include "mmap-cache.h"
 #include "sparse-endian.h"
-#include "time-util.h"
 
 typedef struct JournalMetrics {
         /* For all these: UINT64_MAX means "pick automatically", and 0 means "no limit enforced" */
@@ -31,7 +23,8 @@ typedef struct JournalMetrics {
 
 typedef enum direction {
         DIRECTION_UP,
-        DIRECTION_DOWN
+        DIRECTION_DOWN,
+        _DIRECTION_INVALID = -EINVAL,
 } direction_t;
 
 typedef enum LocationType {
@@ -45,7 +38,7 @@ typedef enum LocationType {
 
         /* We should seek to the precise location specified, and
          * return it, as we haven't read it yet. */
-        LOCATION_SEEK
+        LOCATION_SEEK,
 } LocationType;
 
 typedef enum OfflineState {
@@ -55,7 +48,7 @@ typedef enum OfflineState {
         OFFLINE_CANCEL,
         OFFLINE_AGAIN_FROM_SYNCING,
         OFFLINE_AGAIN_FROM_OFFLINING,
-        OFFLINE_DONE
+        OFFLINE_DONE,
 } OfflineState;
 
 typedef struct JournalFile {
@@ -105,7 +98,6 @@ typedef struct JournalFile {
         void *compress_buffer;
 #endif
 
-#if HAVE_GCRYPT
         gcry_md_hd_t hmac;
         bool hmac_running;
 
@@ -120,7 +112,6 @@ typedef struct JournalFile {
 
         void *fsprg_seed;
         size_t fsprg_seed_size;
-#endif
 
         /* When we insert this file into the per-boot priority queue 'newest_by_boot_id' in sd_journal, then by these keys */
         sd_id128_t newest_boot_id;
@@ -128,20 +119,23 @@ typedef struct JournalFile {
         uint64_t newest_monotonic_usec;
         uint64_t newest_realtime_usec;
         unsigned newest_boot_id_prioq_idx;
-        usec_t newest_mtime;
+        uint64_t newest_entry_offset;
+        uint8_t newest_state;
 } JournalFile;
 
 typedef enum JournalFileFlags {
         JOURNAL_COMPRESS        = 1 << 0,
         JOURNAL_SEAL            = 1 << 1,
         JOURNAL_STRICT_ORDER    = 1 << 2,
-        _JOURNAL_FILE_FLAGS_MAX = JOURNAL_COMPRESS|JOURNAL_SEAL|JOURNAL_STRICT_ORDER,
+        _JOURNAL_FILE_FLAGS_ALL = JOURNAL_COMPRESS|JOURNAL_SEAL|JOURNAL_STRICT_ORDER,
 } JournalFileFlags;
 
 typedef struct {
         uint64_t object_offset;
         uint64_t hash;
 } EntryItem;
+
+extern const struct hash_ops journal_file_hash_ops_by_path;
 
 int journal_file_open(
                 int fd,
@@ -188,6 +182,9 @@ static inline bool VALID_EPOCH(uint64_t u) {
 #define JOURNAL_HEADER_SEALED(h) \
         FLAGS_SET(le32toh((h)->compatible_flags), HEADER_COMPATIBLE_SEALED)
 
+#define JOURNAL_HEADER_SEALED_CONTINUOUS(h) \
+        FLAGS_SET(le32toh((h)->compatible_flags), HEADER_COMPATIBLE_SEALED_CONTINUOUS)
+
 #define JOURNAL_HEADER_TAIL_ENTRY_BOOT_ID(h) \
         FLAGS_SET(le32toh((h)->compatible_flags), HEADER_COMPATIBLE_TAIL_ENTRY_BOOT_ID)
 
@@ -207,6 +204,7 @@ static inline bool VALID_EPOCH(uint64_t u) {
         FLAGS_SET(le32toh((h)->incompatible_flags), HEADER_INCOMPATIBLE_COMPACT)
 
 int journal_file_move_to_object(JournalFile *f, ObjectType type, uint64_t offset, Object **ret);
+int journal_file_pin_object(JournalFile *f, Object *o);
 int journal_file_read_object_header(JournalFile *f, ObjectType type, uint64_t offset, Object *ret);
 
 int journal_file_tail_end_by_pread(JournalFile *f, uint64_t *ret_offset);
@@ -285,12 +283,12 @@ void journal_file_reset_location(JournalFile *f);
 void journal_file_save_location(JournalFile *f, Object *o, uint64_t offset);
 int journal_file_next_entry(JournalFile *f, uint64_t p, direction_t direction, Object **ret_object, uint64_t *ret_offset);
 
-int journal_file_next_entry_for_data(JournalFile *f, Object *d, direction_t direction, Object **ret_object, uint64_t *ret_offset);
-
 int journal_file_move_to_entry_by_offset(JournalFile *f, uint64_t p, direction_t direction, Object **ret_object, uint64_t *ret_offset);
 int journal_file_move_to_entry_by_seqnum(JournalFile *f, uint64_t seqnum, direction_t direction, Object **ret_object, uint64_t *ret_offset);
 int journal_file_move_to_entry_by_realtime(JournalFile *f, uint64_t realtime, direction_t direction, Object **ret_object, uint64_t *ret_offset);
 int journal_file_move_to_entry_by_monotonic(JournalFile *f, sd_id128_t boot_id, uint64_t monotonic, direction_t direction, Object **ret_object, uint64_t *ret_offset);
+
+int journal_file_move_to_entry_for_data(JournalFile *f, Object *d, direction_t direction, Object **ret_object, uint64_t *ret_offset);
 
 int journal_file_move_to_entry_by_offset_for_data(JournalFile *f, Object *d, uint64_t p, direction_t direction, Object **ret_object, uint64_t *ret_offset);
 int journal_file_move_to_entry_by_seqnum_for_data(JournalFile *f, Object *d, uint64_t seqnum, direction_t direction, Object **ret_object, uint64_t *ret_offset);
@@ -304,7 +302,6 @@ void journal_file_print_header(JournalFile *f);
 
 int journal_file_archive(JournalFile *f, char **ret_previous_path);
 int journal_file_parse_uid_from_filename(const char *path, uid_t *uid);
-JournalFile* journal_initiate_close(JournalFile *f, Set *deferred_closes);
 
 int journal_file_dispose(int dir_fd, const char *fname);
 
@@ -312,6 +309,7 @@ void journal_file_post_change(JournalFile *f);
 int journal_file_enable_post_change_timer(JournalFile *f, sd_event *e, usec_t t);
 
 void journal_reset_metrics(JournalMetrics *m);
+bool journal_metrics_equal(const JournalMetrics *x, const JournalMetrics *y);
 
 int journal_file_get_cutoff_realtime_usec(JournalFile *f, usec_t *ret_from, usec_t *ret_to);
 int journal_file_get_cutoff_monotonic_usec(JournalFile *f, sd_id128_t boot, usec_t *ret_from, usec_t *ret_to);
@@ -382,7 +380,4 @@ static inline uint32_t COMPRESSION_TO_HEADER_INCOMPATIBLE_FLAG(Compression c) {
         }
 }
 
-static inline bool journal_file_writable(JournalFile *f) {
-        assert(f);
-        return (f->open_flags & O_ACCMODE) != O_RDONLY;
-}
+bool journal_file_writable(const JournalFile *f) _pure_;

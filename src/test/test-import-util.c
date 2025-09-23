@@ -2,15 +2,13 @@
 
 #include "alloc-util.h"
 #include "import-util.h"
-#include "log.h"
-#include "string-util.h"
 #include "tests.h"
 
 static void test_import_url_last_component_one(const char *input, const char *output, int ret) {
         _cleanup_free_ char *s = NULL;
 
         assert_se(import_url_last_component(input, &s) == ret);
-        assert_se(streq_ptr(output, s));
+        ASSERT_STREQ(output, s);
 }
 
 TEST(import_url_last_component) {
@@ -37,7 +35,7 @@ static void test_import_url_change_suffix_one(const char *input, size_t n, const
         _cleanup_free_ char *s = NULL;
 
         assert_se(import_url_change_suffix(input, n, suffix, &s) == ret);
-        assert_se(streq_ptr(output, s));
+        ASSERT_STREQ(output, s);
 }
 
 TEST(import_url_change_suffix) {

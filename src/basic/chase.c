@@ -1,17 +1,32 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <linux/magic.h>
+#include <sys/mount.h>
+#include <unistd.h>
 
 #include "alloc-util.h"
 #include "chase.h"
+#include "errno-util.h"
 #include "fd-util.h"
 #include "fileio.h"
 #include "fs-util.h"
 #include "glyph-util.h"
 #include "log.h"
 #include "path-util.h"
+#include "stat-util.h"
 #include "string-util.h"
+#include "strv.h"
 #include "user-util.h"
+
+#define CHASE_NO_SHORTCUT_MASK                          \
+        (CHASE_NONEXISTENT |                            \
+         CHASE_NO_AUTOFS |                              \
+         CHASE_TRIGGER_AUTOFS |                         \
+         CHASE_SAFE |                                   \
+         CHASE_STEP |                                   \
+         CHASE_PROHIBIT_SYMLINKS |                      \
+         CHASE_PARENT |                                 \
+         CHASE_MKDIR_0755)
 
 bool unsafe_transition(const struct stat *a, const struct stat *b) {
         /* Returns true if the transition from a to b is safe, i.e. that we never transition from unprivileged to
@@ -41,7 +56,7 @@ static int log_unsafe_transition(int a, int b, const char *path, ChaseFlags flag
 
         return log_warning_errno(SYNTHETIC_ERRNO(ENOLINK),
                                  "Detected unsafe path transition %s (owned by %s) %s %s (owned by %s) during canonicalization of %s.",
-                                 strna(n1), strna(user_a), special_glyph(SPECIAL_GLYPH_ARROW_RIGHT), strna(n2), strna(user_b), path);
+                                 strna(n1), strna(user_a), glyph(GLYPH_ARROW_RIGHT), strna(n2), strna(user_b), path);
 }
 
 static int log_autofs_mount_point(int fd, const char *path, ChaseFlags flags) {
@@ -72,6 +87,41 @@ static int log_prohibited_symlink(int fd, ChaseFlags flags) {
                                  strna(n1));
 }
 
+static int openat_opath_with_automount(int dir_fd, const char *path, bool automount) {
+        static bool can_open_tree = true;
+        int r;
+
+        /* Pin an inode via O_PATH semantics. Sounds pretty obvious to do this, right? You just do open()
+         * with O_PATH, and there you go. But uh, it's not that easy. open() via O_PATH does not trigger
+         * automounts, but we may want that when CHASE_TRIGGER_AUTOFS is set. But thankfully there's
+         * a way out: the newer open_tree() call, when specified without OPEN_TREE_CLONE actually is fully
+         * equivalent to open() with O_PATH – except for one thing: it triggers automounts.
+         *
+         * As it turns out some sandboxes prohibit open_tree(), and return EPERM or ENOSYS if we call it.
+         * But since autofs does not work inside of mount namespace anyway, let's simply handle this
+         * as gracefully as we can, and fall back to classic openat() if we see EPERM/ENOSYS. */
+
+        assert(dir_fd >= 0 || dir_fd == AT_FDCWD);
+        assert(path);
+
+        if (automount && can_open_tree) {
+                r = RET_NERRNO(open_tree(dir_fd, path, AT_SYMLINK_NOFOLLOW|OPEN_TREE_CLOEXEC));
+                if (r >= 0 || (r != -EPERM && !ERRNO_IS_NEG_NOT_SUPPORTED(r)))
+                        return r;
+
+                can_open_tree = false;
+        }
+
+        return RET_NERRNO(openat(dir_fd, path, O_PATH|O_NOFOLLOW|O_CLOEXEC));
+}
+
+static int chaseat_needs_absolute(int dir_fd, const char *path) {
+        if (dir_fd < 0)
+                return path_is_absolute(path);
+
+        return dir_fd_is_root(dir_fd);
+}
+
 int chaseat(int dir_fd, const char *path, ChaseFlags flags, char **ret_path, int *ret_fd) {
         _cleanup_free_ char *buffer = NULL, *done = NULL;
         _cleanup_close_ int fd = -EBADF, root_fd = -EBADF;
@@ -81,16 +131,11 @@ int chaseat(int dir_fd, const char *path, ChaseFlags flags, char **ret_path, int
         const char *todo;
         int r;
 
-        assert(path);
         assert(!FLAGS_SET(flags, CHASE_PREFIX_ROOT));
+        assert(!FLAGS_SET(flags, CHASE_MUST_BE_DIRECTORY|CHASE_MUST_BE_REGULAR));
         assert(!FLAGS_SET(flags, CHASE_STEP|CHASE_EXTRACT_FILENAME));
-        assert(!FLAGS_SET(flags, CHASE_TRAIL_SLASH|CHASE_EXTRACT_FILENAME));
-        assert(!FLAGS_SET(flags, CHASE_MKDIR_0755) || (flags & (CHASE_NONEXISTENT | CHASE_PARENT)) != 0);
+        assert(!FLAGS_SET(flags, CHASE_NO_AUTOFS|CHASE_TRIGGER_AUTOFS));
         assert(dir_fd >= 0 || dir_fd == AT_FDCWD);
-
-        /* Either the file may be missing, or we return an fd to the final object, but both make no sense */
-        if (FLAGS_SET(flags, CHASE_NONEXISTENT))
-                assert(!ret_fd);
 
         if (FLAGS_SET(flags, CHASE_STEP))
                 assert(!ret_fd);
@@ -184,11 +229,7 @@ int chaseat(int dir_fd, const char *path, ChaseFlags flags, char **ret_path, int
                         flags &= ~CHASE_AT_RESOLVE_IN_ROOT;
         }
 
-        if (!(flags &
-              (CHASE_AT_RESOLVE_IN_ROOT|CHASE_NONEXISTENT|CHASE_NO_AUTOFS|CHASE_SAFE|CHASE_STEP|
-               CHASE_PROHIBIT_SYMLINKS|CHASE_MKDIR_0755)) &&
-            !ret_path && ret_fd) {
-
+        if (!ret_path && ret_fd && (flags & (CHASE_AT_RESOLVE_IN_ROOT|CHASE_NO_SHORTCUT_MASK)) == 0) {
                 /* Shortcut the ret_fd case if the caller isn't interested in the actual path and has no root
                  * set and doesn't care about any of the other special features we provide either. */
                 r = openat(dir_fd, path, O_PATH|O_CLOEXEC|(FLAGS_SET(flags, CHASE_NOFOLLOW) ? O_NOFOLLOW : 0));
@@ -206,12 +247,27 @@ int chaseat(int dir_fd, const char *path, ChaseFlags flags, char **ret_path, int
         /* If we receive an absolute path together with AT_FDCWD, we need to return an absolute path, because
          * a relative path would be interpreted relative to the current working directory. Also, let's make
          * the result absolute when the file descriptor of the root directory is specified. */
-        bool need_absolute = (dir_fd == AT_FDCWD && path_is_absolute(path)) || dir_fd_is_root(dir_fd) > 0;
+        r = chaseat_needs_absolute(dir_fd, path);
+        if (r < 0)
+                return r;
+
+        bool need_absolute = r;
         if (need_absolute) {
                 done = strdup("/");
                 if (!done)
                         return -ENOMEM;
         }
+
+        /* If a positive directory file descriptor is provided, always resolve the given path relative to it,
+         * regardless of whether it is absolute or not. If we get AT_FDCWD, follow regular openat()
+         * semantics, if the path is relative, resolve against the current working directory. Otherwise,
+         * resolve against root. */
+        fd = openat(dir_fd, done ?: ".", O_CLOEXEC|O_DIRECTORY|O_PATH);
+        if (fd < 0)
+                return -errno;
+
+        if (fstat(fd, &st) < 0)
+                return -errno;
 
         /* If we get AT_FDCWD, we always resolve symlinks relative to the host's root. Only if a positive
          * directory file descriptor is provided we will look at CHASE_AT_RESOLVE_IN_ROOT to determine
@@ -223,22 +279,15 @@ int chaseat(int dir_fd, const char *path, ChaseFlags flags, char **ret_path, int
         if (root_fd < 0)
                 return -errno;
 
-        /* If a positive directory file descriptor is provided, always resolve the given path relative to it,
-         * regardless of whether it is absolute or not. If we get AT_FDCWD, follow regular openat()
-         * semantics, if the path is relative, resolve against the current working directory. Otherwise,
-         * resolve against root. */
-        if (dir_fd >= 0 || !path_is_absolute(path))
-                fd = openat(dir_fd, ".", O_CLOEXEC|O_DIRECTORY|O_PATH);
-        else
-                fd = open("/", O_CLOEXEC|O_DIRECTORY|O_PATH);
-        if (fd < 0)
-                return -errno;
+        if (ENDSWITH_SET(buffer, "/", "/.")) {
+                flags |= CHASE_MUST_BE_DIRECTORY;
+                if (FLAGS_SET(flags, CHASE_TRAIL_SLASH))
+                        append_trail_slash = true;
+        } else if (dot_or_dot_dot(buffer) || endswith(buffer, "/.."))
+                flags |= CHASE_MUST_BE_DIRECTORY;
 
-        if (fstat(fd, &st) < 0)
-                return -errno;
-
-        if (FLAGS_SET(flags, CHASE_TRAIL_SLASH))
-                append_trail_slash = ENDSWITH_SET(buffer, "/", "/.");
+        if (FLAGS_SET(flags, CHASE_PARENT))
+                flags |= CHASE_MUST_BE_DIRECTORY;
 
         for (todo = buffer;;) {
                 _cleanup_free_ char *first = NULL;
@@ -249,27 +298,26 @@ int chaseat(int dir_fd, const char *path, ChaseFlags flags, char **ret_path, int
                 r = path_find_first_component(&todo, /* accept_dot_dot= */ true, &e);
                 if (r < 0)
                         return r;
-                if (r == 0) { /* We reached the end. */
-                        if (append_trail_slash)
-                                if (!strextend(&done, "/"))
-                                        return -ENOMEM;
+                if (r == 0) /* We reached the end. */
                         break;
-                }
 
                 first = strndup(e, r);
                 if (!first)
                         return -ENOMEM;
 
                 /* Two dots? Then chop off the last bit of what we already found out. */
-                if (path_equal(first, "..")) {
+                if (streq(first, "..")) {
                         _cleanup_free_ char *parent = NULL;
                         _cleanup_close_ int fd_parent = -EBADF;
                         struct stat st_parent;
 
                         /* If we already are at the top, then going up will not change anything. This is
                          * in-line with how the kernel handles this. */
-                        if (empty_or_root(done) && FLAGS_SET(flags, CHASE_AT_RESOLVE_IN_ROOT))
+                        if (empty_or_root(done) && FLAGS_SET(flags, CHASE_AT_RESOLVE_IN_ROOT)) {
+                                if (FLAGS_SET(flags, CHASE_STEP))
+                                        goto chased_one;
                                 continue;
+                        }
 
                         fd_parent = openat(fd, "..", O_CLOEXEC|O_NOFOLLOW|O_PATH|O_DIRECTORY);
                         if (fd_parent < 0)
@@ -285,14 +333,33 @@ int chaseat(int dir_fd, const char *path, ChaseFlags flags, char **ret_path, int
                                 r = dir_fd_is_root(fd);
                                 if (r < 0)
                                         return r;
-                                if (r > 0)
+                                if (r > 0) {
+                                        if (FLAGS_SET(flags, CHASE_STEP))
+                                                goto chased_one;
                                         continue;
+                                }
                         }
 
                         r = path_extract_directory(done, &parent);
-                        if (r >= 0 || r == -EDESTADDRREQ)
+                        if (r >= 0) {
+                                assert(!need_absolute || path_is_absolute(parent));
                                 free_and_replace(done, parent);
-                        else if (IN_SET(r, -EINVAL, -EADDRNOTAVAIL)) {
+                        } else if (r == -EDESTADDRREQ) {
+                                /* 'done' contains filename only (i.e. no slash). */
+                                assert(!need_absolute);
+                                done = mfree(done);
+                        } else if (r == -EADDRNOTAVAIL) {
+                                /* 'done' is "/". This branch should be already handled in the above. */
+                                assert(!FLAGS_SET(flags, CHASE_AT_RESOLVE_IN_ROOT));
+                                assert_not_reached();
+                        } else if (r == -EINVAL) {
+                                /* 'done' is an empty string, ends with '..', or an invalid path. */
+                                assert(!need_absolute);
+                                assert(!FLAGS_SET(flags, CHASE_AT_RESOLVE_IN_ROOT));
+
+                                if (!path_is_valid(done))
+                                        return -EINVAL;
+
                                 /* If we're at the top of "dir_fd", start appending ".." to "done". */
                                 if (!path_extend(&done, ".."))
                                         return -ENOMEM;
@@ -306,8 +373,28 @@ int chaseat(int dir_fd, const char *path, ChaseFlags flags, char **ret_path, int
                             unsafe_transition(&st, &st_parent))
                                 return log_unsafe_transition(fd, fd_parent, path, flags);
 
-                        if (FLAGS_SET(flags, CHASE_PARENT) && isempty(todo))
+                        /* If the path ends on a "..", and CHASE_PARENT is specified then our current 'fd' is
+                         * the child of the returned normalized path, not the parent as requested. To correct
+                         * this we have to go *two* levels up. */
+                        if (FLAGS_SET(flags, CHASE_PARENT) && isempty(todo)) {
+                                _cleanup_close_ int fd_grandparent = -EBADF;
+                                struct stat st_grandparent;
+
+                                fd_grandparent = openat(fd_parent, "..", O_CLOEXEC|O_NOFOLLOW|O_PATH|O_DIRECTORY);
+                                if (fd_grandparent < 0)
+                                        return -errno;
+
+                                if (fstat(fd_grandparent, &st_grandparent) < 0)
+                                        return -errno;
+
+                                if (FLAGS_SET(flags, CHASE_SAFE) &&
+                                    unsafe_transition(&st_parent, &st_grandparent))
+                                        return log_unsafe_transition(fd_parent, fd_grandparent, path, flags);
+
+                                st = st_grandparent;
+                                close_and_replace(fd, fd_grandparent);
                                 break;
+                        }
 
                         /* update fd and stat */
                         st = st_parent;
@@ -315,17 +402,21 @@ int chaseat(int dir_fd, const char *path, ChaseFlags flags, char **ret_path, int
                         continue;
                 }
 
-                /* Otherwise let's see what this is. */
-                child = r = RET_NERRNO(openat(fd, first, O_CLOEXEC|O_NOFOLLOW|O_PATH));
+                /* Otherwise let's pin it by file descriptor, via O_PATH. */
+                child = r = openat_opath_with_automount(fd, first, /* automount = */ FLAGS_SET(flags, CHASE_TRIGGER_AUTOFS));
                 if (r < 0) {
                         if (r != -ENOENT)
                                 return r;
 
-                        if (!isempty(todo) && !path_is_safe(todo))
+                        if (!isempty(todo) && !path_is_safe(todo)) /* Refuse parent/mkdir handling if suffix contains ".." or something weird */
                                 return r;
 
-                        if (FLAGS_SET(flags, CHASE_MKDIR_0755) && !isempty(todo)) {
-                                child = xopenat(fd, first, O_DIRECTORY|O_CREAT|O_EXCL|O_NOFOLLOW|O_CLOEXEC, 0755);
+                        if (FLAGS_SET(flags, CHASE_MKDIR_0755) && (!isempty(todo) || !(flags & (CHASE_PARENT|CHASE_NONEXISTENT)))) {
+                                child = xopenat_full(fd,
+                                                     first,
+                                                     O_DIRECTORY|O_CREAT|O_EXCL|O_NOFOLLOW|O_PATH|O_CLOEXEC,
+                                                     /* xopen_flags = */ 0,
+                                                     0755);
                                 if (child < 0)
                                         return child;
                         } else if (FLAGS_SET(flags, CHASE_PARENT) && isempty(todo)) {
@@ -343,6 +434,7 @@ int chaseat(int dir_fd, const char *path, ChaseFlags flags, char **ret_path, int
                                 return r;
                 }
 
+                /* ... and then check what it actually is. */
                 if (fstat(child, &st_child) < 0)
                         return -errno;
 
@@ -424,10 +516,18 @@ int chaseat(int dir_fd, const char *path, ChaseFlags flags, char **ret_path, int
                 close_and_replace(fd, child);
         }
 
-        if (FLAGS_SET(flags, CHASE_PARENT)) {
-                r = stat_verify_directory(&st);
-                if (r < 0)
-                        return r;
+        if (exists) {
+                if (FLAGS_SET(flags, CHASE_MUST_BE_DIRECTORY)) {
+                        r = stat_verify_directory(&st);
+                        if (r < 0)
+                                return r;
+                }
+
+                if (FLAGS_SET(flags, CHASE_MUST_BE_REGULAR)) {
+                        r = stat_verify_regular(&st);
+                        if (r < 0)
+                                return r;
+                }
         }
 
         if (ret_path) {
@@ -443,20 +543,27 @@ int chaseat(int dir_fd, const char *path, ChaseFlags flags, char **ret_path, int
                 }
 
                 if (!done) {
-                        done = strdup(append_trail_slash ? "./" : ".");
+                        assert(!need_absolute || FLAGS_SET(flags, CHASE_EXTRACT_FILENAME));
+                        done = strdup(".");
                         if (!done)
                                 return -ENOMEM;
                 }
+
+                if (append_trail_slash)
+                        if (!strextend(&done, "/"))
+                                return -ENOMEM;
 
                 *ret_path = TAKE_PTR(done);
         }
 
         if (ret_fd) {
-                /* Return the O_PATH fd we currently are looking to the caller. It can translate it to a
-                 * proper fd by opening /proc/self/fd/xyz. */
-
-                assert(fd >= 0);
-                *ret_fd = TAKE_FD(fd);
+                if (exists) {
+                        /* Return the O_PATH fd we currently are looking to the caller. It can translate it
+                         * to a proper fd by opening /proc/self/fd/xyz. */
+                        assert(fd >= 0);
+                        *ret_fd = TAKE_FD(fd);
+                } else
+                        *ret_fd = -EBADF;
         }
 
         if (FLAGS_SET(flags, CHASE_STEP))
@@ -469,6 +576,7 @@ chased_one:
                 const char *e;
 
                 if (!done) {
+                        assert(!need_absolute);
                         done = strdup(append_trail_slash ? "./" : ".");
                         if (!done)
                                 return -ENOMEM;
@@ -504,10 +612,19 @@ int chase(const char *path, const char *root, ChaseFlags flags, char **ret_path,
         if (isempty(path))
                 return -EINVAL;
 
+        r = empty_or_root_harder_to_null(&root);
+        if (r < 0)
+                return r;
+
         /* A root directory of "/" or "" is identical to "/". */
-        if (empty_or_root(root))
+        if (empty_or_root(root)) {
                 root = "/";
-        else {
+
+                /* When the root directory is "/", we will drop CHASE_AT_RESOLVE_IN_ROOT in chaseat(),
+                 * hence below is not necessary, but let's shortcut. */
+                flags &= ~CHASE_AT_RESOLVE_IN_ROOT;
+
+        } else {
                 r = path_make_absolute_cwd(root, &root_abs);
                 if (r < 0)
                         return r;
@@ -556,8 +673,8 @@ int chase(const char *path, const char *root, ChaseFlags flags, char **ret_path,
                          * absolute, hence it is not necessary to prefix with the root. When "root" points to
                          * a non-root directory, the result path is always normalized and relative, hence
                          * we can simply call path_join() and not necessary to call path_simplify().
-                         * Note that the result of chaseat() may start with "." (more specifically, it may be
-                         * "." or "./"), and we need to drop "." in that case. */
+                         * As a special case, chaseat() may return "." or "./", which are normalized too,
+                         * but we need to drop "." before merging with root. */
 
                         if (empty_or_root(root))
                                 assert(path_is_absolute(p));
@@ -566,7 +683,7 @@ int chase(const char *path, const char *root, ChaseFlags flags, char **ret_path,
 
                                 assert(!path_is_absolute(p));
 
-                                q = path_join(root, p + (*p == '.'));
+                                q = path_join(root, p + STR_IN_SET(p, ".", "./"));
                                 if (!q)
                                         return -ENOMEM;
 
@@ -595,8 +712,13 @@ int chaseat_prefix_root(const char *path, const char *root, char **ret) {
         if (!path_is_absolute(path)) {
                 _cleanup_free_ char *root_abs = NULL;
 
+                r = empty_or_root_harder_to_null(&root);
+                if (r < 0 && r != -ENOENT)
+                        return r;
+
                 /* If the dir_fd points to the root directory, chaseat() always returns an absolute path. */
-                assert(!empty_or_root(root));
+                if (empty_or_root(root))
+                        return -EINVAL;
 
                 r = path_make_absolute_cwd(root, &root_abs);
                 if (r < 0)
@@ -614,38 +736,85 @@ int chaseat_prefix_root(const char *path, const char *root, char **ret) {
         return 0;
 }
 
-int chase_and_open(const char *path, const char *root, ChaseFlags chase_flags, int open_flags, char **ret_path) {
+int chase_extract_filename(const char *path, const char *root, char **ret) {
+        int r;
+
+        /* This is similar to path_extract_filename(), but takes root directory.
+         * The result should be consistent with chase() with CHASE_EXTRACT_FILENAME. */
+
+        assert(path);
+        assert(ret);
+
+        if (isempty(path))
+                return -EINVAL;
+
+        if (!path_is_absolute(path))
+                return -EINVAL;
+
+        r = empty_or_root_harder_to_null(&root);
+        if (r < 0 && r != -ENOENT)
+                return r;
+
+        if (!empty_or_root(root)) {
+                _cleanup_free_ char *root_abs = NULL;
+
+                r = path_make_absolute_cwd(root, &root_abs);
+                if (r < 0)
+                        return r;
+
+                path = path_startswith(path, root_abs);
+                if (!path)
+                        return -EINVAL;
+        }
+
+        if (!isempty(path)) {
+                r = path_extract_filename(path, ret);
+                if (r != -EADDRNOTAVAIL)
+                        return r;
+        }
+
+        return strdup_to(ret, ".");
+}
+
+int chase_and_open(
+                const char *path,
+                const char *root,
+                ChaseFlags chase_flags,
+                int open_flags,
+                char **ret_path) {
+
         _cleanup_close_ int path_fd = -EBADF;
         _cleanup_free_ char *p = NULL, *fname = NULL;
-        mode_t mode = open_flags & O_DIRECTORY ? 0755 : 0644;
-        const char *q;
         int r;
 
         assert(!(chase_flags & (CHASE_NONEXISTENT|CHASE_STEP)));
 
-        if (empty_or_root(root) && !ret_path &&
-            (chase_flags & (CHASE_NO_AUTOFS|CHASE_SAFE|CHASE_PROHIBIT_SYMLINKS|CHASE_PARENT|CHASE_MKDIR_0755)) == 0)
-                /* Shortcut this call if none of the special features of this call are requested */
-                return RET_NERRNO(xopenat(AT_FDCWD, path,
-                                          open_flags | (FLAGS_SET(chase_flags, CHASE_NOFOLLOW) ? O_NOFOLLOW : 0),
-                                          mode));
+        XOpenFlags xopen_flags = 0;
+        if (FLAGS_SET(chase_flags, CHASE_MUST_BE_DIRECTORY))
+                open_flags |= O_DIRECTORY;
+        if (FLAGS_SET(chase_flags, CHASE_MUST_BE_REGULAR))
+                xopen_flags |= XO_REGULAR;
 
-        r = chase(path, root, CHASE_PARENT|chase_flags, &p, &path_fd);
+        if (empty_or_root(root) && !ret_path && (chase_flags & CHASE_NO_SHORTCUT_MASK) == 0)
+                /* Shortcut this call if none of the special features of this call are requested */
+                return xopenat_full(AT_FDCWD, path,
+                                    open_flags | (FLAGS_SET(chase_flags, CHASE_NOFOLLOW) ? O_NOFOLLOW : 0),
+                                    xopen_flags,
+                                    MODE_INVALID);
+
+        r = chase(path, root, (CHASE_PARENT|chase_flags)&~CHASE_MUST_BE_REGULAR, &p, &path_fd);
         if (r < 0)
                 return r;
         assert(path_fd >= 0);
 
-        assert_se(q = path_startswith(p, empty_to_root(root)));
-        if (isempty(q))
-                q = ".";
-
-        if (!FLAGS_SET(chase_flags, CHASE_PARENT)) {
-                r = path_extract_filename(q, &fname);
-                if (r < 0 && r != -EADDRNOTAVAIL)
+        if (!FLAGS_SET(chase_flags, CHASE_PARENT) &&
+            !FLAGS_SET(chase_flags, CHASE_EXTRACT_FILENAME)) {
+                r = chase_extract_filename(p, root, &fname);
+                if (r < 0)
                         return r;
         }
 
-        r = xopenat(path_fd, strempty(fname), open_flags|O_NOFOLLOW, mode);
+        r = xopenat_full(path_fd, strempty(fname), open_flags|O_NOFOLLOW, xopen_flags, MODE_INVALID);
         if (r < 0)
                 return r;
 
@@ -661,11 +830,10 @@ int chase_and_opendir(const char *path, const char *root, ChaseFlags chase_flags
         DIR *d;
         int r;
 
-        assert(!(chase_flags & (CHASE_NONEXISTENT|CHASE_STEP)));
+        assert(!(chase_flags & (CHASE_NONEXISTENT|CHASE_STEP|CHASE_MUST_BE_REGULAR)));
         assert(ret_dir);
 
-        if (empty_or_root(root) && !ret_path &&
-            (chase_flags & (CHASE_NO_AUTOFS|CHASE_SAFE|CHASE_PROHIBIT_SYMLINKS|CHASE_PARENT|CHASE_MKDIR_0755)) == 0) {
+        if (empty_or_root(root) && !ret_path && (chase_flags & CHASE_NO_SHORTCUT_MASK) == 0) {
                 /* Shortcut this call if none of the special features of this call are requested */
                 d = opendir(path);
                 if (!d)
@@ -675,12 +843,12 @@ int chase_and_opendir(const char *path, const char *root, ChaseFlags chase_flags
                 return 0;
         }
 
-        r = chase(path, root, chase_flags, ret_path ? &p : NULL, &path_fd);
+        r = chase(path, root, chase_flags|CHASE_MUST_BE_DIRECTORY, ret_path ? &p : NULL, &path_fd);
         if (r < 0)
                 return r;
         assert(path_fd >= 0);
 
-        d = xopendirat(path_fd, ".", O_NOFOLLOW);
+        d = xopendirat(path_fd, /* path= */ NULL, /* flags= */ 0);
         if (!d)
                 return -errno;
 
@@ -700,8 +868,7 @@ int chase_and_stat(const char *path, const char *root, ChaseFlags chase_flags, c
         assert(!(chase_flags & (CHASE_NONEXISTENT|CHASE_STEP)));
         assert(ret_stat);
 
-        if (empty_or_root(root) && !ret_path &&
-            (chase_flags & (CHASE_NO_AUTOFS|CHASE_SAFE|CHASE_PROHIBIT_SYMLINKS|CHASE_PARENT|CHASE_MKDIR_0755)) == 0)
+        if (empty_or_root(root) && !ret_path && (chase_flags & CHASE_NO_SHORTCUT_MASK) == 0)
                 /* Shortcut this call if none of the special features of this call are requested */
                 return RET_NERRNO(fstatat(AT_FDCWD, path, ret_stat,
                                           FLAGS_SET(chase_flags, CHASE_NOFOLLOW) ? AT_SYMLINK_NOFOLLOW : 0));
@@ -728,8 +895,7 @@ int chase_and_access(const char *path, const char *root, ChaseFlags chase_flags,
         assert(path);
         assert(!(chase_flags & (CHASE_NONEXISTENT|CHASE_STEP)));
 
-        if (empty_or_root(root) && !ret_path &&
-            (chase_flags & (CHASE_NO_AUTOFS|CHASE_SAFE|CHASE_PROHIBIT_SYMLINKS|CHASE_PARENT|CHASE_MKDIR_0755)) == 0)
+        if (empty_or_root(root) && !ret_path && (chase_flags & CHASE_NO_SHORTCUT_MASK) == 0)
                 /* Shortcut this call if none of the special features of this call are requested */
                 return RET_NERRNO(faccessat(AT_FDCWD, path, access_mode,
                                             FLAGS_SET(chase_flags, CHASE_NOFOLLOW) ? AT_SYMLINK_NOFOLLOW : 0));
@@ -762,7 +928,7 @@ int chase_and_fopen_unlocked(
         int mode_flags, r;
 
         assert(path);
-        assert(!(chase_flags & (CHASE_NONEXISTENT|CHASE_STEP|CHASE_PARENT)));
+        assert(!(chase_flags & (CHASE_NONEXISTENT|CHASE_STEP|CHASE_PARENT|CHASE_MUST_BE_DIRECTORY)));
         assert(open_flags);
         assert(ret_file);
 
@@ -821,22 +987,33 @@ int chase_and_open_parent(const char *path, const char *root, ChaseFlags chase_f
         return pfd;
 }
 
-int chase_and_openat(int dir_fd, const char *path, ChaseFlags chase_flags, int open_flags, char **ret_path) {
+int chase_and_openat(
+                int dir_fd,
+                const char *path,
+                ChaseFlags chase_flags,
+                int open_flags,
+                char **ret_path) {
+
         _cleanup_close_ int path_fd = -EBADF;
         _cleanup_free_ char *p = NULL, *fname = NULL;
-        mode_t mode = open_flags & O_DIRECTORY ? 0755 : 0644;
         int r;
 
         assert(!(chase_flags & (CHASE_NONEXISTENT|CHASE_STEP)));
 
-        if (dir_fd == AT_FDCWD && !ret_path &&
-            (chase_flags & (CHASE_NO_AUTOFS|CHASE_SAFE|CHASE_PROHIBIT_SYMLINKS|CHASE_PARENT|CHASE_MKDIR_0755)) == 0)
-                /* Shortcut this call if none of the special features of this call are requested */
-                return RET_NERRNO(xopenat(dir_fd, path,
-                                          open_flags | (FLAGS_SET(chase_flags, CHASE_NOFOLLOW) ? O_NOFOLLOW : 0),
-                                          mode));
+        XOpenFlags xopen_flags = 0;
+        if (FLAGS_SET(chase_flags, CHASE_MUST_BE_DIRECTORY))
+                open_flags |= O_DIRECTORY;
+        if (FLAGS_SET(chase_flags, CHASE_MUST_BE_REGULAR))
+                xopen_flags |= XO_REGULAR;
 
-        r = chaseat(dir_fd, path, chase_flags|CHASE_PARENT, &p, &path_fd);
+        if (dir_fd == AT_FDCWD && !ret_path && (chase_flags & CHASE_NO_SHORTCUT_MASK) == 0)
+                /* Shortcut this call if none of the special features of this call are requested */
+                return xopenat_full(dir_fd, path,
+                                    open_flags | (FLAGS_SET(chase_flags, CHASE_NOFOLLOW) ? O_NOFOLLOW : 0),
+                                    xopen_flags,
+                                    MODE_INVALID);
+
+        r = chaseat(dir_fd, path, (chase_flags|CHASE_PARENT)&~CHASE_MUST_BE_REGULAR, &p, &path_fd);
         if (r < 0)
                 return r;
 
@@ -846,7 +1023,12 @@ int chase_and_openat(int dir_fd, const char *path, ChaseFlags chase_flags, int o
                         return r;
         }
 
-        r = xopenat(path_fd, strempty(fname), open_flags|O_NOFOLLOW, mode);
+        r = xopenat_full(
+                        path_fd,
+                        strempty(fname),
+                        open_flags|O_NOFOLLOW,
+                        xopen_flags,
+                        MODE_INVALID);
         if (r < 0)
                 return r;
 
@@ -862,11 +1044,10 @@ int chase_and_opendirat(int dir_fd, const char *path, ChaseFlags chase_flags, ch
         DIR *d;
         int r;
 
-        assert(!(chase_flags & (CHASE_NONEXISTENT|CHASE_STEP)));
+        assert(!(chase_flags & (CHASE_NONEXISTENT|CHASE_STEP|CHASE_MUST_BE_REGULAR)));
         assert(ret_dir);
 
-        if (dir_fd == AT_FDCWD && !ret_path &&
-            (chase_flags & (CHASE_NO_AUTOFS|CHASE_SAFE|CHASE_PROHIBIT_SYMLINKS|CHASE_PARENT|CHASE_MKDIR_0755)) == 0) {
+        if (dir_fd == AT_FDCWD && !ret_path && (chase_flags & CHASE_NO_SHORTCUT_MASK) == 0) {
                 /* Shortcut this call if none of the special features of this call are requested */
                 d = opendir(path);
                 if (!d)
@@ -881,7 +1062,7 @@ int chase_and_opendirat(int dir_fd, const char *path, ChaseFlags chase_flags, ch
                 return r;
         assert(path_fd >= 0);
 
-        d = xopendirat(path_fd, ".", O_NOFOLLOW);
+        d = xopendirat(path_fd, /* path= */ NULL, /* flags= */ 0);
         if (!d)
                 return -errno;
 
@@ -901,8 +1082,7 @@ int chase_and_statat(int dir_fd, const char *path, ChaseFlags chase_flags, char 
         assert(!(chase_flags & (CHASE_NONEXISTENT|CHASE_STEP)));
         assert(ret_stat);
 
-        if (dir_fd == AT_FDCWD && !ret_path &&
-            (chase_flags & (CHASE_NO_AUTOFS|CHASE_SAFE|CHASE_PROHIBIT_SYMLINKS|CHASE_PARENT|CHASE_MKDIR_0755)) == 0)
+        if (dir_fd == AT_FDCWD && !ret_path && (chase_flags & CHASE_NO_SHORTCUT_MASK) == 0)
                 /* Shortcut this call if none of the special features of this call are requested */
                 return RET_NERRNO(fstatat(AT_FDCWD, path, ret_stat,
                                           FLAGS_SET(chase_flags, CHASE_NOFOLLOW) ? AT_SYMLINK_NOFOLLOW : 0));
@@ -929,8 +1109,7 @@ int chase_and_accessat(int dir_fd, const char *path, ChaseFlags chase_flags, int
         assert(path);
         assert(!(chase_flags & (CHASE_NONEXISTENT|CHASE_STEP)));
 
-        if (dir_fd == AT_FDCWD && !ret_path &&
-            (chase_flags & (CHASE_NO_AUTOFS|CHASE_SAFE|CHASE_PROHIBIT_SYMLINKS|CHASE_PARENT|CHASE_MKDIR_0755)) == 0)
+        if (dir_fd == AT_FDCWD && !ret_path && (chase_flags & CHASE_NO_SHORTCUT_MASK) == 0)
                 /* Shortcut this call if none of the special features of this call are requested */
                 return RET_NERRNO(faccessat(AT_FDCWD, path, access_mode,
                                             FLAGS_SET(chase_flags, CHASE_NOFOLLOW) ? AT_SYMLINK_NOFOLLOW : 0));

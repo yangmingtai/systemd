@@ -1,10 +1,14 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
+#include "sd-bus.h"
+
 #include "bus-error.h"
 #include "bus-locator.h"
+#include "log.h"
+#include "string-util.h"
+#include "systemctl.h"
 #include "systemctl-trivial-method.h"
 #include "systemctl-util.h"
-#include "systemctl.h"
 
 /* A generic implementation for cases we just need to invoke a simple method call on the Manager object. */
 
@@ -30,6 +34,7 @@ int verb_trivial_method(int argc, char *argv[], void *userdata) {
                 streq(argv[0], "halt")          ? "Halt" :
                 streq(argv[0], "reboot")        ? "Reboot" :
                 streq(argv[0], "kexec")         ? "KExec" :
+                streq(argv[0], "soft-reboot")   ? "SoftReboot" :
                 streq(argv[0], "exit")          ? "Exit" :
                              /* poweroff */       "PowerOff";
 

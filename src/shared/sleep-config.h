@@ -1,76 +1,65 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include <linux/fiemap.h>
-
-#include "hashmap.h"
-#include "time-util.h"
-
-#define DEFAULT_SUSPEND_ESTIMATION_USEC (1 * USEC_PER_HOUR)
+#include "forward.h"
 
 typedef enum SleepOperation {
         SLEEP_SUSPEND,
         SLEEP_HIBERNATE,
         SLEEP_HYBRID_SLEEP,
+        _SLEEP_OPERATION_CONFIG_MAX,
+        /* The operations above require configuration for mode and state. The ones below are "combined"
+         * operations that use config from those individual operations. */
+
         SLEEP_SUSPEND_THEN_HIBERNATE,
+
         _SLEEP_OPERATION_MAX,
         _SLEEP_OPERATION_INVALID = -EINVAL,
 } SleepOperation;
 
+const char* sleep_operation_to_string(SleepOperation s) _const_;
+SleepOperation sleep_operation_from_string(const char *s) _pure_;
+
+static inline bool SLEEP_OPERATION_IS_HIBERNATION(SleepOperation operation) {
+        return IN_SET(operation, SLEEP_HIBERNATE, SLEEP_HYBRID_SLEEP);
+}
+
 typedef struct SleepConfig {
         bool allow[_SLEEP_OPERATION_MAX];
-        char **modes[_SLEEP_OPERATION_MAX];
-        char **states[_SLEEP_OPERATION_MAX];
+
+        char **states[_SLEEP_OPERATION_CONFIG_MAX];
+        char **modes[_SLEEP_OPERATION_CONFIG_MAX];  /* Power mode after writing hibernation image (/sys/power/disk) */
+        char **mem_modes;                           /* /sys/power/mem_sleep */
+
         usec_t hibernate_delay_usec;
+        bool hibernate_on_ac_power;
         usec_t suspend_estimation_usec;
 } SleepConfig;
 
-SleepConfig* free_sleep_config(SleepConfig *sc);
-DEFINE_TRIVIAL_CLEANUP_FUNC(SleepConfig*, free_sleep_config);
+SleepConfig* sleep_config_free(SleepConfig *sc);
+DEFINE_TRIVIAL_CLEANUP_FUNC(SleepConfig*, sleep_config_free);
 
-/* entry in /proc/swaps */
-typedef struct SwapEntry {
-        char *device;
-        char *type;
-        uint64_t size;
-        uint64_t used;
-        int priority;
-} SwapEntry;
-
-SwapEntry* swap_entry_free(SwapEntry *se);
-DEFINE_TRIVIAL_CLEANUP_FUNC(SwapEntry*, swap_entry_free);
-
-/*
- * represents values for /sys/power/resume & /sys/power/resume_offset
- * and the matching /proc/swap entry.
- */
-typedef struct HibernateLocation {
-        dev_t devno;
-        uint64_t offset;
-        SwapEntry *swap;
-} HibernateLocation;
-
-HibernateLocation* hibernate_location_free(HibernateLocation *hl);
-DEFINE_TRIVIAL_CLEANUP_FUNC(HibernateLocation*, hibernate_location_free);
-
-int read_fiemap(int fd, struct fiemap **ret);
 int parse_sleep_config(SleepConfig **sleep_config);
-int find_hibernate_location(HibernateLocation **ret_hibernate_location);
 
-int can_sleep(SleepOperation operation);
-int can_sleep_disk(char **types);
-int can_sleep_state(char **types);
-int battery_is_discharging_and_low(void);
-int get_total_suspend_interval(Hashmap *last_capacity, usec_t *ret);
-int fetch_batteries_capacity_by_name(Hashmap **ret_current_capacity);
-int get_capacity_by_name(Hashmap *capacities_by_name, const char *name);
-int estimate_battery_discharge_rate_per_hour(
-                Hashmap *last_capacity,
-                Hashmap *current_capacity,
-                usec_t before_timestamp,
-                usec_t after_timestamp);
-int check_wakeup_type(void);
-int battery_trip_point_alarm_exists(void);
+bool sleep_needs_mem_sleep(const SleepConfig *sc, SleepOperation operation) _pure_;
 
-const char* sleep_operation_to_string(SleepOperation s) _const_;
-SleepOperation sleep_operation_from_string(const char *s) _pure_;
+typedef enum SleepSupport {
+        SLEEP_SUPPORTED,
+        SLEEP_DISABLED,                    /* Disabled in SleepConfig.allow */
+        SLEEP_NOT_CONFIGURED,              /* SleepConfig.states is not configured */
+        SLEEP_STATE_OR_MODE_NOT_SUPPORTED, /* SleepConfig.states/modes are not supported by kernel */
+        SLEEP_RESUME_NOT_SUPPORTED,
+        SLEEP_RESUME_DEVICE_MISSING,       /* resume= is specified, but the device cannot be found in /proc/swaps */
+        SLEEP_RESUME_MISCONFIGURED,        /* resume= is not set yet resume_offset= is configured */
+        SLEEP_NOT_ENOUGH_SWAP_SPACE,
+        SLEEP_ALARM_NOT_SUPPORTED,         /* CLOCK_BOOTTIME_ALARM is unsupported by kernel (only used by s2h) */
+} SleepSupport;
+
+int sleep_supported_full(SleepOperation operation, SleepSupport *ret_support);
+static inline int sleep_supported(SleepOperation operation) {
+        return sleep_supported_full(operation, NULL);
+}
+
+/* Only for test-sleep-config */
+int sleep_state_supported(char * const *states);
+int sleep_mode_supported(const char *path, char * const *modes);

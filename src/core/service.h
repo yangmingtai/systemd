@@ -1,15 +1,11 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-typedef struct Service Service;
-typedef struct ServiceFDStore ServiceFDStore;
-
+#include "cgroup.h"
+#include "core-forward.h"
 #include "exit-status.h"
 #include "kill.h"
-#include "open-file.h"
-#include "path.h"
-#include "ratelimit.h"
-#include "socket.h"
+#include "pidref.h"
 #include "unit.h"
 
 typedef enum ServiceRestart {
@@ -91,7 +87,15 @@ typedef enum ServiceTimeoutFailureMode {
         _SERVICE_TIMEOUT_FAILURE_MODE_INVALID = -EINVAL,
 } ServiceTimeoutFailureMode;
 
-struct ServiceFDStore {
+typedef enum ServiceRestartMode {
+        SERVICE_RESTART_MODE_NORMAL,
+        SERVICE_RESTART_MODE_DIRECT,
+        SERVICE_RESTART_MODE_DEBUG,
+        _SERVICE_RESTART_MODE_MAX,
+        _SERVICE_RESTART_MODE_INVALID = -EINVAL,
+} ServiceRestartMode;
+
+typedef struct ServiceFDStore {
         Service *service;
 
         int fd;
@@ -99,15 +103,21 @@ struct ServiceFDStore {
         sd_event_source *event_source;
         bool do_poll;
 
-        LIST_FIELDS(ServiceFDStore, fd_store);
-};
+        LIST_FIELDS(struct ServiceFDStore, fd_store);
+} ServiceFDStore;
 
-struct Service {
+typedef struct ServiceExtraFD {
+        int fd;
+        char *fdname;
+} ServiceExtraFD;
+
+typedef struct Service {
         Unit meta;
 
         ServiceType type;
         ServiceExitType exit_type;
         ServiceRestart restart;
+        ServiceRestartMode restart_mode;
         ExitStatusSet restart_prevent_status;
         ExitStatusSet restart_force_status;
         ExitStatusSet success_status;
@@ -115,9 +125,10 @@ struct Service {
         /* If set we'll read the main daemon PID from this file */
         char *pid_file;
 
-        usec_t restart_usec;
+        unsigned n_restarts;
         unsigned restart_steps;
-        usec_t restart_usec_max;
+        usec_t restart_usec;
+        usec_t restart_max_delay_usec;
         usec_t timeout_start_usec;
         usec_t timeout_stop_usec;
         usec_t timeout_abort_usec;
@@ -134,8 +145,6 @@ struct Service {
         bool watchdog_override_enable;
         sd_event_source *watchdog_event_source;
 
-        ExecCommand* exec_command[_SERVICE_EXEC_COMMAND_MAX];
-
         ExecContext exec_context;
         KillContext kill_context;
         CGroupContext cgroup_context;
@@ -145,13 +154,14 @@ struct Service {
         /* The exit status of the real main process */
         ExecStatus main_exec_status;
 
+        ExecCommand *exec_command[_SERVICE_EXEC_COMMAND_MAX];
+
+        /* The currently executed main process, which may be NULL if the main process got started via
+         * forking mode and not by us */
+        ExecCommand *main_command;
+
         /* The currently executed control process */
         ExecCommand *control_command;
-
-        /* The currently executed main process, which may be NULL if
-         * the main process got started via forking mode and not by
-         * us */
-        ExecCommand *main_command;
 
         /* The ID of the control command currently being executed */
         ServiceExecCommand control_command_id;
@@ -159,7 +169,9 @@ struct Service {
         /* Runtime data of the execution context */
         ExecRuntime *exec_runtime;
 
-        pid_t main_pid, control_pid;
+        CGroupRuntime *cgroup_runtime;
+
+        PidRef main_pid, control_pid;
 
         /* if we are a socket activated service instance, store information of the connection/peer/socket */
         int socket_fd;
@@ -175,21 +187,21 @@ struct Service {
         /* If we shut down, remember why */
         ServiceResult result;
         ServiceResult reload_result;
+        ServiceResult live_mount_result;
         ServiceResult clean_result;
 
         bool main_pid_known:1;
         bool main_pid_alien:1;
         bool bus_name_good:1;
         bool forbid_restart:1;
-        /* Keep restart intention between UNIT_FAILED and UNIT_ACTIVATING */
-        bool will_auto_restart:1;
         bool start_timeout_defined:1;
         bool exec_fd_hot:1;
 
         char *bus_name;
-        char *bus_name_owner; /* unique name of the current owner */
 
         char *status_text;
+        char *status_bus_error;
+        char *status_varlink_error;
         int status_errno;
 
         sd_event_source *timer_event_source;
@@ -203,28 +215,32 @@ struct Service {
 
         sd_event_source *exec_fd_event_source;
 
-        ServiceFDStore *fd_store;
+        LIST_HEAD(ServiceFDStore, fd_store);
         size_t n_fd_store;
         unsigned n_fd_store_max;
         ExecPreserveMode fd_store_preserve_mode;
-
-        char *usb_function_descriptors;
-        char *usb_function_strings;
 
         int stdin_fd;
         int stdout_fd;
         int stderr_fd;
 
-        unsigned n_restarts;
-        bool flush_n_restarts;
-
-        OOMPolicy oom_policy;
+        /* If service spawned from transient unit, extra file descriptors can be passed via dbus API */
+        ServiceExtraFD *extra_fds;
+        size_t n_extra_fds;
 
         LIST_HEAD(OpenFile, open_files);
 
         int reload_signal;
         usec_t reload_begin_usec;
-};
+
+        OOMPolicy oom_policy;
+
+        char *usb_function_descriptors;
+        char *usb_function_strings;
+
+        /* The D-Bus request, we will reply once the operation is finished, so that callers can block */
+        sd_bus_message *mount_request;
+} Service;
 
 static inline usec_t service_timeout_abort_usec(Service *s) {
         assert(s);
@@ -248,8 +264,13 @@ void service_release_socket_fd(Service *s);
 
 usec_t service_restart_usec_next(Service *s);
 
+int service_determine_exec_selinux_label(Service *s, char **ret);
+
 const char* service_restart_to_string(ServiceRestart i) _const_;
 ServiceRestart service_restart_from_string(const char *s) _pure_;
+
+const char* service_restart_mode_to_string(ServiceRestartMode i) _const_;
+ServiceRestartMode service_restart_mode_from_string(const char *s) _pure_;
 
 const char* service_type_to_string(ServiceType i) _const_;
 ServiceType service_type_from_string(const char *s) _pure_;

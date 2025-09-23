@@ -4,29 +4,35 @@
 #include <getopt.h>
 #include <linux/loop.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <sys/file.h>
-#include <sys/ioctl.h>
-#include <sys/mount.h>
+#include <unistd.h>
 
 #include "sd-device.h"
 
 #include "architecture.h"
+#include "argv-util.h"
 #include "blockdev-util.h"
 #include "build.h"
 #include "chase.h"
 #include "copy.h"
 #include "device-util.h"
-#include "devnum-util.h"
 #include "discover-image.h"
 #include "dissect-image.h"
 #include "env-util.h"
+#include "errno-util.h"
 #include "escape.h"
+#include "extract-word.h"
 #include "fd-util.h"
 #include "fileio.h"
 #include "format-table.h"
 #include "format-util.h"
 #include "fs-util.h"
+#include "hashmap.h"
 #include "hexdecoct.h"
+#include "image-policy.h"
+#include "json-util.h"
+#include "libarchive-util.h"
 #include "log.h"
 #include "loop-util.h"
 #include "main-func.h"
@@ -34,20 +40,24 @@
 #include "mount-util.h"
 #include "mountpoint-util.h"
 #include "namespace-util.h"
+#include "nsresource.h"
 #include "parse-argument.h"
 #include "parse-util.h"
 #include "path-util.h"
 #include "pretty-print.h"
 #include "process-util.h"
 #include "recurse-dir.h"
+#include "runtime-scope.h"
 #include "sha256.h"
+#include "shift-uid.h"
 #include "stat-util.h"
 #include "string-util.h"
 #include "strv.h"
 #include "terminal-util.h"
 #include "tmpfile-util.h"
-#include "uid-alloc-range.h"
+#include "uid-classification.h"
 #include "user-util.h"
+#include "vpick.h"
 
 static enum {
         ACTION_DISSECT,
@@ -62,8 +72,11 @@ static enum {
         ACTION_COPY_TO,
         ACTION_DISCOVER,
         ACTION_VALIDATE,
+        ACTION_MAKE_ARCHIVE,
+        ACTION_SHIFT,
 } arg_action = ACTION_DISSECT;
 static char *arg_image = NULL;
+static char *arg_root = NULL;
 static char *arg_path = NULL;
 static const char *arg_source = NULL;
 static const char *arg_target = NULL;
@@ -75,26 +88,40 @@ static DissectImageFlags arg_flags =
         DISSECT_IMAGE_USR_NO_ROOT |
         DISSECT_IMAGE_GROWFS |
         DISSECT_IMAGE_PIN_PARTITION_DEVICES |
-        DISSECT_IMAGE_ADD_PARTITION_DEVICES;
+        DISSECT_IMAGE_ADD_PARTITION_DEVICES |
+        DISSECT_IMAGE_ALLOW_USERSPACE_VERITY;
 static VeritySettings arg_verity_settings = VERITY_SETTINGS_DEFAULT;
-static JsonFormatFlags arg_json_format_flags = JSON_FORMAT_OFF;
+static sd_json_format_flags_t arg_json_format_flags = SD_JSON_FORMAT_OFF;
 static PagerFlags arg_pager_flags = 0;
 static bool arg_legend = true;
 static bool arg_rmdir = false;
 static bool arg_in_memory = false;
 static char **arg_argv = NULL;
 static char *arg_loop_ref = NULL;
-static ImagePolicy* arg_image_policy = NULL;
+static bool arg_loop_ref_auto = false;
+static ImagePolicy *arg_image_policy = NULL;
+static bool arg_mtree_hash = true;
+static bool arg_via_service = false;
+static RuntimeScope arg_runtime_scope = _RUNTIME_SCOPE_INVALID;
+static bool arg_all = false;
+static uid_t arg_uid_base = UID_INVALID;
+static bool arg_quiet = false;
+static ImageFilter *arg_image_filter = NULL;
 
 STATIC_DESTRUCTOR_REGISTER(arg_image, freep);
+STATIC_DESTRUCTOR_REGISTER(arg_root, freep);
 STATIC_DESTRUCTOR_REGISTER(arg_path, freep);
 STATIC_DESTRUCTOR_REGISTER(arg_verity_settings, verity_settings_done);
 STATIC_DESTRUCTOR_REGISTER(arg_argv, strv_freep);
 STATIC_DESTRUCTOR_REGISTER(arg_loop_ref, freep);
+STATIC_DESTRUCTOR_REGISTER(arg_image_policy, image_policy_freep);
+STATIC_DESTRUCTOR_REGISTER(arg_image_filter, image_filter_freep);
 
 static int help(void) {
         _cleanup_free_ char *link = NULL;
         int r;
+
+        pager_open(arg_pager_flags);
 
         r = terminal_urlify_man("systemd-dissect", "1", &link);
         if (r < 0)
@@ -109,8 +136,12 @@ static int help(void) {
                "%1$s [OPTIONS...] --mtree IMAGE\n"
                "%1$s [OPTIONS...] --with IMAGE [COMMAND…]\n"
                "%1$s [OPTIONS...] --copy-from IMAGE PATH [TARGET]\n"
-               "%1$s [OPTIONS...] --copy-to IMAGE [SOURCE] PATH\n\n"
-               "%5$sDissect a Discoverable Disk Image (DDI).%6$s\n\n"
+               "%1$s [OPTIONS...] --copy-to IMAGE [SOURCE] PATH\n"
+               "%1$s [OPTIONS...] --make-archive IMAGE [TARGET]\n"
+               "%1$s [OPTIONS...] --discover\n"
+               "%1$s [OPTIONS...] --validate IMAGE\n"
+               "%1$s [OPTIONS...] --shift IMAGE UIDBASE\n"
+               "\n%5$sDissect a Discoverable Disk Image (DDI).%6$s\n\n"
                "%3$sOptions:%4$s\n"
                "     --no-pager           Do not pipe output into a pager\n"
                "     --no-legend          Do not show the headers and footers\n"
@@ -130,9 +161,16 @@ static int help(void) {
                "                          not embedded in IMAGE\n"
                "     --image-policy=POLICY\n"
                "                          Specify image dissection policy\n"
+               "     --image-filter=FILTER\n"
+               "                          Specify image dissection filter\n"
                "     --json=pretty|short|off\n"
                "                          Generate JSON output\n"
                "     --loop-ref=NAME      Set reference string for loopback device\n"
+               "     --loop-ref-auto      Derive reference string from image file name\n"
+               "     --mtree-hash=BOOL    Whether to include SHA256 hash in the mtree output\n"
+               "     --user               Discover user images\n"
+               "     --system             Discover system images\n"
+               "     --all                Show hidden images too\n"
                "\n%3$sCommands:%4$s\n"
                "  -h --help               Show this help\n"
                "     --version            Show package version\n"
@@ -141,15 +179,18 @@ static int help(void) {
                "  -u --umount             Unmount the image from the specified directory\n"
                "  -U                      Shortcut for --umount --rmdir\n"
                "     --attach             Attach the disk image to a loopback block device\n"
-               "     --detach             Detach a loopback block device gain\n"
+               "     --detach             Detach a loopback block device again\n"
                "  -l --list               List all the files and directories of the specified\n"
                "                          OS image\n"
                "     --mtree              Show BSD mtree manifest of OS image\n"
                "     --with               Mount, run command, unmount\n"
                "  -x --copy-from          Copy files from image to host\n"
                "  -a --copy-to            Copy files from host to image\n"
+               "     --make-archive       Convert the DDI to an archive file\n"
                "     --discover           Discover DDIs in well known directories\n"
                "     --validate           Validate image and image policy\n"
+               "     --shift              Shift UID range to selected base\n"
+               "  -q --quiet              Suppress output of chosen loopback block device\n"
                "\nSee the %2$s for details.\n",
                program_invocation_short_name,
                link,
@@ -204,6 +245,31 @@ static int patch_argv(int *argc, char ***argv, char ***buf) {
         return 1;
 }
 
+static int parse_image_path_argument(const char *path, char **ret_root, char **ret_image) {
+        _cleanup_free_ char *p = NULL;
+        struct stat st;
+        int r;
+
+        assert(ret_image);
+
+        r = parse_path_argument(path, /* suppress_root= */ false, &p);
+        if (r < 0)
+                return r;
+
+        if (stat(p, &st) < 0)
+                return log_error_errno(errno, "Failed to stat %s: %m", p);
+
+        if (S_ISDIR(st.st_mode)) {
+                if (!ret_root)
+                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "%s is not an image file.", p);
+
+                *ret_root = TAKE_PTR(p);
+        } else
+                *ret_image = TAKE_PTR(p);
+
+        return 0;
+}
+
 static int parse_argv(int argc, char *argv[]) {
 
         enum {
@@ -216,6 +282,8 @@ static int parse_argv(int argc, char *argv[]) {
                 ARG_GROWFS,
                 ARG_ROOT_HASH,
                 ARG_ROOT_HASH_SIG,
+                ARG_USR_HASH,
+                ARG_USR_HASH_SIG,
                 ARG_VERITY_DATA,
                 ARG_MKDIR,
                 ARG_RMDIR,
@@ -226,8 +294,16 @@ static int parse_argv(int argc, char *argv[]) {
                 ARG_ATTACH,
                 ARG_DETACH,
                 ARG_LOOP_REF,
+                ARG_LOOP_REF_AUTO,
                 ARG_IMAGE_POLICY,
                 ARG_VALIDATE,
+                ARG_MTREE_HASH,
+                ARG_MAKE_ARCHIVE,
+                ARG_SHIFT,
+                ARG_SYSTEM,
+                ARG_USER,
+                ARG_ALL,
+                ARG_IMAGE_FILTER,
         };
 
         static const struct option options[] = {
@@ -246,6 +322,8 @@ static int parse_argv(int argc, char *argv[]) {
                 { "growfs",        required_argument, NULL, ARG_GROWFS        },
                 { "root-hash",     required_argument, NULL, ARG_ROOT_HASH     },
                 { "root-hash-sig", required_argument, NULL, ARG_ROOT_HASH_SIG },
+                { "usr-hash",      required_argument, NULL, ARG_USR_HASH      },
+                { "usr-hash-sig",  required_argument, NULL, ARG_USR_HASH_SIG  },
                 { "verity-data",   required_argument, NULL, ARG_VERITY_DATA   },
                 { "mkdir",         no_argument,       NULL, ARG_MKDIR         },
                 { "rmdir",         no_argument,       NULL, ARG_RMDIR         },
@@ -257,12 +335,22 @@ static int parse_argv(int argc, char *argv[]) {
                 { "json",          required_argument, NULL, ARG_JSON          },
                 { "discover",      no_argument,       NULL, ARG_DISCOVER      },
                 { "loop-ref",      required_argument, NULL, ARG_LOOP_REF      },
+                { "loop-ref-auto", no_argument,       NULL, ARG_LOOP_REF_AUTO },
                 { "image-policy",  required_argument, NULL, ARG_IMAGE_POLICY  },
                 { "validate",      no_argument,       NULL, ARG_VALIDATE      },
+                { "mtree-hash",    required_argument, NULL, ARG_MTREE_HASH    },
+                { "make-archive",  no_argument,       NULL, ARG_MAKE_ARCHIVE  },
+                { "shift",         no_argument,       NULL, ARG_SHIFT         },
+                { "system",        no_argument,       NULL, ARG_SYSTEM        },
+                { "user",          no_argument,       NULL, ARG_USER          },
+                { "all",           no_argument,       NULL, ARG_ALL           },
+                { "quiet",         no_argument,       NULL, 'q'               },
+                { "image-filter",  required_argument, NULL, ARG_IMAGE_FILTER  },
                 {}
         };
 
         _cleanup_free_ char **buf = NULL; /* we use free(), not strv_free() here, as we don't copy the strings here */
+        bool system_scope_requested = false, user_scope_requested = false;
         int c, r;
 
         assert(argc >= 0);
@@ -272,7 +360,7 @@ static int parse_argv(int argc, char *argv[]) {
         if (r < 0)
                 return r;
 
-        while ((c = getopt_long(argc, argv, "hmurMUlxa", options, NULL)) >= 0) {
+        while ((c = getopt_long(argc, argv, "hmurMUlxaq", options, NULL)) >= 0) {
 
                 switch (c) {
 
@@ -383,29 +471,42 @@ static int parse_argv(int argc, char *argv[]) {
                         arg_in_memory = true;
                         break;
 
-                case ARG_ROOT_HASH: {
+                case ARG_ROOT_HASH:
+                case ARG_USR_HASH: {
                         _cleanup_free_ void *p = NULL;
                         size_t l;
 
-                        r = unhexmem(optarg, strlen(optarg), &p, &l);
+                        PartitionDesignator d = c == ARG_USR_HASH ? PARTITION_USR : PARTITION_ROOT;
+                        if (arg_verity_settings.designator >= 0 &&
+                            arg_verity_settings.designator != d)
+                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Cannot combine --root-hash=/--root-hash-sig= and --usr-hash=/--usr-hash-sig= options.");
+
+                        r = unhexmem(optarg, &p, &l);
                         if (r < 0)
                                 return log_error_errno(r, "Failed to parse root hash '%s': %m", optarg);
                         if (l < sizeof(sd_id128_t))
                                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
-                                                       "Root hash must be at least 128bit long: %s", optarg);
+                                                       "Root hash must be at least 128-bit long: %s", optarg);
 
                         free_and_replace(arg_verity_settings.root_hash, p);
                         arg_verity_settings.root_hash_size = l;
+                        arg_verity_settings.designator = d;
                         break;
                 }
 
-                case ARG_ROOT_HASH_SIG: {
+                case ARG_ROOT_HASH_SIG:
+                case ARG_USR_HASH_SIG: {
                         char *value;
                         size_t l;
                         void *p;
 
+                        PartitionDesignator d = c == ARG_USR_HASH_SIG ? PARTITION_USR : PARTITION_ROOT;
+                        if (arg_verity_settings.designator >= 0 &&
+                            arg_verity_settings.designator != d)
+                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Cannot combine --root-hash=/--root-hash-sig= and --usr-hash=/--usr-hash-sig= options.");
+
                         if ((value = startswith(optarg, "base64:"))) {
-                                r = unbase64mem(value, strlen(value), &p, &l);
+                                r = unbase64mem(value, &p, &l);
                                 if (r < 0)
                                         return log_error_errno(r, "Failed to parse root hash signature '%s': %m", optarg);
                         } else {
@@ -416,6 +517,7 @@ static int parse_argv(int argc, char *argv[]) {
 
                         free_and_replace(arg_verity_settings.root_hash_sig, p);
                         arg_verity_settings.root_hash_sig_size = l;
+                        arg_verity_settings.designator = d;
                         break;
                 }
 
@@ -455,6 +557,7 @@ static int parse_argv(int argc, char *argv[]) {
                 case ARG_LOOP_REF:
                         if (isempty(optarg)) {
                                 arg_loop_ref = mfree(arg_loop_ref);
+                                arg_loop_ref_auto = false;
                                 break;
                         }
 
@@ -464,6 +567,13 @@ static int parse_argv(int argc, char *argv[]) {
                         r = free_and_strdup_warn(&arg_loop_ref, optarg);
                         if (r < 0)
                                 return r;
+
+                        arg_loop_ref_auto = false;
+                        break;
+
+                case ARG_LOOP_REF_AUTO:
+                        arg_loop_ref = mfree(arg_loop_ref);
+                        arg_loop_ref_auto = true;
                         break;
 
                 case ARG_IMAGE_POLICY:
@@ -476,6 +586,51 @@ static int parse_argv(int argc, char *argv[]) {
                         arg_action = ACTION_VALIDATE;
                         break;
 
+                case ARG_MTREE_HASH:
+                        r = parse_boolean_argument("--mtree-hash=", optarg, &arg_mtree_hash);
+                        if (r < 0)
+                                return r;
+                        break;
+
+                case ARG_MAKE_ARCHIVE:
+                        r = dlopen_libarchive();
+                        if (r < 0)
+                                return log_error_errno(r, "Archive support not available (compiled without libarchive, or libarchive not installed?).");
+
+                        arg_action = ACTION_MAKE_ARCHIVE;
+                        break;
+
+                case ARG_SHIFT:
+                        arg_action = ACTION_SHIFT;
+                        break;
+
+                case ARG_SYSTEM:
+                        system_scope_requested = true;
+                        break;
+
+                case ARG_USER:
+                        user_scope_requested = true;
+                        break;
+
+                case ARG_ALL:
+                        arg_all = true;
+                        break;
+
+                case 'q':
+                        arg_quiet = true;
+                        break;
+
+                case ARG_IMAGE_FILTER: {
+                        _cleanup_(image_filter_freep) ImageFilter *f = NULL;
+                        r = image_filter_parse(optarg, &f);
+                        if (r < 0)
+                                return log_error_errno(r, "Failed to parse image filter expression: %s", optarg);
+
+                        image_filter_free(arg_image_filter);
+                        arg_image_filter = TAKE_PTR(f);
+                        break;
+                }
+
                 case '?':
                         return -EINVAL;
 
@@ -484,6 +639,10 @@ static int parse_argv(int argc, char *argv[]) {
                 }
         }
 
+        if (system_scope_requested || user_scope_requested)
+                arg_runtime_scope = system_scope_requested && user_scope_requested ? _RUNTIME_SCOPE_INVALID :
+                        system_scope_requested ? RUNTIME_SCOPE_SYSTEM : RUNTIME_SCOPE_USER;
+
         switch (arg_action) {
 
         case ACTION_DISSECT:
@@ -491,7 +650,7 @@ static int parse_argv(int argc, char *argv[]) {
                         return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                                "Expected an image file path as only argument.");
 
-                r = parse_path_argument(argv[optind], /* suppress_root= */ false, &arg_image);
+                r = parse_image_path_argument(argv[optind], NULL, &arg_image);
                 if (r < 0)
                         return r;
 
@@ -504,7 +663,7 @@ static int parse_argv(int argc, char *argv[]) {
                         return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                                "Expected an image file path and mount point path as only arguments.");
 
-                r = parse_path_argument(argv[optind], /* suppress_root= */ false, &arg_image);
+                r = parse_image_path_argument(argv[optind], NULL, &arg_image);
                 if (r < 0)
                         return r;
 
@@ -530,7 +689,7 @@ static int parse_argv(int argc, char *argv[]) {
                         return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                                "Expected an image file path as only argument.");
 
-                r = parse_path_argument(argv[optind], /* suppress_root= */ false, &arg_image);
+                r = parse_image_path_argument(argv[optind], NULL, &arg_image);
                 if (r < 0)
                         return r;
                 break;
@@ -540,7 +699,7 @@ static int parse_argv(int argc, char *argv[]) {
                         return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                                "Expected an image file path or loopback device as only argument.");
 
-                r = parse_path_argument(argv[optind], /* suppress_root= */ false, &arg_image);
+                r = parse_image_path_argument(argv[optind], NULL, &arg_image);
                 if (r < 0)
                         return r;
                 break;
@@ -549,21 +708,34 @@ static int parse_argv(int argc, char *argv[]) {
         case ACTION_MTREE:
                 if (optind + 1 != argc)
                         return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
-                                               "Expected an image file path as only argument.");
+                                               "Expected an image file or directory path as only argument.");
 
-                r = parse_path_argument(argv[optind], /* suppress_root= */ false, &arg_image);
+                r = parse_image_path_argument(argv[optind], &arg_root, &arg_image);
                 if (r < 0)
                         return r;
 
                 arg_flags |= DISSECT_IMAGE_READ_ONLY | DISSECT_IMAGE_REQUIRE_ROOT;
                 break;
 
+        case ACTION_MAKE_ARCHIVE:
+                if (argc < optind + 1 || argc > optind + 2)
+                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                               "Expected an image file, and an optional target path as only arguments.");
+
+                r = parse_image_path_argument(argv[optind], &arg_root, &arg_image);
+                if (r < 0)
+                        return r;
+
+                arg_target = argc > optind + 1 ? empty_or_dash_to_null(argv[optind + 1]) : NULL;
+                arg_flags |= DISSECT_IMAGE_READ_ONLY | DISSECT_IMAGE_REQUIRE_ROOT;
+                break;
+
         case ACTION_COPY_FROM:
                 if (argc < optind + 2 || argc > optind + 3)
                         return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
-                                               "Expected an image file path, a source path and an optional destination path as only arguments.");
+                                               "Expected an image file or directory path, a source path and an optional destination path as only arguments.");
 
-                r = parse_path_argument(argv[optind], /* suppress_root= */ false, &arg_image);
+                r = parse_image_path_argument(argv[optind], &arg_root, &arg_image);
                 if (r < 0)
                         return r;
                 arg_source = argv[optind + 1];
@@ -575,9 +747,9 @@ static int parse_argv(int argc, char *argv[]) {
         case ACTION_COPY_TO:
                 if (argc < optind + 2 || argc > optind + 3)
                         return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
-                                               "Expected an image file path, an optional source path and a destination path as only arguments.");
+                                               "Expected an image file or directory path, an optional source path and a destination path as only arguments.");
 
-                r = parse_path_argument(argv[optind], /* suppress_root= */ false, &arg_image);
+                r = parse_image_path_argument(argv[optind], &arg_root, &arg_image);
                 if (r < 0)
                         return r;
 
@@ -597,7 +769,7 @@ static int parse_argv(int argc, char *argv[]) {
                         return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                                "Expected an image file path and an optional command line.");
 
-                r = parse_path_argument(argv[optind], /* suppress_root= */ false, &arg_image);
+                r = parse_image_path_argument(argv[optind], NULL, &arg_image);
                 if (r < 0)
                         return r;
 
@@ -620,7 +792,7 @@ static int parse_argv(int argc, char *argv[]) {
                         return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                                "Expected an image file path as only argument.");
 
-                r = parse_path_argument(argv[optind], /* suppress_root= */ false, &arg_image);
+                r = parse_image_path_argument(argv[optind], NULL, &arg_image);
                 if (r < 0)
                         return r;
 
@@ -628,9 +800,48 @@ static int parse_argv(int argc, char *argv[]) {
                 arg_flags &= ~(DISSECT_IMAGE_PIN_PARTITION_DEVICES|DISSECT_IMAGE_ADD_PARTITION_DEVICES);
                 break;
 
+        case ACTION_SHIFT:
+                if (optind + 2 != argc)
+                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                               "Expected an image path and a UID base as only argument.");
+
+                r = parse_image_path_argument(argv[optind], &arg_root, &arg_image);
+                if (r < 0)
+                        return r;
+
+                if (streq(argv[optind + 1], "foreign"))
+                        arg_uid_base = FOREIGN_UID_BASE;
+                else {
+                        r = parse_uid(argv[optind + 1], &arg_uid_base);
+                        if (r < 0)
+                                return log_error_errno(r, "Failed to parse UID base: %s", argv[optind + 1]);
+
+                        if ((arg_uid_base & 0xFFFF) != 0)
+                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Selected UID base not a multiple of 64K: " UID_FMT, arg_uid_base);
+                        if (arg_uid_base != 0 &&
+                            !uid_is_container(arg_uid_base) &&
+                            !uid_is_foreign(arg_uid_base))
+                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Selected UID range is not in the container range, nor the foreign one, refusing.");
+                }
+
+                arg_flags |= DISSECT_IMAGE_REQUIRE_ROOT;
+                break;
+
         default:
                 assert_not_reached();
         }
+
+        r = getenv_bool("SYSTEMD_USE_MOUNTFSD");
+        if (r < 0) {
+                if (r != -ENXIO)
+                        return log_error_errno(r, "Failed to parse $SYSTEMD_USE_MOUNTFSD: %m");
+        } else
+                arg_via_service = r;
+
+        if (!IN_SET(arg_action, ACTION_DISSECT, ACTION_LIST, ACTION_MTREE, ACTION_COPY_FROM, ACTION_COPY_TO, ACTION_DISCOVER, ACTION_VALIDATE) && geteuid() != 0)
+                return log_error_errno(SYNTHETIC_ERRNO(EPERM), "Need to be root.");
+
+        SET_FLAG(arg_flags, DISSECT_IMAGE_ALLOW_INTERACTIVE_AUTH, isatty_safe(STDIN_FILENO));
 
         return 1;
 }
@@ -643,7 +854,7 @@ static int parse_argv_as_mount_helper(int argc, char *argv[]) {
         /* Implements util-linux "external helper" command line interface, as per mount(8) man page. */
 
         while ((c = getopt(argc, argv, "sfnvN:o:t:")) >= 0) {
-                switch(c) {
+                switch (c) {
 
                 case 'f':
                         fake = true;
@@ -714,23 +925,6 @@ static int parse_argv_as_mount_helper(int argc, char *argv[]) {
         return 1;
 }
 
-static int strv_pair_to_json(char **l, JsonVariant **ret) {
-        _cleanup_strv_free_ char **jl = NULL;
-
-        STRV_FOREACH_PAIR(a, b, l) {
-                char *j;
-
-                j = strjoin(*a, "=", *b);
-                if (!j)
-                        return log_oom();
-
-                if (strv_consume(&jl, j) < 0)
-                        return log_oom();
-        }
-
-        return json_variant_new_array_strv(ret, jl);
-}
-
 static void strv_pair_print(char **l, const char *prefix) {
         assert(prefix);
 
@@ -741,22 +935,40 @@ static void strv_pair_print(char **l, const char *prefix) {
                         printf("%*s %s=%s\n", (int) strlen(prefix), "", *p, *q);
 }
 
-static int get_sysext_scopes(DissectedImage *m, char ***ret_scopes) {
+static int get_extension_scopes(DissectedImage *m, ImageClass class, char ***ret_scopes) {
         _cleanup_strv_free_ char **l = NULL;
-        const char *e;
+        const char *e, *field_name;
+        char **release_data;
 
         assert(m);
         assert(ret_scopes);
 
-        /* If there's no extension-release file its not a system extension. Otherwise the SYSEXT_SCOPE field
-         * indicates which scope it is for — and it defaults to "system" + "portable" if unset. */
+        switch (class) {
 
-        if (!m->extension_release) {
+        case IMAGE_SYSEXT:
+                release_data = m->sysext_release;
+                field_name = "SYSEXT_SCOPE";
+                break;
+
+        case IMAGE_CONFEXT:
+                release_data = m->confext_release;
+                field_name = "CONFEXT_SCOPE";
+                break;
+
+        default:
+                return -EINVAL;
+        }
+
+        /* If there's no extension-release file its not a system extension. Otherwise the SYSEXT_SCOPE
+         * field for sysext images and the CONFEXT_SCOPE field for confext images indicates which scope
+         * it is for — and it defaults to "system" + "portable" if unset. */
+
+        if (!release_data) {
                 *ret_scopes = NULL;
                 return 0;
         }
 
-        e = strv_env_pairs_get(m->extension_release, "SYSEXT_SCOPE");
+        e = strv_env_pairs_get(release_data, field_name);
         if (e)
                 l = strv_split(e, WHITESPACE);
         else
@@ -768,42 +980,51 @@ static int get_sysext_scopes(DissectedImage *m, char ***ret_scopes) {
         return 1;
 }
 
-static int action_dissect(DissectedImage *m, LoopDevice *d) {
-        _cleanup_(json_variant_unrefp) JsonVariant *v = NULL;
+static int action_dissect(
+                DissectedImage *m,
+                LoopDevice *d,
+                int userns_fd) {
+
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *v = NULL;
         _cleanup_(table_unrefp) Table *t = NULL;
         _cleanup_free_ char *bn = NULL;
         uint64_t size = UINT64_MAX;
         int r;
 
         assert(m);
-        assert(d);
 
         r = path_extract_filename(arg_image, &bn);
         if (r < 0)
                 return log_error_errno(r, "Failed to extract file name from image path '%s': %m", arg_image);
 
-        if (arg_json_format_flags & (JSON_FORMAT_OFF|JSON_FORMAT_PRETTY|JSON_FORMAT_PRETTY_AUTO))
+        if (arg_json_format_flags & (SD_JSON_FORMAT_OFF|SD_JSON_FORMAT_PRETTY|SD_JSON_FORMAT_PRETTY_AUTO))
                 pager_open(arg_pager_flags);
 
-        if (arg_json_format_flags & JSON_FORMAT_OFF)
-                printf("      Name: %s%s%s\n", ansi_highlight(), bn, ansi_normal());
+        if (!sd_json_format_enabled(arg_json_format_flags)) {
+                printf(" File Name: %s%s%s\n",
+                       ansi_highlight(), bn, ansi_normal());
 
-        if (ioctl(d->fd, BLKGETSIZE64, &size) < 0)
-                log_debug_errno(errno, "Failed to query size of loopback device: %m");
-        else if (arg_json_format_flags & JSON_FORMAT_OFF)
-                printf("      Size: %s\n", FORMAT_BYTES(size));
+                printf("      Size: %s\n",
+                       FORMAT_BYTES(m->image_size));
 
-        printf(" Sec. Size: %" PRIu32 "\n", m->sector_size);
+                printf(" Sec. Size: %" PRIu32 "\n",
+                       m->sector_size);
 
-        printf("     Arch.: %s\n",
-               strna(architecture_to_string(dissected_image_architecture(m))));
+                printf("     Arch.: %s\n",
+                       strna(architecture_to_string(dissected_image_architecture(m))));
 
-        if (arg_json_format_flags & JSON_FORMAT_OFF)
+                if (!sd_id128_is_null(m->image_uuid))
+                        printf("Image UUID: %s\n",
+                               SD_ID128_TO_UUID_STRING(m->image_uuid));
+
+                if (m->image_name && !streq(m->image_name, bn))
+                        printf("Image Name: %s\n", m->image_name);
+
                 putc('\n', stdout);
+                fflush(stdout);
+        }
 
-        fflush(stdout);
-
-        r = dissected_image_acquire_metadata(m, 0);
+        r = dissected_image_acquire_metadata(m, userns_fd, /* extra_flags= */ 0);
         if (r == -ENXIO)
                 return log_error_errno(r, "No root partition discovered.");
         if (r == -EUCLEAN)
@@ -816,11 +1037,7 @@ static int action_dissect(DissectedImage *m, LoopDevice *d) {
                 log_warning_errno(r, "OS image is currently in use, proceeding without showing OS image metadata.");
         else if (r < 0)
                 return log_error_errno(r, "Failed to acquire image metadata: %m");
-        else if (arg_json_format_flags & JSON_FORMAT_OFF) {
-                _cleanup_strv_free_ char **sysext_scopes = NULL;
-
-                if (!sd_id128_is_null(m->image_uuid))
-                        printf("Image UUID: %s\n", SD_ID128_TO_UUID_STRING(m->image_uuid));
+        else if (!sd_json_format_enabled(arg_json_format_flags)) {
 
                 if (m->hostname)
                         printf("  Hostname: %s\n", m->hostname);
@@ -834,89 +1051,83 @@ static int action_dissect(DissectedImage *m, LoopDevice *d) {
                                "OS Release:");
                 strv_pair_print(m->initrd_release,
                                 "initrd R.:");
-                strv_pair_print(m->extension_release,
-                               " Ext. Rel.:");
+                strv_pair_print(m->sysext_release,
+                               " sysext R.:");
+                strv_pair_print(m->confext_release,
+                               "confext R.:");
 
                 if (m->hostname ||
                     !sd_id128_is_null(m->machine_id) ||
                     !strv_isempty(m->machine_info) ||
                     !strv_isempty(m->os_release) ||
                     !strv_isempty(m->initrd_release) ||
-                    !strv_isempty(m->extension_release))
+                    !strv_isempty(m->sysext_release) ||
+                    !strv_isempty(m->confext_release))
                         putc('\n', stdout);
 
-                printf("    Use As: %s bootable system for UEFI\n", COLOR_MARK_BOOL(m->partitions[PARTITION_ESP].found));
-
-                if (m->has_init_system >= 0)
-                        printf("            %s bootable system for container\n", COLOR_MARK_BOOL(m->has_init_system));
-
+                printf("    Use As: %s bootable system for UEFI\n",
+                       COLOR_MARK_BOOL(dissected_image_is_bootable_uefi(m)));
+                printf("            %s bootable system for container\n",
+                       COLOR_MARK_BOOL(dissected_image_is_bootable_os(m)));
                 printf("            %s portable service\n",
-                       COLOR_MARK_BOOL(strv_env_pairs_get(m->os_release, "PORTABLE_PREFIXES")));
+                       COLOR_MARK_BOOL(dissected_image_is_portable(m)));
                 printf("            %s initrd\n",
-                       COLOR_MARK_BOOL(!strv_isempty(m->initrd_release)));
+                       COLOR_MARK_BOOL(dissected_image_is_initrd(m)));
 
-                r = get_sysext_scopes(m, &sysext_scopes);
-                if (r < 0)
-                        return log_error_errno(r, "Failed to parse SYSEXT_SCOPE: %m");
+                for (ImageClass c = _IMAGE_CLASS_EXTENSION_FIRST; c <= _IMAGE_CLASS_EXTENSION_LAST; c++) {
+                        const char *string_class = image_class_to_string(c);
+                        _cleanup_strv_free_ char **extension_scopes = NULL;
 
-                printf("            %s extension for system\n",
-                       COLOR_MARK_BOOL(strv_contains(sysext_scopes, "system")));
-                printf("            %s extension for initrd\n",
-                       COLOR_MARK_BOOL(strv_contains(sysext_scopes, "initrd")));
-                printf("            %s extension for portable service\n",
-                       COLOR_MARK_BOOL(strv_contains(sysext_scopes, "portable")));
+                        r = get_extension_scopes(m, c, &extension_scopes);
+                        if (r < 0)
+                                return log_error_errno(r, "Failed to parse scopes: %m");
+
+                        printf("            %s %s for system\n",
+                               COLOR_MARK_BOOL(strv_contains(extension_scopes, "system")), string_class);
+                        printf("            %s %s for portable service\n",
+                               COLOR_MARK_BOOL(strv_contains(extension_scopes, "portable")), string_class);
+                        printf("            %s %s for initrd\n",
+                               COLOR_MARK_BOOL(strv_contains(extension_scopes, "initrd")), string_class);
+                }
 
                 putc('\n', stdout);
         } else {
-                _cleanup_(json_variant_unrefp) JsonVariant *mi = NULL, *osr = NULL, *irdr = NULL, *exr = NULL;
-                _cleanup_strv_free_ char **sysext_scopes = NULL;
+                _cleanup_strv_free_ char **sysext_scopes = NULL, **confext_scopes = NULL;
 
-                if (!strv_isempty(m->machine_info)) {
-                        r = strv_pair_to_json(m->machine_info, &mi);
-                        if (r < 0)
-                                return log_oom();
-                }
-
-                if (!strv_isempty(m->os_release)) {
-                        r = strv_pair_to_json(m->os_release, &osr);
-                        if (r < 0)
-                                return log_oom();
-                }
-
-                if (!strv_isempty(m->initrd_release)) {
-                        r = strv_pair_to_json(m->initrd_release, &irdr);
-                        if (r < 0)
-                                return log_oom();
-                }
-
-                if (!strv_isempty(m->extension_release)) {
-                        r = strv_pair_to_json(m->extension_release, &exr);
-                        if (r < 0)
-                                return log_oom();
-                }
-
-                r = get_sysext_scopes(m, &sysext_scopes);
+                r = get_extension_scopes(m, IMAGE_SYSEXT, &sysext_scopes);
                 if (r < 0)
-                        return log_error_errno(r, "Failed to parse SYSEXT_SCOPE: %m");
+                        return log_error_errno(r, "Failed to parse sysext scopes: %m");
 
-                r = json_build(&v, JSON_BUILD_OBJECT(
-                                               JSON_BUILD_PAIR("name", JSON_BUILD_STRING(bn)),
-                                               JSON_BUILD_PAIR_CONDITION(!sd_id128_is_null(m->image_uuid), "imageUuid", JSON_BUILD_UUID(m->image_uuid)),
-                                               JSON_BUILD_PAIR("size", JSON_BUILD_INTEGER(size)),
-                                               JSON_BUILD_PAIR("sectorSize", JSON_BUILD_INTEGER(m->sector_size)),
-                                               JSON_BUILD_PAIR_CONDITION(m->hostname, "hostname", JSON_BUILD_STRING(m->hostname)),
-                                               JSON_BUILD_PAIR_CONDITION(!sd_id128_is_null(m->machine_id), "machineId", JSON_BUILD_ID128(m->machine_id)),
-                                               JSON_BUILD_PAIR_CONDITION(mi, "machineInfo", JSON_BUILD_VARIANT(mi)),
-                                               JSON_BUILD_PAIR_CONDITION(osr, "osRelease", JSON_BUILD_VARIANT(osr)),
-                                               JSON_BUILD_PAIR_CONDITION(osr, "initrdRelease", JSON_BUILD_VARIANT(irdr)),
-                                               JSON_BUILD_PAIR_CONDITION(exr, "extensionRelease", JSON_BUILD_VARIANT(exr)),
-                                               JSON_BUILD_PAIR("useBootableUefi", JSON_BUILD_BOOLEAN(m->partitions[PARTITION_ESP].found)),
-                                               JSON_BUILD_PAIR_CONDITION(m->has_init_system >= 0, "useBootableContainer", JSON_BUILD_BOOLEAN(m->has_init_system)),
-                                               JSON_BUILD_PAIR("useInitrd", JSON_BUILD_BOOLEAN(!strv_isempty(m->initrd_release))),
-                                               JSON_BUILD_PAIR("usePortableService", JSON_BUILD_BOOLEAN(strv_env_pairs_get(m->os_release, "PORTABLE_MATCHES"))),
-                                               JSON_BUILD_PAIR("useSystemExtension", JSON_BUILD_BOOLEAN(strv_contains(sysext_scopes, "system"))),
-                                               JSON_BUILD_PAIR("useInitRDExtension", JSON_BUILD_BOOLEAN(strv_contains(sysext_scopes, "initrd"))),
-                                               JSON_BUILD_PAIR("usePortableExtension", JSON_BUILD_BOOLEAN(strv_contains(sysext_scopes, "portable")))));
+                r = get_extension_scopes(m, IMAGE_CONFEXT, &confext_scopes);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to parse confext scopes: %m");
+
+                Architecture a = dissected_image_architecture(m);
+
+                r = sd_json_buildo(
+                                &v,
+                                SD_JSON_BUILD_PAIR("name", SD_JSON_BUILD_STRING(bn)),
+                                SD_JSON_BUILD_PAIR_CONDITION(size != UINT64_MAX, "size", SD_JSON_BUILD_INTEGER(size)),
+                                SD_JSON_BUILD_PAIR("sectorSize", SD_JSON_BUILD_INTEGER(m->sector_size)),
+                                SD_JSON_BUILD_PAIR_CONDITION(a >= 0, "architecture", SD_JSON_BUILD_STRING(architecture_to_string(a))),
+                                SD_JSON_BUILD_PAIR_CONDITION(!sd_id128_is_null(m->image_uuid), "imageUuid", SD_JSON_BUILD_UUID(m->image_uuid)),
+                                SD_JSON_BUILD_PAIR_CONDITION(!!m->hostname, "hostname", SD_JSON_BUILD_STRING(m->hostname)),
+                                SD_JSON_BUILD_PAIR_CONDITION(!sd_id128_is_null(m->machine_id), "machineId", SD_JSON_BUILD_ID128(m->machine_id)),
+                                SD_JSON_BUILD_PAIR_CONDITION(!strv_isempty(m->machine_info), "machineInfo", JSON_BUILD_STRV_ENV_PAIR(m->machine_info)),
+                                SD_JSON_BUILD_PAIR_CONDITION(!strv_isempty(m->os_release), "osRelease", JSON_BUILD_STRV_ENV_PAIR(m->os_release)),
+                                SD_JSON_BUILD_PAIR_CONDITION(!strv_isempty(m->initrd_release), "initrdRelease", JSON_BUILD_STRV_ENV_PAIR(m->initrd_release)),
+                                SD_JSON_BUILD_PAIR_CONDITION(!strv_isempty(m->sysext_release), "sysextRelease", JSON_BUILD_STRV_ENV_PAIR(m->sysext_release)),
+                                SD_JSON_BUILD_PAIR_CONDITION(!strv_isempty(m->confext_release), "confextRelease", JSON_BUILD_STRV_ENV_PAIR(m->confext_release)),
+                                SD_JSON_BUILD_PAIR("useBootableUefi", SD_JSON_BUILD_BOOLEAN(dissected_image_is_bootable_uefi(m))),
+                                SD_JSON_BUILD_PAIR("useBootableContainer", SD_JSON_BUILD_BOOLEAN(dissected_image_is_bootable_os(m))),
+                                SD_JSON_BUILD_PAIR("useInitrd", SD_JSON_BUILD_BOOLEAN(dissected_image_is_initrd(m))),
+                                SD_JSON_BUILD_PAIR("usePortableService", SD_JSON_BUILD_BOOLEAN(dissected_image_is_portable(m))),
+                                SD_JSON_BUILD_PAIR("useSystemExtension", SD_JSON_BUILD_BOOLEAN(strv_contains(sysext_scopes, "system"))),
+                                SD_JSON_BUILD_PAIR("useInitRDSystemExtension", SD_JSON_BUILD_BOOLEAN(strv_contains(sysext_scopes, "initrd"))),
+                                SD_JSON_BUILD_PAIR("usePortableSystemExtension", SD_JSON_BUILD_BOOLEAN(strv_contains(sysext_scopes, "portable"))),
+                                SD_JSON_BUILD_PAIR("useConfigurationExtension", SD_JSON_BUILD_BOOLEAN(strv_contains(confext_scopes, "system"))),
+                                SD_JSON_BUILD_PAIR("useInitRDConfigurationExtension", SD_JSON_BUILD_BOOLEAN(strv_contains(confext_scopes, "initrd"))),
+                                SD_JSON_BUILD_PAIR("usePortableConfigurationExtension", SD_JSON_BUILD_BOOLEAN(strv_contains(confext_scopes, "portable"))));
                 if (r < 0)
                         return log_oom();
         }
@@ -926,7 +1137,12 @@ static int action_dissect(DissectedImage *m, LoopDevice *d) {
                 return log_oom();
 
         table_set_ersatz_string(t, TABLE_ERSATZ_DASH);
-        (void) table_set_align_percent(t, table_get_cell(t, 0, 7), 100);
+        (void) table_set_align_percent(t, table_get_cell(t, 0, 9), 100);
+
+        /* Hide the device path if this is a loopback device that is not relinquished, since that means the
+         * device node is not going to be useful the instant our command exits */
+        if ((!d || d->created) && !sd_json_format_enabled(arg_json_format_flags))
+                table_hide_column_from_display(t, 8);
 
         for (PartitionDesignator i = 0; i < _PARTITION_DESIGNATOR_MAX; i++) {
                 DissectedPartition *p = m->partitions + i;
@@ -988,24 +1204,24 @@ static int action_dissect(DissectedImage *m, LoopDevice *d) {
                         return table_log_add_error(r);
         }
 
-        if (arg_json_format_flags & JSON_FORMAT_OFF) {
+        if (!sd_json_format_enabled(arg_json_format_flags)) {
                 (void) table_set_header(t, arg_legend);
 
                 r = table_print(t, NULL);
                 if (r < 0)
                         return table_log_print_error(r);
         } else {
-                _cleanup_(json_variant_unrefp) JsonVariant *jt = NULL;
+                _cleanup_(sd_json_variant_unrefp) sd_json_variant *jt = NULL;
 
                 r = table_to_json(t, &jt);
                 if (r < 0)
                         return log_error_errno(r, "Failed to convert table to JSON: %m");
 
-                r = json_variant_set_field(&v, "mounts", jt);
+                r = sd_json_variant_set_field(&v, "mounts", jt);
                 if (r < 0)
                         return log_oom();
 
-                json_variant_dump(v, arg_json_format_flags, stdout, NULL);
+                sd_json_variant_dump(v, arg_json_format_flags, stdout, NULL);
         }
 
         return 0;
@@ -1015,16 +1231,23 @@ static int action_mount(DissectedImage *m, LoopDevice *d) {
         int r;
 
         assert(m);
-        assert(d);
         assert(arg_action == ACTION_MOUNT);
 
-        r = dissected_image_mount_and_warn(m, arg_path, UID_INVALID, UID_INVALID, arg_flags);
+        r = dissected_image_mount_and_warn(
+                        m,
+                        arg_path,
+                        /* uid_shift= */ UID_INVALID,
+                        /* uid_range= */ UID_INVALID,
+                        /* userns_fd= */ -EBADF,
+                        arg_flags);
         if (r < 0)
                 return r;
 
-        r = loop_device_flock(d, LOCK_UN);
-        if (r < 0)
-                return log_error_errno(r, "Failed to unlock loopback block device: %m");
+        if (d) {
+                r = loop_device_flock(d, LOCK_UN);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to unlock loopback block device: %m");
+        }
 
         r = dissected_image_relinquish(m);
         if (r < 0)
@@ -1054,7 +1277,6 @@ static int list_print_item(
 
 static int get_file_sha256(int inode_fd, uint8_t ret[static SHA256_DIGEST_SIZE]) {
         _cleanup_close_ int fd = -EBADF;
-        struct sha256_ctx ctx;
 
         /* convert O_PATH fd into a regular one */
         fd = fd_reopen(inode_fd, O_RDONLY|O_CLOEXEC);
@@ -1064,23 +1286,7 @@ static int get_file_sha256(int inode_fd, uint8_t ret[static SHA256_DIGEST_SIZE])
         /* Calculating the SHA sum might be slow, hence let's flush STDOUT first, to give user an idea where we are slow. */
         fflush(stdout);
 
-        sha256_init_ctx(&ctx);
-
-        for (;;) {
-                uint8_t buffer[64 * 1024];
-                ssize_t n;
-
-                n = read(fd, buffer, sizeof(buffer));
-                if (n < 0)
-                        return -errno;
-                if (n == 0)
-                        break;
-
-                sha256_process_bytes(buffer, n, &ctx);
-        }
-
-        sha256_finish_ctx(&ctx, ret);
-        return 0;
+        return sha256_fd(fd, UINT64_MAX, ret);
 }
 
 static const char *pick_color_for_uid_gid(uid_t uid) {
@@ -1088,9 +1294,9 @@ static const char *pick_color_for_uid_gid(uid_t uid) {
                 return ansi_highlight_yellow4(); /* files should never be owned by 'nobody' (but might happen due to userns mapping) */
         if (uid_is_system(uid))
                 return ansi_normal();            /* files in disk images are typically owned by root and other system users, no issue there */
-        if (uid_is_dynamic(uid))
+        if (uid_is_dynamic(uid) || uid_is_greeter(uid))
                 return ansi_highlight_red();     /* files should never be owned persistently by dynamic users, and there are just no excuses */
-        if (uid_is_container(uid))
+        if (uid_is_container(uid) || uid_is_foreign(uid))
                 return ansi_highlight_cyan();
 
         return ansi_highlight();
@@ -1173,7 +1379,7 @@ static int mtree_print_item(
                        ansi_normal(),
                        (uint64_t) sx->stx_size);
 
-                if (inode_fd >= 0 && sx->stx_size > 0) {
+                if (arg_mtree_hash && inode_fd >= 0 && sx->stx_size > 0) {
                         uint8_t hash[SHA256_DIGEST_SIZE];
 
                         r = get_file_sha256(inode_fd, hash);
@@ -1226,50 +1432,165 @@ static int mtree_print_item(
         return RECURSE_DIR_CONTINUE;
 }
 
-static int action_list_or_mtree_or_copy(DissectedImage *m, LoopDevice *d) {
-        _cleanup_(umount_and_rmdir_and_freep) char *mounted_dir = NULL;
-        _cleanup_(rmdir_and_freep) char *created_dir = NULL;
-        _cleanup_free_ char *temp = NULL;
+#if HAVE_LIBARCHIVE
+static int archive_item(
+                RecurseDirEvent event,
+                const char *path,
+                int dir_fd,
+                int inode_fd,
+                const struct dirent *de,
+                const struct statx *sx,
+                void *userdata) {
+
+        struct archive *a = ASSERT_PTR(userdata);
         int r;
 
-        assert(m);
-        assert(d);
-        assert(IN_SET(arg_action, ACTION_LIST, ACTION_MTREE, ACTION_COPY_FROM, ACTION_COPY_TO));
+        assert(path);
 
-        r = detach_mount_namespace();
-        if (r < 0)
-                return log_error_errno(r, "Failed to detach mount namespace: %m");
+        if (!IN_SET(event, RECURSE_DIR_ENTER, RECURSE_DIR_ENTRY))
+                return RECURSE_DIR_CONTINUE;
 
-        r = tempfn_random_child(NULL, program_invocation_short_name, &temp);
-        if (r < 0)
-                return log_error_errno(r, "Failed to generate temporary mount directory: %m");
+        assert(inode_fd >= 0);
+        assert(sx);
 
-        r = mkdir_p(temp, 0700);
-        if (r < 0)
-                return log_error_errno(r, "Failed to create mount point: %m");
+        log_debug("Archiving %s\n", path);
 
-        created_dir = TAKE_PTR(temp);
+        _cleanup_(sym_archive_entry_freep) struct archive_entry *entry = NULL;
+        entry = sym_archive_entry_new();
+        if (!entry)
+                return log_oom();
 
-        r = dissected_image_mount_and_warn(m, created_dir, UID_INVALID, UID_INVALID, arg_flags);
-        if (r < 0)
-                return r;
+        assert(FLAGS_SET(sx->stx_mask, STATX_TYPE|STATX_MODE));
+        sym_archive_entry_set_pathname(entry, path);
+        sym_archive_entry_set_filetype(entry, sx->stx_mode);
 
-        mounted_dir = TAKE_PTR(created_dir);
+        if (!S_ISLNK(sx->stx_mode))
+                sym_archive_entry_set_perm(entry, sx->stx_mode);
 
-        r = loop_device_flock(d, LOCK_UN);
-        if (r < 0)
-                return log_error_errno(r, "Failed to unlock loopback block device: %m");
+        if (FLAGS_SET(sx->stx_mask, STATX_UID))
+                sym_archive_entry_set_uid(entry, sx->stx_uid);
+        if (FLAGS_SET(sx->stx_mask, STATX_GID))
+                sym_archive_entry_set_gid(entry, sx->stx_gid);
 
-        r = dissected_image_relinquish(m);
-        if (r < 0)
-                return log_error_errno(r, "Failed to relinquish DM and loopback block devices: %m");
+        if (S_ISREG(sx->stx_mode)) {
+                if (!FLAGS_SET(sx->stx_mask, STATX_SIZE))
+                        return log_error_errno(SYNTHETIC_ERRNO(EIO), "Unable to determine file size of '%s'.", path);
+
+                sym_archive_entry_set_size(entry, sx->stx_size);
+        }
+
+        if (S_ISCHR(sx->stx_mode) || S_ISBLK(sx->stx_mode)) {
+                sym_archive_entry_set_rdevmajor(entry, sx->stx_rdev_major);
+                sym_archive_entry_set_rdevminor(entry, sx->stx_rdev_minor);
+        }
+
+        /* We care about a modicum of reproducibility here, hence we don't save atime/btime here */
+        if (FLAGS_SET(sx->stx_mask, STATX_MTIME))
+                sym_archive_entry_set_mtime(entry, sx->stx_mtime.tv_sec, sx->stx_mtime.tv_nsec);
+        if (FLAGS_SET(sx->stx_mask, STATX_CTIME))
+                sym_archive_entry_set_ctime(entry, sx->stx_ctime.tv_sec, sx->stx_ctime.tv_nsec);
+
+        if (S_ISLNK(sx->stx_mode)) {
+                _cleanup_free_ char *s = NULL;
+
+                assert(dir_fd >= 0);
+                assert(de);
+
+                r = readlinkat_malloc(dir_fd, de->d_name, &s);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to read symlink target of '%s': %m", path);
+
+                sym_archive_entry_set_symlink(entry, s);
+        }
+
+        if (sym_archive_write_header(a, entry) != ARCHIVE_OK)
+                return log_error_errno(SYNTHETIC_ERRNO(ENOTRECOVERABLE), "Failed to write archive entry header: %s", sym_archive_error_string(a));
+
+        if (S_ISREG(sx->stx_mode)) {
+                _cleanup_close_ int data_fd = -EBADF;
+
+                /* Convert the O_PATH fd in a proper fd */
+                data_fd = fd_reopen(inode_fd, O_RDONLY|O_CLOEXEC);
+                if (data_fd < 0)
+                        return log_error_errno(data_fd, "Failed to open '%s': %m", path);
+
+                for (;;) {
+                        char buffer[64*1024];
+                        ssize_t l;
+
+                        l = read(data_fd, buffer, sizeof(buffer));
+                        if (l < 0)
+                                return log_error_errno(errno, "Failed to read '%s': %m",  path);
+                        if (l == 0)
+                                break;
+
+                        la_ssize_t k;
+                        k = sym_archive_write_data(a, buffer, l);
+                        if (k < 0)
+                                return log_error_errno(SYNTHETIC_ERRNO(ENOTRECOVERABLE), "Failed to write archive data: %s", sym_archive_error_string(a));
+                }
+        }
+
+        return RECURSE_DIR_CONTINUE;
+}
+#endif
+
+static int action_list_or_mtree_or_copy_or_make_archive(DissectedImage *m, LoopDevice *d, int userns_fd) {
+        _cleanup_(umount_and_freep) char *mounted_dir = NULL;
+        _cleanup_free_ char *t = NULL;
+        const char *root;
+        int r;
+
+        assert(IN_SET(arg_action, ACTION_LIST, ACTION_MTREE, ACTION_COPY_FROM, ACTION_COPY_TO, ACTION_MAKE_ARCHIVE, ACTION_SHIFT));
+
+        if (arg_image) {
+                assert(m);
+
+                if (userns_fd < 0)
+                        r = detach_mount_namespace_harder(0, 0);
+                else
+                        r = detach_mount_namespace_userns(userns_fd);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to detach mount namespace: %m");
+
+                /* Create a place we can mount things onto soon. We use a fixed path shared by all invocations. Given
+                 * the mounts are done in a mount namespace there's not going to be a collision here */
+                r = get_common_dissect_directory(&t);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to generate private mount directory: %m");
+
+                r = dissected_image_mount_and_warn(
+                                m,
+                                t,
+                                /* uid_shift= */ UID_INVALID,
+                                /* uid_range= */ UID_INVALID,
+                                /* userns_fd= */ -EBADF,
+                                arg_flags);
+                if (r < 0)
+                        return r;
+
+                root = mounted_dir = TAKE_PTR(t);
+
+                if (d) {
+                        r = loop_device_flock(d, LOCK_UN);
+                        if (r < 0)
+                                return log_error_errno(r, "Failed to unlock loopback block device: %m");
+                }
+
+                r = dissected_image_relinquish(m);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to relinquish DM and loopback block devices: %m");
+
+                dissected_image_close(m);
+        } else
+                root = arg_root;
 
         switch (arg_action) {
 
         case ACTION_COPY_FROM: {
                 _cleanup_close_ int source_fd = -EBADF, target_fd = -EBADF;
 
-                source_fd = chase_and_open(arg_source, mounted_dir, CHASE_PREFIX_ROOT|CHASE_WARN, O_RDONLY|O_CLOEXEC|O_NOCTTY, NULL);
+                source_fd = chase_and_open(arg_source, root, CHASE_PREFIX_ROOT|CHASE_WARN, O_RDONLY|O_CLOEXEC|O_NOCTTY, NULL);
                 if (source_fd < 0)
                         return log_error_errno(source_fd, "Failed to open source path '%s' in image '%s': %m", arg_source, arg_image);
 
@@ -1284,7 +1605,7 @@ static int action_list_or_mtree_or_copy(DissectedImage *m, LoopDevice *d) {
                 }
 
                 /* Try to copy as directory? */
-                r = copy_directory_fd(source_fd, arg_target, COPY_REFLINK|COPY_MERGE_EMPTY|COPY_SIGINT|COPY_HARDLINKS);
+                r = copy_directory_at(source_fd, NULL, AT_FDCWD, arg_target, COPY_REFLINK|COPY_MERGE|COPY_REPLACE|COPY_SIGINT|COPY_HARDLINKS);
                 if (r >= 0)
                         return 0;
                 if (r != -ENOTDIR)
@@ -1326,7 +1647,7 @@ static int action_list_or_mtree_or_copy(DissectedImage *m, LoopDevice *d) {
                         return log_error_errno(r, "Failed to extract filename from target path '%s': %m", arg_target);
                 is_dir = r == O_DIRECTORY;
 
-                r = chase(dn, mounted_dir, CHASE_PREFIX_ROOT|CHASE_WARN, NULL, &dfd);
+                r = chase(dn, root, CHASE_PREFIX_ROOT|CHASE_WARN, NULL, &dfd);
                 if (r < 0)
                         return log_error_errno(r, "Failed to open '%s': %m", dn);
 
@@ -1363,9 +1684,9 @@ static int action_list_or_mtree_or_copy(DissectedImage *m, LoopDevice *d) {
                                 if (errno != ENOENT)
                                         return log_error_errno(errno, "Failed to open destination '%s': %m", arg_target);
 
-                                r = copy_tree_at(source_fd, ".", dfd, bn, UID_INVALID, GID_INVALID, COPY_REFLINK|COPY_REPLACE|COPY_SIGINT|COPY_HARDLINKS, NULL);
+                                r = copy_tree_at(source_fd, ".", dfd, bn, UID_INVALID, GID_INVALID, COPY_REFLINK|COPY_MERGE|COPY_REPLACE|COPY_SIGINT|COPY_HARDLINKS, NULL, NULL);
                         } else
-                                r = copy_tree_at(source_fd, ".", target_fd, ".", UID_INVALID, GID_INVALID, COPY_REFLINK|COPY_REPLACE|COPY_SIGINT|COPY_HARDLINKS, NULL);
+                                r = copy_tree_at(source_fd, ".", target_fd, ".", UID_INVALID, GID_INVALID, COPY_REFLINK|COPY_MERGE|COPY_REPLACE|COPY_SIGINT|COPY_HARDLINKS, NULL, NULL);
                         if (r < 0)
                                 return log_error_errno(r, "Failed to copy '%s' to '%s' in image '%s': %m", arg_source, arg_target, arg_image);
 
@@ -1396,7 +1717,7 @@ static int action_list_or_mtree_or_copy(DissectedImage *m, LoopDevice *d) {
         case ACTION_MTREE: {
                 _cleanup_close_ int dfd = -EBADF;
 
-                dfd = open(mounted_dir, O_DIRECTORY|O_CLOEXEC|O_RDONLY);
+                dfd = open(root, O_DIRECTORY|O_CLOEXEC|O_RDONLY);
                 if (dfd < 0)
                         return log_error_errno(errno, "Failed to open mount directory: %m");
 
@@ -1412,6 +1733,77 @@ static int action_list_or_mtree_or_copy(DissectedImage *m, LoopDevice *d) {
                         return log_error_errno(r, "Failed to list image: %m");
                 return 0;
         }
+
+        case ACTION_MAKE_ARCHIVE: {
+#if HAVE_LIBARCHIVE
+                _cleanup_(unlink_and_freep) char *tar = NULL;
+                _cleanup_close_ int dfd = -EBADF;
+                _cleanup_fclose_ FILE *f = NULL;
+
+                dfd = open(root, O_DIRECTORY|O_CLOEXEC|O_RDONLY);
+                if (dfd < 0)
+                        return log_error_errno(errno, "Failed to open mount directory: %m");
+
+                _cleanup_(sym_archive_write_freep) struct archive *a = sym_archive_write_new();
+                if (!a)
+                        return log_oom();
+
+                if (arg_target)
+                        r = sym_archive_write_set_format_filter_by_ext(a, arg_target);
+                else
+                        r = sym_archive_write_set_format_gnutar(a);
+                if (r != ARCHIVE_OK)
+                        return log_error_errno(SYNTHETIC_ERRNO(ENOTRECOVERABLE), "Failed to set libarchive output format: %s", sym_archive_error_string(a));
+
+                if (arg_target) {
+                        r = fopen_tmpfile_linkable(arg_target, O_WRONLY|O_CLOEXEC, &tar, &f);
+                        if (r < 0)
+                                return log_error_errno(r, "Failed to create target file '%s': %m", arg_target);
+
+                        r = sym_archive_write_open_FILE(a, f);
+                } else {
+                        if (isatty_safe(STDOUT_FILENO))
+                                return log_error_errno(SYNTHETIC_ERRNO(EBADF), "Refusing to write archive to TTY.");
+
+                        r = sym_archive_write_open_fd(a, STDOUT_FILENO);
+                }
+                if (r != ARCHIVE_OK)
+                        return log_error_errno(SYNTHETIC_ERRNO(ENOTRECOVERABLE), "Failed to set libarchive output file: %s", sym_archive_error_string(a));
+
+                r = recurse_dir(dfd,
+                                ".",
+                                STATX_TYPE|STATX_MODE|STATX_UID|STATX_GID|STATX_SIZE|STATX_ATIME|STATX_CTIME,
+                                UINT_MAX,
+                                RECURSE_DIR_SORT|RECURSE_DIR_INODE_FD|RECURSE_DIR_TOPLEVEL,
+                                archive_item,
+                                a);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to make archive: %m");
+
+                r = sym_archive_write_close(a);
+                if (r != ARCHIVE_OK)
+                        return log_error_errno(SYNTHETIC_ERRNO(ENOTRECOVERABLE), "Unable to finish writing archive: %s", sym_archive_error_string(a));
+
+                if (arg_target) {
+                        r = flink_tmpfile(f, tar, arg_target, LINK_TMPFILE_REPLACE);
+                        if (r < 0)
+                                return log_error_errno(r, "Failed to move archive file into place: %m");
+
+                        tar = mfree(tar);
+                }
+
+                return 0;
+#else
+                assert_not_reached();
+#endif
+        }
+
+        case ACTION_SHIFT:
+                r = path_patch_uid(root, arg_uid_base, 0x10000);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to shift UID base: %m");
+
+                return 0;
 
         default:
                 assert_not_reached();
@@ -1431,7 +1823,7 @@ static int action_umount(const char *path) {
         if (fd < 0)
                 return log_error_errno(fd, "Failed to resolve path '%s': %m", path);
 
-        r = fd_is_mount_point(fd, NULL, 0);
+        r = is_mount_point_at(fd, NULL, 0);
         if (r == 0)
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "'%s' is not a mount point", canonical);
         if (r < 0)
@@ -1485,7 +1877,6 @@ static int action_with(DissectedImage *m, LoopDevice *d) {
         int r, rcode;
 
         assert(m);
-        assert(d);
         assert(arg_action == ACTION_WITH);
 
         r = tempfn_random_child(NULL, program_invocation_short_name, &temp);
@@ -1498,7 +1889,13 @@ static int action_with(DissectedImage *m, LoopDevice *d) {
 
         created_dir = TAKE_PTR(temp);
 
-        r = dissected_image_mount_and_warn(m, created_dir, UID_INVALID, UID_INVALID, arg_flags);
+        r = dissected_image_mount_and_warn(
+                        m,
+                        created_dir,
+                        /* uid_shift= */ UID_INVALID,
+                        /* uid_range= */ UID_INVALID,
+                        /* userns_fd= */ -EBADF,
+                        arg_flags);
         if (r < 0)
                 return r;
 
@@ -1508,9 +1905,11 @@ static int action_with(DissectedImage *m, LoopDevice *d) {
         if (r < 0)
                 return log_error_errno(r, "Failed to relinquish DM and loopback block devices: %m");
 
-        r = loop_device_flock(d, LOCK_UN);
-        if (r < 0)
-                return log_error_errno(r, "Failed to unlock loopback block device: %m");
+        if (d) {
+                r = loop_device_flock(d, LOCK_UN);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to unlock loopback block device: %m");
+        }
 
         rcode = safe_fork("(with)", FORK_CLOSE_ALL_FDS|FORK_LOG|FORK_WAIT, NULL);
         if (rcode == 0) {
@@ -1523,6 +1922,11 @@ static int action_with(DissectedImage *m, LoopDevice *d) {
 
                 if (setenv("SYSTEMD_DISSECT_ROOT", mounted_dir, /* overwrite= */ true) < 0) {
                         log_error_errno(errno, "Failed to set $SYSTEMD_DISSECT_ROOT: %m");
+                        _exit(EXIT_FAILURE);
+                }
+
+                if (setenv("SYSTEMD_DISSECT_DEVICE", d->node, /* overwrite= */ true) < 0) {
+                        log_error_errno(errno, "Failed to set $SYSTEMD_DISSECT_DEVICE: %m");
                         _exit(EXIT_FAILURE);
                 }
 
@@ -1546,14 +1950,16 @@ static int action_with(DissectedImage *m, LoopDevice *d) {
         }
 
         /* Let's manually detach everything, to make things synchronous */
-        r = loop_device_flock(d, LOCK_SH);
-        if (r < 0)
-                log_warning_errno(r, "Failed to lock loopback block device, ignoring: %m");
+        if (d) {
+                r = loop_device_flock(d, LOCK_SH);
+                if (r < 0)
+                        log_warning_errno(r, "Failed to lock loopback block device, ignoring: %m");
+        }
 
         r = umount_recursive(mounted_dir, 0);
         if (r < 0)
                 log_warning_errno(r, "Failed to unmount '%s', ignoring: %m", mounted_dir);
-        else
+        else if (d)
                 loop_device_unrelinquish(d); /* Let's try to destroy the loopback device */
 
         created_dir = TAKE_PTR(mounted_dir);
@@ -1567,44 +1973,45 @@ static int action_with(DissectedImage *m, LoopDevice *d) {
 }
 
 static int action_discover(void) {
-        _cleanup_(hashmap_freep) Hashmap *images = NULL;
-        _cleanup_(table_unrefp) Table *t = NULL;
-        Image *img;
+        _cleanup_hashmap_free_ Hashmap *images = NULL;
         int r;
 
-        images = hashmap_new(&image_hash_ops);
-        if (!images)
-                return log_oom();
-
         for (ImageClass cl = 0; cl < _IMAGE_CLASS_MAX; cl++) {
-                r = image_discover(cl, NULL, images);
+                r = image_discover(arg_runtime_scope, cl, NULL, &images);
                 if (r < 0)
                         return log_error_errno(r, "Failed to discover images: %m");
         }
 
-        if ((arg_json_format_flags & JSON_FORMAT_OFF) && hashmap_isempty(images)) {
+        if (hashmap_isempty(images) && !sd_json_format_enabled(arg_json_format_flags)) {
                 log_info("No images found.");
                 return 0;
         }
 
-        t = table_new("name", "type", "class", "ro", "path", "time", "usage");
+        _cleanup_(table_unrefp) Table *t = table_new("name", "type", "class", "ro", "path", "time", "usage");
         if (!t)
                 return log_oom();
 
+        table_set_align_percent(t, table_get_cell(t, 0, 6), 100);
+        table_set_ersatz_string(t, TABLE_ERSATZ_DASH);
+
+        Image *img;
         HASHMAP_FOREACH(img, images) {
 
-                if (!IN_SET(img->type, IMAGE_RAW, IMAGE_BLOCK))
+                if (!arg_all && startswith(img->name, "."))
                         continue;
 
                 r = table_add_many(
                                 t,
                                 TABLE_STRING, img->name,
+                                TABLE_SET_COLOR, startswith(img->name, ".") ? ANSI_GREY : NULL,
                                 TABLE_STRING, image_type_to_string(img->type),
                                 TABLE_STRING, image_class_to_string(img->class),
                                 TABLE_BOOLEAN, img->read_only,
+                                TABLE_SET_COLOR, !img->read_only ? ANSI_HIGHLIGHT_GREEN : ANSI_HIGHLIGHT_RED,
                                 TABLE_PATH, img->path,
                                 TABLE_TIMESTAMP, img->mtime != 0 ? img->mtime : img->crtime,
-                                TABLE_SIZE, img->usage);
+                                TABLE_SIZE, img->usage,
+                                TABLE_SET_COLOR, img->usage <= 0 ? ANSI_HIGHLIGHT_RED : NULL);
                 if (r < 0)
                         return table_log_add_error(r);
         }
@@ -1628,7 +2035,9 @@ static int action_attach(DissectedImage *m, LoopDevice *d) {
         if (r < 0)
                 return log_error_errno(r, "Failed to relinquish DM and loopback block devices: %m");
 
-        puts(d->node);
+        if (!arg_quiet)
+                puts(d->node);
+
         return 0;
 }
 
@@ -1637,6 +2046,8 @@ static int action_detach(const char *path) {
         _cleanup_close_ int fd = -EBADF;
         struct stat st;
         int r;
+
+        assert(path);
 
         fd = open(path, O_PATH|O_CLOEXEC);
         if (fd < 0)
@@ -1652,7 +2063,6 @@ static int action_detach(const char *path) {
 
         } else if (S_ISREG(st.st_mode)) {
                 _cleanup_(sd_device_enumerator_unrefp) sd_device_enumerator *e = NULL;
-                sd_device *d;
 
                 /* If a regular file is specified, search for a loopback block device that is backed by it */
 
@@ -1672,26 +2082,18 @@ static int action_detach(const char *path) {
 
                 FOREACH_DEVICE(e, d) {
                         _cleanup_(loop_device_unrefp) LoopDevice *entry_loop = NULL;
-                        const char *name, *devtype;
 
-                        r = sd_device_get_sysname(d, &name);
+                        r = device_is_devtype(d, "disk");
                         if (r < 0) {
-                                log_warning_errno(r, "Failed to get enumerated device's sysname, skipping: %m");
+                                log_device_warning_errno(d, r, "Failed to check if device is a whole disk, skipping: %m");
                                 continue;
                         }
-
-                        r = sd_device_get_devtype(d, &devtype);
-                        if (r < 0) {
-                                log_warning_errno(r, "Failed to get devtype of '%s', skipping: %m", name);
-                                continue;
-                        }
-
-                        if (!streq(devtype, "disk")) /* Filter out partition block devices */
-                                continue;
+                        if (r == 0)
+                                continue; /* Filter out partition block devices */
 
                         r = loop_device_open(d, O_RDONLY, LOCK_SH, &entry_loop);
                         if (r < 0) {
-                                log_warning_errno(r, "Failed to open loopback block device '%s', skipping: %m", name);
+                                log_device_warning_errno(d, r, "Failed to open loopback block device, skipping: %m");
                                 continue;
                         }
 
@@ -1727,20 +2129,21 @@ static int action_validate(void) {
         r = dissect_image_file_and_warn(
                         arg_image,
                         &arg_verity_settings,
-                        NULL,
+                        /* mount_options= */ NULL,
                         arg_image_policy,
+                        arg_image_filter,
                         arg_flags,
-                        NULL);
+                        /* ret= */ NULL);
         if (r < 0)
                 return r;
 
-        if (isatty(STDOUT_FILENO) && emoji_enabled())
-                printf("%s ", special_glyph(SPECIAL_GLYPH_SPARKLES));
+        if (isatty_safe(STDOUT_FILENO) && emoji_enabled())
+                printf("%s ", glyph(GLYPH_SPARKLES));
 
         printf("%sOK%s", ansi_highlight_green(), ansi_normal());
 
-        if (isatty(STDOUT_FILENO) && emoji_enabled())
-                printf(" %s", special_glyph(SPECIAL_GLYPH_SPARKLES));
+        if (isatty_safe(STDOUT_FILENO) && emoji_enabled())
+                printf(" %s", glyph(GLYPH_SPARKLES));
 
         putc('\n', stdout);
         return 0;
@@ -1749,8 +2152,8 @@ static int action_validate(void) {
 static int run(int argc, char *argv[]) {
         _cleanup_(dissected_image_unrefp) DissectedImage *m = NULL;
         _cleanup_(loop_device_unrefp) LoopDevice *d = NULL;
-        uint32_t loop_flags;
-        int open_flags, r;
+        _cleanup_close_ int userns_fd = -EBADF;
+        int r;
 
         log_setup();
 
@@ -1760,6 +2163,26 @@ static int run(int argc, char *argv[]) {
                 r = parse_argv(argc, argv);
         if (r <= 0)
                 return r;
+
+        if (arg_image) {
+                r = path_pick_update_warn(
+                                &arg_image,
+                                &pick_filter_image_raw,
+                                PICK_ARCHITECTURE|PICK_TRIES,
+                                /* ret_result= */ NULL);
+                if (r < 0)
+                        return r;
+        }
+
+        if (arg_root) {
+                r = path_pick_update_warn(
+                                &arg_root,
+                                &pick_filter_image_dir,
+                                PICK_ARCHITECTURE|PICK_TRIES,
+                                /* ret_result= */ NULL);
+                if (r < 0)
+                        return r;
+        }
 
         switch (arg_action) {
         case ACTION_UMOUNT:
@@ -1772,74 +2195,132 @@ static int run(int argc, char *argv[]) {
                 return action_discover();
 
         default:
-                /* All other actions need the image dissected */
-                break;
+                /* All other actions need the image dissected (except for ACTION_VALIDATE, see below) */
+                ;
         }
 
-        r = verity_settings_load(
-                        &arg_verity_settings,
-                        arg_image, NULL, NULL);
-        if (r < 0)
-                return log_error_errno(r, "Failed to read verity artifacts for %s: %m", arg_image);
+        if (arg_image) {
+                r = verity_settings_load(
+                                &arg_verity_settings,
+                                arg_image,
+                                /* root_hash_path= */ NULL,
+                                /* root_hash_sig_path= */ NULL);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to read verity artifacts for %s: %m", arg_image);
 
-        if (arg_verity_settings.data_path)
-                arg_flags |= DISSECT_IMAGE_NO_PARTITION_TABLE; /* We only support Verity per file system,
-                                                                * hence if there's external Verity data
-                                                                * available we turn off partition table
-                                                                * support */
+                if (arg_verity_settings.data_path)
+                        arg_flags |= DISSECT_IMAGE_NO_PARTITION_TABLE; /* We only support Verity per file system,
+                                                                        * hence if there's external Verity data
+                                                                        * available we turn off partition table
+                                                                        * support */
+        }
+
+        if (!arg_loop_ref && arg_loop_ref_auto) {
+                r = path_extract_filename(arg_image, &arg_loop_ref);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to extract file name from image path '%s': %m", arg_image);
+        }
 
         if (arg_action == ACTION_VALIDATE)
                 return action_validate();
 
-        open_flags = FLAGS_SET(arg_flags, DISSECT_IMAGE_DEVICE_READ_ONLY) ? O_RDONLY : O_RDWR;
-        loop_flags = FLAGS_SET(arg_flags, DISSECT_IMAGE_NO_PARTITION_TABLE) ? 0 : LO_FLAGS_PARTSCAN;
+        if (arg_image) {
+                /* First try locally, if we are allowed to */
+                if (!arg_via_service) {
+                        uint32_t loop_flags;
+                        int open_flags;
 
-        if (arg_in_memory)
-                r = loop_device_make_by_path_memory(arg_image, open_flags, /* sector_size= */ UINT32_MAX, loop_flags, LOCK_SH, &d);
-        else
-                r = loop_device_make_by_path(arg_image, open_flags, /* sector_size= */ UINT32_MAX, loop_flags, LOCK_SH, &d);
-        if (r < 0)
-                return log_error_errno(r, "Failed to set up loopback device for %s: %m", arg_image);
+                        open_flags = FLAGS_SET(arg_flags, DISSECT_IMAGE_DEVICE_READ_ONLY) ? O_RDONLY : O_RDWR;
+                        loop_flags = FLAGS_SET(arg_flags, DISSECT_IMAGE_NO_PARTITION_TABLE) ? 0 : LO_FLAGS_PARTSCAN;
 
-        if (arg_loop_ref) {
-                r = loop_device_set_filename(d, arg_loop_ref);
-                if (r < 0)
-                        log_warning_errno(r, "Failed to set loop reference string to '%s', ignoring: %m", arg_loop_ref);
-        }
+                        if (arg_in_memory)
+                                r = loop_device_make_by_path_memory(arg_image, open_flags, /* sector_size= */ UINT32_MAX, loop_flags, LOCK_SH, &d);
+                        else
+                                r = loop_device_make_by_path(arg_image, open_flags, /* sector_size= */ UINT32_MAX, loop_flags, LOCK_SH, &d);
+                        if (r < 0) {
+                                if (!ERRNO_IS_PRIVILEGE(r) || !IN_SET(arg_action, ACTION_DISSECT, ACTION_LIST, ACTION_MTREE, ACTION_COPY_FROM, ACTION_COPY_TO, ACTION_SHIFT))
+                                        return log_error_errno(r, "Failed to set up loopback device for %s: %m", arg_image);
 
-        r = dissect_loop_device_and_warn(
-                        d,
-                        &arg_verity_settings,
-                        /* mount_options= */ NULL,
-                        arg_image_policy,
-                        arg_flags,
-                        &m);
-        if (r < 0)
-                return r;
+                                log_debug_errno(r, "Lacking permissions to set up loopback block device for %s, using service: %m", arg_image);
+                                arg_via_service = true;
+                        } else {
+                                if (arg_loop_ref) {
+                                        r = loop_device_set_filename(d, arg_loop_ref);
+                                        if (r < 0)
+                                                log_warning_errno(r, "Failed to set loop reference string to '%s', ignoring: %m", arg_loop_ref);
+                                }
 
-        if (arg_action == ACTION_ATTACH)
-                return action_attach(m, d);
+                                r = dissect_loop_device_and_warn(
+                                                d,
+                                                &arg_verity_settings,
+                                                /* mount_options= */ NULL,
+                                                arg_image_policy,
+                                                arg_image_filter,
+                                                arg_flags,
+                                                &m);
+                                if (r < 0)
+                                        return r;
 
-        r = dissected_image_load_verity_sig_partition(
-                        m,
-                        d->fd,
-                        &arg_verity_settings);
-        if (r < 0)
-                return log_error_errno(r, "Failed to load verity signature partition: %m");
+                                if (arg_action == ACTION_ATTACH)
+                                        return action_attach(m, d);
 
-        if (arg_action != ACTION_DISSECT) {
-                r = dissected_image_decrypt_interactively(
-                                m, NULL,
-                                &arg_verity_settings,
-                                arg_flags);
-                if (r < 0)
-                        return r;
+                                r = dissected_image_load_verity_sig_partition(
+                                                m,
+                                                d->fd,
+                                                &arg_verity_settings);
+                                if (r < 0)
+                                        return log_error_errno(r, "Failed to load verity signature partition: %m");
+
+                                r = dissected_image_guess_verity_roothash(
+                                                m,
+                                                &arg_verity_settings);
+                                if (r < 0)
+                                        return log_error_errno(r, "Failed to guess verity root hash: %m");
+
+                                if (arg_action != ACTION_DISSECT) {
+                                        r = dissected_image_decrypt_interactively(
+                                                        m, NULL,
+                                                        &arg_verity_settings,
+                                                        arg_flags);
+                                        if (r < 0)
+                                                return r;
+                                }
+                        }
+                }
+
+                /* Try via service */
+                if (arg_via_service) {
+                        if (arg_in_memory)
+                                return log_error_errno(SYNTHETIC_ERRNO(EOPNOTSUPP), "--in-memory= not supported when operating via systemd-mountfsd.");
+
+                        if (arg_loop_ref || arg_loop_ref_auto) /* yes, the 2nd check is strictly speaking redundant, given the normalization we did above, but let's be explicit here */
+                                return log_error_errno(SYNTHETIC_ERRNO(EOPNOTSUPP), "--loop-ref=/--loop-ref-auto not supported when operating via systemd-mountfsd.");
+
+                        if (verity_settings_set(&arg_verity_settings))
+                                return log_error_errno(SYNTHETIC_ERRNO(EOPNOTSUPP), "Externally configured verity settings not supported when operating via systemd-mountfsd.");
+
+                        /* Don't run things in private userns, if the mount shall be attached to the host */
+                        if (!IN_SET(arg_action, ACTION_MOUNT, ACTION_WITH)) {
+                                userns_fd = nsresource_allocate_userns(/* name= */ NULL, UINT64_C(0x10000)); /* allocate 64K users by default */
+                                if (userns_fd < 0)
+                                        return log_error_errno(userns_fd, "Failed to allocate user namespace with 64K users: %m");
+                        }
+
+                        r = mountfsd_mount_image(
+                                        arg_image,
+                                        userns_fd,
+                                        arg_image_policy,
+                                        arg_flags,
+                                        &m);
+                        if (r < 0)
+                                return r;
+                }
         }
 
         switch (arg_action) {
 
         case ACTION_DISSECT:
-                return action_dissect(m, d);
+                return action_dissect(m, d, userns_fd);
 
         case ACTION_MOUNT:
                 return action_mount(m, d);
@@ -1848,7 +2329,9 @@ static int run(int argc, char *argv[]) {
         case ACTION_MTREE:
         case ACTION_COPY_FROM:
         case ACTION_COPY_TO:
-                return action_list_or_mtree_or_copy(m, d);
+        case ACTION_MAKE_ARCHIVE:
+        case ACTION_SHIFT:
+                return action_list_or_mtree_or_copy_or_make_archive(m, d, userns_fd);
 
         case ACTION_WITH:
                 return action_with(m, d);

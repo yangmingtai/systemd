@@ -1,10 +1,10 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include <stdbool.h>
+#include "forward.h"
 
-#include "execute.h"
-#include "path-lookup.h"
+typedef struct ExecCommand ExecCommand;
+typedef struct Unit Unit;
 
 typedef enum RecursiveErrors {
         RECURSIVE_ERRORS_YES,               /* Look for errors in all associated units */
@@ -14,7 +14,7 @@ typedef enum RecursiveErrors {
         _RECURSIVE_ERRORS_INVALID = -EINVAL,
 } RecursiveErrors;
 
-int verify_generate_path(char **var, char **filenames);
+int verify_set_unit_path(char **filenames);
 int verify_prepare_filename(const char *filename, char **ret);
 int verify_executable(Unit *u, const ExecCommand *exec, const char *root);
 int verify_units(char **filenames, RuntimeScope scope, bool check_man, bool run_generators, RecursiveErrors recursive_errors, const char *root);

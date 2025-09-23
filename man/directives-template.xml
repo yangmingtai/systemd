@@ -33,12 +33,29 @@
   </refsect1>
 
   <refsect1>
+    <title>SMBIOS Type 11 Variables</title>
+
+    <para>Data passed from VMM to system via SMBIOS Type 11.</para>
+
+    <variablelist id='smbios-type-11-options' />
+  </refsect1>
+
+  <refsect1>
     <title>Environment variables</title>
 
     <para>Environment variables understood by the systemd manager and other programs and environment
     variable-compatible settings.</para>
 
     <variablelist id='environment-variables' />
+  </refsect1>
+
+  <refsect1>
+    <title>System Credentials</title>
+
+    <para>System credentials understood by the system and service manager and various other
+    components:</para>
+
+    <variablelist id='system-credentials' />
   </refsect1>
 
   <refsect1>
@@ -146,7 +163,7 @@
   <refsect1>
     <title>Miscellaneous options and directives</title>
 
-    <para>Other configuration elements which don't fit in any of the above groups.</para>
+    <para>Other configuration elements which do not fit in any of the above groups.</para>
 
     <variablelist id='miscellaneous' />
   </refsect1>

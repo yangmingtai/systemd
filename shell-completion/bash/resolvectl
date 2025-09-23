@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # resolvectl(1) completion                                  -*- shell-script -*-
 # SPDX-License-Identifier: LGPL-2.1-or-later
 #
@@ -23,7 +24,7 @@ __contains_word () {
     done
 }
 
-__get_interfaces(){
+__get_interfaces() {
     local name
     for name in $(cd /sys/class/net && command ls); do
         [[ "$name" != "lo" ]] && echo "$name"
@@ -35,10 +36,10 @@ _resolvectl() {
     local cur=${COMP_WORDS[COMP_CWORD]} prev=${COMP_WORDS[COMP_CWORD-1]}
     local -A OPTS=(
         [STANDALONE]='-h --help --version -4 -6 --legend=no --cname=no
-                      --validate=no --synthesize=no --cache=no --zone=no
+                      --validate=no --synthesize=no --cache=no --relax-single-label=no --zone=no
                       --trust-anchor=no --network=no --service-address=no
-                      --service-txt=no --search=no --no-pager'
-        [ARG]='-t --type -c --class -i --interface -p --protocol --raw'
+                      --service-txt=no --search=no --stale-data=no --no-pager --no-ask-password'
+        [ARG]='-t --type -c --class -i --interface -p --protocol --raw --json'
     )
     local -A VERBS=(
         [DOMAIN]='query service openpgp'
@@ -49,7 +50,7 @@ _resolvectl() {
         [RESOLVE]='llmnr mdns'
         [DNSSEC]='dnssec'
         [DNSOVERTLS]='dnsovertls'
-        [STANDALONE]='statistics reset-statistics flush-caches reset-server-features'
+        [STANDALONE]='statistics reset-statistics flush-caches reset-server-features monitor show-cache show-server-state'
         [LOG_LEVEL]='log-level'
     )
     local -A ARGS=(
@@ -59,15 +60,14 @@ _resolvectl() {
         [DNSSEC]='yes no allow-downgrade'
         [DNSOVERTLS]='yes no opportunistic'
     )
-    local interfaces=$( __get_interfaces )
 
     if __contains_word "$prev" ${OPTS[ARG]}; then
         case $prev in
             --interface|-i)
-                comps="$interfaces"
+                comps=$( __get_interfaces )
                 ;;
-            --protocol|-p|--type|-t|--class|-c)
-                comps=$( resolvectl --legend=no "$prev" help; echo help )
+            --protocol|-p|--type|-t|--class|-c|--json)
+                comps=$( resolvectl --legend=no "$prev" help 2>/dev/null; echo help )
                 ;;
             --raw)
                 comps="payload packet"
@@ -97,7 +97,7 @@ _resolvectl() {
         comps=''
 
     elif __contains_word "$verb" ${VERBS[STATUS]}; then
-        comps="$interfaces"
+        comps=$( __get_interfaces )
 
     elif __contains_word "$verb" ${VERBS[LOG_LEVEL]}; then
         comps='debug info notice warning err crit alert emerg'
@@ -107,7 +107,7 @@ _resolvectl() {
             if __contains_word "${COMP_WORDS[i]}" ${ARGS[FAMILY]} &&
                     ! __contains_word "${COMP_WORDS[i-1]}" ${OPTS[ARG]}; then
                 name=${COMP_WORDS[i]}
-                break;
+                break
             fi
         done
         if [[ -z $name ]]; then
@@ -117,11 +117,12 @@ _resolvectl() {
         fi
 
     elif __contains_word "$verb" ${VERBS[LINK]} ${VERBS[BOOLEAN]} ${VERBS[RESOLVE]} ${VERBS[DNSSEC]} ${VERBS[DNSOVERTLS]}; then
+        local interfaces=$( __get_interfaces )
         for ((i++; i < COMP_CWORD; i++)); do
             if __contains_word "${COMP_WORDS[i]}" $interfaces &&
                     ! __contains_word "${COMP_WORDS[i-1]}" ${OPTS[ARG]}; then
                 name=${COMP_WORDS[i]}
-                break;
+                break
             fi
         done
 
@@ -134,7 +135,7 @@ _resolvectl() {
                 if __contains_word "${COMP_WORDS[i]}" ${ARGS[RESOLVE]} &&
                         ! __contains_word "${COMP_WORDS[i-1]}" ${OPTS[ARG]}; then
                     name=${COMP_WORDS[i]}
-                    break;
+                    break
                 fi
             done
 
@@ -150,7 +151,7 @@ _resolvectl() {
                 if __contains_word "${COMP_WORDS[i]}" ${ARGS[BOOLEAN]} &&
                         ! __contains_word "${COMP_WORDS[i-1]}" ${OPTS[ARG]}; then
                     name=${COMP_WORDS[i]}
-                    break;
+                    break
                 fi
             done
 
@@ -166,7 +167,7 @@ _resolvectl() {
                 if __contains_word "${COMP_WORDS[i]}" ${ARGS[DNSSEC]} &&
                         ! __contains_word "${COMP_WORDS[i-1]}" ${OPTS[ARG]}; then
                     name=${COMP_WORDS[i]}
-                    break;
+                    break
                 fi
             done
 
@@ -182,7 +183,7 @@ _resolvectl() {
                 if __contains_word "${COMP_WORDS[i]}" ${ARGS[DNSOVERTLS]} &&
                         ! __contains_word "${COMP_WORDS[i-1]}" ${OPTS[ARG]}; then
                     name=${COMP_WORDS[i]}
-                    break;
+                    break
                 fi
             done
 

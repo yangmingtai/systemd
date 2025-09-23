@@ -7,8 +7,8 @@
 #include <sys/mman.h>
 #include <sys/personality.h>
 #include <sys/shm.h>
-#include <sys/syscall.h>
-#include <sys/types.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #if HAVE_VALGRIND_VALGRIND_H
 #include <valgrind/valgrind.h>
@@ -16,11 +16,11 @@
 
 #include "alloc-util.h"
 #include "capability-util.h"
+#include "errno-list.h"
 #include "fd-util.h"
 #include "fileio.h"
-#include "macro.h"
+#include "fs-util.h"
 #include "memory-util.h"
-#include "missing_sched.h"
 #include "nsflags.h"
 #include "nulstr-util.h"
 #include "process-util.h"
@@ -42,49 +42,53 @@
 #  define SECCOMP_RESTRICT_ADDRESS_FAMILIES_BROKEN 0
 #endif
 
-static bool have_seccomp_privs(void) {
-        return geteuid() == 0 && have_effective_cap(CAP_SYS_ADMIN) > 0; /* If we are root but CAP_SYS_ADMIN we can't do caps (unless we also do NNP) */
-}
+#define CHECK_SECCOMP(refuse_container) \
+        if (!is_seccomp_available())                                    \
+                return (void) log_tests_skipped("Seccomp not available"); \
+        if (geteuid() != 0 || have_effective_cap(CAP_SYS_ADMIN) <= 0)   \
+                return (void) log_tests_skipped("Not privileged");      \
+        if (refuse_container && detect_container() > 0)                 \
+                return (void) log_tests_skipped("Running in container");
 
 TEST(parse_syscall_and_errno) {
         _cleanup_free_ char *n = NULL;
         int e;
 
         assert_se(parse_syscall_and_errno("uname:EILSEQ", &n, &e) >= 0);
-        assert_se(streq(n, "uname"));
+        ASSERT_STREQ(n, "uname");
         assert_se(e == errno_from_name("EILSEQ") && e >= 0);
         n = mfree(n);
 
         assert_se(parse_syscall_and_errno("uname:EINVAL", &n, &e) >= 0);
-        assert_se(streq(n, "uname"));
+        ASSERT_STREQ(n, "uname");
         assert_se(e == errno_from_name("EINVAL") && e >= 0);
         n = mfree(n);
 
         assert_se(parse_syscall_and_errno("@sync:4095", &n, &e) >= 0);
-        assert_se(streq(n, "@sync"));
+        ASSERT_STREQ(n, "@sync");
         assert_se(e == 4095);
         n = mfree(n);
 
         /* If errno is omitted, then e is set to -1 */
         assert_se(parse_syscall_and_errno("mount", &n, &e) >= 0);
-        assert_se(streq(n, "mount"));
+        ASSERT_STREQ(n, "mount");
         assert_se(e == -1);
         n = mfree(n);
 
         /* parse_syscall_and_errno() does not check the syscall name is valid or not. */
         assert_se(parse_syscall_and_errno("hoge:255", &n, &e) >= 0);
-        assert_se(streq(n, "hoge"));
+        ASSERT_STREQ(n, "hoge");
         assert_se(e == 255);
         n = mfree(n);
 
         /* 0 is also a valid errno. */
         assert_se(parse_syscall_and_errno("hoge:0", &n, &e) >= 0);
-        assert_se(streq(n, "hoge"));
+        ASSERT_STREQ(n, "hoge");
         assert_se(e == 0);
         n = mfree(n);
 
         assert_se(parse_syscall_and_errno("hoge:kill", &n, &e) >= 0);
-        assert_se(streq(n, "hoge"));
+        ASSERT_STREQ(n, "hoge");
         assert_se(e == SECCOMP_ERROR_NUMBER_KILL);
         n = mfree(n);
 
@@ -126,6 +130,9 @@ TEST(architecture_table) {
                        "x32\0"
                        "arm\0"
                        "arm64\0"
+#ifdef SCMP_ARCH_LOONGARCH64
+                       "loongarch64\0"
+#endif
                        "mips\0"
                        "mips64\0"
                        "mips64-n32\0"
@@ -147,7 +154,7 @@ TEST(architecture_table) {
                 assert_se(seccomp_arch_from_string(n, &c) >= 0);
                 n2 = seccomp_arch_to_string(c);
                 log_info("seccomp-arch: %s → 0x%"PRIx32" → %s", n, c, n2);
-                assert_se(streq_ptr(n, n2));
+                ASSERT_STREQ(n, n2);
         }
 }
 
@@ -163,17 +170,11 @@ TEST(syscall_filter_set_find) {
 }
 
 TEST(filter_sets) {
-        if (!is_seccomp_available()) {
-                log_notice("Seccomp not available, skipping %s", __func__);
-                return;
-        }
-        if (!have_seccomp_privs()) {
-                log_notice("Not privileged, skipping %s", __func__);
-                return;
-        }
+        int r;
+
+        CHECK_SECCOMP(/* skip_container = */ false);
 
         for (unsigned i = 0; i < _SYSCALL_FILTER_SET_MAX; i++) {
-                pid_t pid;
 
 #if HAVE_VALGRIND_VALGRIND_H
                 if (RUNNING_ON_VALGRIND && IN_SET(i, SYSCALL_FILTER_SET_DEFAULT, SYSCALL_FILTER_SET_BASIC_IO, SYSCALL_FILTER_SET_SIGNAL)) {
@@ -192,11 +193,9 @@ TEST(filter_sets) {
 
                 log_info("Testing %s", syscall_filter_sets[i].name);
 
-                pid = fork();
-                assert_se(pid >= 0);
-
-                if (pid == 0) { /* Child? */
-                        int fd, r;
+                ASSERT_OK(r = safe_fork("(filter_sets)", FORK_LOG | FORK_WAIT, NULL));
+                if (r == 0) {
+                        int fd;
 
                         /* If we look at the default set (or one that includes it), allow-list instead of deny-list */
                         if (IN_SET(i, SYSCALL_FILTER_SET_DEFAULT,
@@ -219,19 +218,17 @@ TEST(filter_sets) {
 
                         _exit(EXIT_SUCCESS);
                 }
-
-                assert_se(wait_for_terminate_and_check(syscall_filter_sets[i].name, pid, WAIT_LOG) == EXIT_SUCCESS);
         }
 }
 
 TEST(filter_sets_ordered) {
         /* Ensure "@default" always remains at the beginning of the list */
         assert_se(SYSCALL_FILTER_SET_DEFAULT == 0);
-        assert_se(streq(syscall_filter_sets[0].name, "@default"));
+        ASSERT_STREQ(syscall_filter_sets[0].name, "@default");
 
         /* Ensure "@known" always remains at the end of the list */
         assert_se(SYSCALL_FILTER_SET_KNOWN == _SYSCALL_FILTER_SET_MAX - 1);
-        assert_se(streq(syscall_filter_sets[SYSCALL_FILTER_SET_KNOWN].name, "@known"));
+        ASSERT_STREQ(syscall_filter_sets[SYSCALL_FILTER_SET_KNOWN].name, "@known");
 
         for (size_t i = 0; i < _SYSCALL_FILTER_SET_MAX; i++) {
                 const char *p = NULL;
@@ -260,12 +257,10 @@ TEST(filter_sets_ordered) {
 TEST(restrict_namespace) {
         char *s = NULL;
         unsigned long ul;
-        pid_t pid;
+        int r;
 
-        if (!have_namespaces()) {
-                log_notice("Testing without namespaces, skipping %s", __func__);
-                return;
-        }
+        if (!have_namespaces())
+                return (void) log_tests_skipped("Testing without namespaces");
 
         assert_se(namespace_flags_to_string(0, &s) == 0 && isempty(s));
         s = mfree(s);
@@ -290,23 +285,14 @@ TEST(restrict_namespace) {
         s = mfree(s);
 
         assert_se(namespace_flags_to_string(NAMESPACE_FLAGS_ALL, &s) == 0);
-        assert_se(streq(s, "cgroup ipc net mnt pid user uts"));
+        ASSERT_STREQ(s, "cgroup ipc net mnt pid user uts time");
         assert_se(namespace_flags_from_string(s, &ul) == 0 && ul == NAMESPACE_FLAGS_ALL);
         s = mfree(s);
 
-        if (!is_seccomp_available()) {
-                log_notice("Seccomp not available, skipping remaining tests in %s", __func__);
-                return;
-        }
-        if (!have_seccomp_privs()) {
-                log_notice("Not privileged, skipping remaining tests in %s", __func__);
-                return;
-        }
+        CHECK_SECCOMP(/* skip_container = */ false);
 
-        pid = fork();
-        assert_se(pid >= 0);
-
-        if (pid == 0) {
+        ASSERT_OK(r = safe_fork("(restrict-namespace)", FORK_LOG | FORK_WAIT, NULL));
+        if (r == 0) {
 
                 assert_se(seccomp_restrict_namespaces(CLONE_NEWNS|CLONE_NEWNET) >= 0);
 
@@ -334,7 +320,7 @@ TEST(restrict_namespace) {
                 assert_se(setns(0, 0) == -1);
                 assert_se(errno == EPERM);
 
-                pid = raw_clone(CLONE_NEWNS);
+                pid_t pid = raw_clone(CLONE_NEWNS);
                 assert_se(pid >= 0);
                 if (pid == 0)
                         _exit(EXIT_SUCCESS);
@@ -354,37 +340,21 @@ TEST(restrict_namespace) {
 
                 _exit(EXIT_SUCCESS);
         }
-
-        assert_se(wait_for_terminate_and_check("nsseccomp", pid, WAIT_LOG) == EXIT_SUCCESS);
 }
 
 TEST(protect_sysctl) {
-        pid_t pid;
-        _cleanup_free_ char *seccomp = NULL;
-
-        if (!is_seccomp_available()) {
-                log_notice("Seccomp not available, skipping %s", __func__);
-                return;
-        }
-        if (!have_seccomp_privs()) {
-                log_notice("Not privileged, skipping %s", __func__);
-                return;
-        }
+        int r;
 
         /* in containers _sysctl() is likely missing anyway */
-        if (detect_container() > 0) {
-                log_notice("Testing in container, skipping %s", __func__);
-                return;
-        }
+        CHECK_SECCOMP(/* skip_container = */ true);
 
-        assert_se(get_proc_field("/proc/self/status", "Seccomp", WHITESPACE, &seccomp) == 0);
+        _cleanup_free_ char *seccomp = NULL;
+        assert_se(get_proc_field("/proc/self/status", "Seccomp", &seccomp) == 0);
         if (!streq(seccomp, "0"))
                 log_warning("Warning: seccomp filter detected, results may be unreliable for %s", __func__);
 
-        pid = fork();
-        assert_se(pid >= 0);
-
-        if (pid == 0) {
+        ASSERT_OK(r = safe_fork("(protect-sysctl)", FORK_LOG | FORK_WAIT, NULL));
+        if (r == 0) {
 #if defined __NR__sysctl && __NR__sysctl >= 0
                 assert_se(syscall(__NR__sysctl, NULL) < 0);
                 assert_se(IN_SET(errno, EFAULT, ENOSYS));
@@ -406,32 +376,16 @@ TEST(protect_sysctl) {
 
                 _exit(EXIT_SUCCESS);
         }
-
-        assert_se(wait_for_terminate_and_check("sysctlseccomp", pid, WAIT_LOG) == EXIT_SUCCESS);
 }
 
 TEST(protect_syslog) {
-        pid_t pid;
-
-        if (!is_seccomp_available()) {
-                log_notice("Seccomp not available, skipping %s", __func__);
-                return;
-        }
-        if (!have_seccomp_privs()) {
-                log_notice("Not privileged, skipping %s", __func__);
-                return;
-        }
+        int r;
 
         /* in containers syslog() is likely missing anyway */
-        if (detect_container() > 0) {
-                log_notice("Testing in container, skipping %s", __func__);
-                return;
-        }
+        CHECK_SECCOMP(/* skip_container = */ true);
 
-        pid = fork();
-        assert_se(pid >= 0);
-
-        if (pid == 0) {
+        ASSERT_OK(r = safe_fork("(protect-syslog)", FORK_LOG | FORK_WAIT, NULL));
+        if (r == 0) {
 #if defined __NR_syslog && __NR_syslog >= 0
                 assert_se(syscall(__NR_syslog, -1, NULL, 0) < 0);
                 assert_se(errno == EINVAL);
@@ -446,26 +400,15 @@ TEST(protect_syslog) {
 
                 _exit(EXIT_SUCCESS);
         }
-
-        assert_se(wait_for_terminate_and_check("syslogseccomp", pid, WAIT_LOG) == EXIT_SUCCESS);
 }
 
 TEST(restrict_address_families) {
-        pid_t pid;
+        int r;
 
-        if (!is_seccomp_available()) {
-                log_notice("Seccomp not available, skipping %s", __func__);
-                return;
-        }
-        if (!have_seccomp_privs()) {
-                log_notice("Not privileged, skipping %s", __func__);
-                return;
-        }
+        CHECK_SECCOMP(/* skip_container = */ false);
 
-        pid = fork();
-        assert_se(pid >= 0);
-
-        if (pid == 0) {
+        ASSERT_OK(r = safe_fork("(restrict-address-families)", FORK_LOG | FORK_WAIT, NULL));
+        if (r == 0) {
                 int fd;
                 Set *s;
 
@@ -482,7 +425,7 @@ TEST(restrict_address_families) {
                 safe_close(fd);
 
                 assert_se(s = set_new(NULL));
-                assert_se(set_put(s, INT_TO_PTR(AF_UNIX)) >= 0);
+                ASSERT_OK(set_put(s, INT_TO_PTR(AF_UNIX)));
 
                 assert_se(seccomp_restrict_address_families(s, false) >= 0);
 
@@ -505,7 +448,7 @@ TEST(restrict_address_families) {
 
                 set_clear(s);
 
-                assert_se(set_put(s, INT_TO_PTR(AF_INET)) >= 0);
+                ASSERT_OK(set_put(s, INT_TO_PTR(AF_INET)));
 
                 assert_se(seccomp_restrict_address_families(s, true) >= 0);
 
@@ -533,34 +476,23 @@ TEST(restrict_address_families) {
 
                 _exit(EXIT_SUCCESS);
         }
-
-        assert_se(wait_for_terminate_and_check("socketseccomp", pid, WAIT_LOG) == EXIT_SUCCESS);
 }
 
 TEST(restrict_realtime) {
-        pid_t pid;
-
-        if (!is_seccomp_available()) {
-                log_notice("Seccomp not available, skipping %s", __func__);
-                return;
-        }
-        if (!have_seccomp_privs()) {
-                log_notice("Not privileged, skipping %s", __func__);
-                return;
-        }
+        int r;
 
         /* in containers RT privs are likely missing anyway */
-        if (detect_container() > 0) {
-                log_notice("Testing in container, skipping %s", __func__);
-                return;
-        }
+        CHECK_SECCOMP(/* skip_container = */ true);
 
-        pid = fork();
-        assert_se(pid >= 0);
-
-        if (pid == 0) {
+        ASSERT_OK(r = safe_fork("(restrict-realtime)", FORK_LOG | FORK_WAIT, NULL));
+        if (r == 0) {
                 /* On some CI environments, the restriction may be already enabled. */
                 if (sched_setscheduler(0, SCHED_FIFO, &(struct sched_param) { .sched_priority = 1 }) < 0) {
+                        if (errno == ENOSYS) {
+                                log_tests_skipped("sched_setscheduler() is not available or already filtered");
+                                _exit(EXIT_SUCCESS);
+                        }
+
                         log_full_errno(errno == EPERM ? LOG_DEBUG : LOG_WARNING, errno,
                                        "Failed to set scheduler parameter for FIFO: %m");
                         assert(errno == EPERM);
@@ -588,21 +520,13 @@ TEST(restrict_realtime) {
 
                 _exit(EXIT_SUCCESS);
         }
-
-        assert_se(wait_for_terminate_and_check("realtimeseccomp", pid, WAIT_LOG) == EXIT_SUCCESS);
 }
 
 TEST(memory_deny_write_execute_mmap) {
-        pid_t pid;
+        int r;
 
-        if (!is_seccomp_available()) {
-                log_notice("Seccomp not available, skipping %s", __func__);
-                return;
-        }
-        if (!have_seccomp_privs()) {
-                log_notice("Not privileged, skipping %s", __func__);
-                return;
-        }
+        CHECK_SECCOMP(/* skip_container = */ false);
+
 #if HAVE_VALGRIND_VALGRIND_H
         if (RUNNING_ON_VALGRIND) {
                 log_notice("Running on valgrind, skipping %s", __func__);
@@ -614,24 +538,22 @@ TEST(memory_deny_write_execute_mmap) {
         return;
 #endif
 
-        pid = fork();
-        assert_se(pid >= 0);
-
-        if (pid == 0) {
+        ASSERT_OK(r = safe_fork("(memory_deny_write_execute_mmap)", FORK_LOG | FORK_WAIT, NULL));
+        if (r == 0) {
                 void *p;
 
-                p = mmap(NULL, page_size(), PROT_WRITE|PROT_EXEC, MAP_PRIVATE|MAP_ANONYMOUS, -1,0);
+                p = mmap(NULL, page_size(), PROT_WRITE|PROT_EXEC, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
                 assert_se(p != MAP_FAILED);
                 assert_se(munmap(p, page_size()) >= 0);
 
-                p = mmap(NULL, page_size(), PROT_WRITE|PROT_READ, MAP_PRIVATE|MAP_ANONYMOUS, -1,0);
+                p = mmap(NULL, page_size(), PROT_WRITE|PROT_READ, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
                 assert_se(p != MAP_FAILED);
                 assert_se(munmap(p, page_size()) >= 0);
 
                 assert_se(seccomp_memory_deny_write_execute() >= 0);
 
-                p = mmap(NULL, page_size(), PROT_WRITE|PROT_EXEC, MAP_PRIVATE|MAP_ANONYMOUS, -1,0);
-#if defined(__x86_64__) || defined(__i386__) || defined(__powerpc64__) || defined(__arm__) || defined(__aarch64__)
+                p = mmap(NULL, page_size(), PROT_WRITE|PROT_EXEC, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+#if defined(__x86_64__) || defined(__i386__) || defined(__powerpc64__) || defined(__arm__) || defined(__aarch64__) || defined(__loongarch_lp64)
                 assert_se(p == MAP_FAILED);
                 assert_se(errno == EPERM);
 #endif
@@ -640,20 +562,17 @@ TEST(memory_deny_write_execute_mmap) {
                 if (p != MAP_FAILED)
                         assert_se(munmap(p, page_size()) == 0);
 
-                p = mmap(NULL, page_size(), PROT_WRITE|PROT_READ, MAP_PRIVATE|MAP_ANONYMOUS, -1,0);
+                p = mmap(NULL, page_size(), PROT_WRITE|PROT_READ, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
                 assert_se(p != MAP_FAILED);
                 assert_se(munmap(p, page_size()) >= 0);
 
                 _exit(EXIT_SUCCESS);
         }
-
-        assert_se(wait_for_terminate_and_check("memoryseccomp-mmap", pid, WAIT_LOG) == EXIT_SUCCESS);
 }
 
 TEST(memory_deny_write_execute_shmat) {
-        int shmid;
-        pid_t pid;
         uint32_t arch;
+        int r, shmid;
 
         SECCOMP_FOREACH_LOCAL_ARCH(arch) {
                 log_debug("arch %s: SCMP_SYS(mmap) = %d", seccomp_arch_to_string(arch), SCMP_SYS(mmap));
@@ -663,14 +582,8 @@ TEST(memory_deny_write_execute_shmat) {
                 log_debug("arch %s: SCMP_SYS(shmdt) = %d", seccomp_arch_to_string(arch), SCMP_SYS(shmdt));
         }
 
-        if (!is_seccomp_available()) {
-                log_notice("Seccomp not available, skipping %s", __func__);
-                return;
-        }
-        if (!have_seccomp_privs() || have_effective_cap(CAP_IPC_OWNER) <= 0) {
-                log_notice("Not privileged, skipping %s", __func__);
-                return;
-        }
+        CHECK_SECCOMP(/* skip_container = */ false);
+
 #if HAVE_VALGRIND_VALGRIND_H
         if (RUNNING_ON_VALGRIND) {
                 log_notice("Running on valgrind, skipping %s", __func__);
@@ -685,10 +598,8 @@ TEST(memory_deny_write_execute_shmat) {
         shmid = shmget(IPC_PRIVATE, page_size(), 0);
         assert_se(shmid >= 0);
 
-        pid = fork();
-        assert_se(pid >= 0);
-
-        if (pid == 0) {
+        ASSERT_OK(r = safe_fork("(memory-deny-write-execute)", FORK_LOG | FORK_WAIT, NULL));
+        if (r == 0) {
                 void *p;
 
                 p = shmat(shmid, NULL, 0);
@@ -703,7 +614,7 @@ TEST(memory_deny_write_execute_shmat) {
 
                 p = shmat(shmid, NULL, SHM_EXEC);
                 log_debug_errno(p == MAP_FAILED ? errno : 0, "shmat(SHM_EXEC): %m");
-#if defined(__x86_64__) || defined(__arm__) || defined(__aarch64__)
+#if defined(__x86_64__) || defined(__arm__) || defined(__aarch64__) || defined(__loongarch_lp64)
                 assert_se(p == MAP_FAILED);
                 assert_se(errno == EPERM);
 #endif
@@ -719,26 +630,15 @@ TEST(memory_deny_write_execute_shmat) {
 
                 _exit(EXIT_SUCCESS);
         }
-
-        assert_se(wait_for_terminate_and_check("memoryseccomp-shmat", pid, WAIT_LOG) == EXIT_SUCCESS);
 }
 
 TEST(restrict_archs) {
-        pid_t pid;
+        int r;
 
-        if (!is_seccomp_available()) {
-                log_notice("Seccomp not available, skipping %s", __func__);
-                return;
-        }
-        if (!have_seccomp_privs()) {
-                log_notice("Not privileged, skipping %s", __func__);
-                return;
-        }
+        CHECK_SECCOMP(/* skip_container = */ false);
 
-        pid = fork();
-        assert_se(pid >= 0);
-
-        if (pid == 0) {
+        ASSERT_OK(r = safe_fork("(restrict-archs)", FORK_LOG | FORK_WAIT, NULL));
+        if (r == 0) {
                 _cleanup_set_free_ Set *s = NULL;
 
                 assert_se(access("/", F_OK) >= 0);
@@ -746,7 +646,7 @@ TEST(restrict_archs) {
                 assert_se(s = set_new(NULL));
 
 #ifdef __x86_64__
-                assert_se(set_put(s, UINT32_TO_PTR(SCMP_ARCH_X86+1)) >= 0);
+                ASSERT_OK(set_put(s, UINT32_TO_PTR(SCMP_ARCH_X86+1)));
 #endif
                 assert_se(seccomp_restrict_archs(s) >= 0);
 
@@ -757,26 +657,15 @@ TEST(restrict_archs) {
 
                 _exit(EXIT_SUCCESS);
         }
-
-        assert_se(wait_for_terminate_and_check("archseccomp", pid, WAIT_LOG) == EXIT_SUCCESS);
 }
 
 TEST(load_syscall_filter_set_raw) {
-        pid_t pid;
+        int r;
 
-        if (!is_seccomp_available()) {
-                log_notice("Seccomp not available, skipping %s", __func__);
-                return;
-        }
-        if (!have_seccomp_privs()) {
-                log_notice("Not privileged, skipping %s", __func__);
-                return;
-        }
+        CHECK_SECCOMP(/* skip_container = */ false);
 
-        pid = fork();
-        assert_se(pid >= 0);
-
-        if (pid == 0) {
+        ASSERT_OK(r = safe_fork("(load-filter)", FORK_LOG | FORK_WAIT, NULL));
+        if (r == 0) {
                 _cleanup_hashmap_free_ Hashmap *s = NULL;
 
                 assert_se(access("/", F_OK) >= 0);
@@ -870,33 +759,22 @@ TEST(load_syscall_filter_set_raw) {
 
                 _exit(EXIT_SUCCESS);
         }
-
-        assert_se(wait_for_terminate_and_check("syscallrawseccomp", pid, WAIT_LOG) == EXIT_SUCCESS);
 }
 
 TEST(native_syscalls_filtered) {
-        pid_t pid;
+        int r;
 
-        if (!is_seccomp_available()) {
-                log_notice("Seccomp not available, skipping %s", __func__);
-                return;
-        }
-        if (!have_seccomp_privs()) {
-                log_notice("Not privileged, skipping %s", __func__);
-                return;
-        }
+        CHECK_SECCOMP(/* skip_container = */ false);
 
-        pid = fork();
-        assert_se(pid >= 0);
-
-        if (pid == 0) {
+        ASSERT_OK(r = safe_fork("(native-syscalls)", FORK_LOG | FORK_WAIT, NULL));
+        if (r == 0) {
                 _cleanup_set_free_ Set *arch_s = NULL;
                 _cleanup_hashmap_free_ Hashmap *s = NULL;
 
                 /* Passing "native" or an empty set is equivalent, just do both here. */
                 assert_se(arch_s = set_new(NULL));
                 assert_se(seccomp_restrict_archs(arch_s) >= 0);
-                assert_se(set_put(arch_s, SCMP_ARCH_NATIVE) >= 0);
+                ASSERT_OK(set_put(arch_s, (void*) SCMP_ARCH_NATIVE));
                 assert_se(seccomp_restrict_archs(arch_s) >= 0);
 
                 assert_se(access("/", F_OK) >= 0);
@@ -928,41 +806,27 @@ TEST(native_syscalls_filtered) {
 
                 _exit(EXIT_SUCCESS);
         }
-
-        assert_se(wait_for_terminate_and_check("nativeseccomp", pid, WAIT_LOG) == EXIT_SUCCESS);
 }
 
 TEST(lock_personality) {
-        unsigned long current;
-        pid_t pid;
+        unsigned long current_opinionated;
+        int r;
 
-        if (!is_seccomp_available()) {
-                log_notice("Seccomp not available, skipping %s", __func__);
-                return;
-        }
-        if (!have_seccomp_privs()) {
-                log_notice("Not privileged, skipping %s", __func__);
-                return;
-        }
+        CHECK_SECCOMP(/* skip_container = */ false);
 
-        assert_se(opinionated_personality(&current) >= 0);
-        /* On ppc64le sanitizers disable ASLR (i.e. by setting ADDR_NO_RANDOMIZE),
-         * which opinionated_personality() doesn't return. Let's tweak the current
-         * personality ourselves in such cases.
-         * See: https://github.com/llvm/llvm-project/commit/78f7a6eaa601bfdd6ae70ffd3da2254c21ff77f9
-         */
-        if (FLAGS_SET(safe_personality(PERSONALITY_INVALID), ADDR_NO_RANDOMIZE))
-                current |= ADDR_NO_RANDOMIZE;
+        assert_se(opinionated_personality(&current_opinionated) >= 0);
 
-        log_info("current personality=0x%lX", current);
+        log_info("current personality=0x%lX", (unsigned long) safe_personality(PERSONALITY_INVALID));
+        log_info("current opinionated personality=0x%lX", current_opinionated);
 
-        pid = fork();
-        assert_se(pid >= 0);
+        ASSERT_OK(r = safe_fork("(lock-personality)", FORK_LOG | FORK_WAIT, NULL));
+        if (r == 0) {
+                unsigned long current;
 
-        if (pid == 0) {
-                assert_se(seccomp_lock_personality(current) >= 0);
+                assert_se(seccomp_lock_personality(current_opinionated) >= 0);
 
-                assert_se((unsigned long) safe_personality(current) == current);
+                current = safe_personality(current_opinionated);
+                assert_se((current & OPINIONATED_PERSONALITY_MASK) == current_opinionated);
 
                 /* Note, we also test that safe_personality() works correctly, by checking whether errno is properly
                  * set, in addition to the return value */
@@ -977,18 +841,17 @@ TEST(lock_personality) {
                 assert_se(safe_personality(PER_LINUX_32BIT) == -EPERM);
                 assert_se(safe_personality(PER_SVR4) == -EPERM);
                 assert_se(safe_personality(PER_BSD) == -EPERM);
-                assert_se(safe_personality(current == PER_LINUX ? PER_LINUX32 : PER_LINUX) == -EPERM);
+                assert_se(safe_personality(current_opinionated == PER_LINUX ? PER_LINUX32 : PER_LINUX) == -EPERM);
                 assert_se(safe_personality(PER_LINUX32_3GB) == -EPERM);
                 assert_se(safe_personality(PER_UW7) == -EPERM);
                 assert_se(safe_personality(0x42) == -EPERM);
 
                 assert_se(safe_personality(PERSONALITY_INVALID) == -EPERM); /* maybe remove this later */
 
-                assert_se((unsigned long) personality(current) == current);
+                current = safe_personality(current_opinionated);
+                assert_se((current & OPINIONATED_PERSONALITY_MASK) == current_opinionated);
                 _exit(EXIT_SUCCESS);
         }
-
-        assert_se(wait_for_terminate_and_check("lockpersonalityseccomp", pid, WAIT_LOG) == EXIT_SUCCESS);
 }
 
 static int real_open(const char *path, int flags, mode_t mode) {
@@ -1003,22 +866,31 @@ static int real_open(const char *path, int flags, mode_t mode) {
 #endif
 }
 
+static int try_fchmodat2(int dirfd, const char *path, mode_t mode, int flags) {
+        int r;
+
+        /* glibc does not provide a direct wrapper for fchmodat2(). Let's hence define our own wrapper for
+         * testing purposes that calls the real syscall, on architectures and in environments where
+         * SYS_fchmodat2 is defined. Otherwise, let's just fall back to the glibc fchmodat() call. */
+
+        /* Not supported by fchmodat() */
+        assert_se(!FLAGS_SET(flags, AT_EMPTY_PATH));
+
+        r = RET_NERRNO(fchmodat2(dirfd, path, mode, flags));
+        if (r != -ENOSYS)
+                return r;
+
+        /* The syscall might still be unsupported by kernel or libseccomp. */
+        return RET_NERRNO(fchmodat(dirfd, path, mode, flags));
+}
+
 TEST(restrict_suid_sgid) {
-        pid_t pid;
+        int r;
 
-        if (!is_seccomp_available()) {
-                log_notice("Seccomp not available, skipping %s", __func__);
-                return;
-        }
-        if (!have_seccomp_privs()) {
-                log_notice("Not privileged, skipping %s", __func__);
-                return;
-        }
+        CHECK_SECCOMP(/* skip_container = */ false);
 
-        pid = fork();
-        assert_se(pid >= 0);
-
-        if (pid == 0) {
+        ASSERT_OK(r = safe_fork("(suid-sgid)", FORK_LOG | FORK_WAIT, NULL));
+        if (r == 0) {
                 char path[] = "/tmp/suidsgidXXXXXX", dir[] = "/tmp/suidsgiddirXXXXXX";
                 int fd = -EBADF, k = -EBADF;
                 const char *z;
@@ -1043,6 +915,11 @@ TEST(restrict_suid_sgid) {
                 assert_se(fchmodat(AT_FDCWD, path, 0755 | S_ISGID, 0) >= 0);
                 assert_se(fchmodat(AT_FDCWD, path, 0755 | S_ISGID | S_ISUID, 0) >= 0);
                 assert_se(fchmodat(AT_FDCWD, path, 0755, 0) >= 0);
+
+                assert_se(try_fchmodat2(AT_FDCWD, path, 0755 | S_ISUID, 0) >= 0);
+                assert_se(try_fchmodat2(AT_FDCWD, path, 0755 | S_ISGID, 0) >= 0);
+                assert_se(try_fchmodat2(AT_FDCWD, path, 0755 | S_ISGID | S_ISUID, 0) >= 0);
+                assert_se(try_fchmodat2(AT_FDCWD, path, 0755, 0) >= 0);
 
                 k = real_open(z, O_CREAT|O_RDWR|O_CLOEXEC|O_EXCL, 0644 | S_ISUID);
                 k = safe_close(k);
@@ -1145,6 +1022,11 @@ TEST(restrict_suid_sgid) {
                 assert_se(fchmodat(AT_FDCWD, path, 0755 | S_ISGID | S_ISUID, 0) < 0 && errno == EPERM);
                 assert_se(fchmodat(AT_FDCWD, path, 0755, 0) >= 0);
 
+                assert_se(try_fchmodat2(AT_FDCWD, path, 0755 | S_ISUID, 0) < 0 && errno == EPERM);
+                assert_se(try_fchmodat2(AT_FDCWD, path, 0755 | S_ISGID, 0) < 0 && errno == EPERM);
+                assert_se(try_fchmodat2(AT_FDCWD, path, 0755 | S_ISGID | S_ISUID, 0) < 0 && errno == EPERM);
+                assert_se(try_fchmodat2(AT_FDCWD, path, 0755, 0) >= 0);
+
                 assert_se(real_open(z, O_CREAT|O_RDWR|O_CLOEXEC|O_EXCL, 0644 | S_ISUID) < 0 && errno == EPERM);
                 assert_se(real_open(z, O_CREAT|O_RDWR|O_CLOEXEC|O_EXCL, 0644 | S_ISGID) < 0 && errno == EPERM);
                 assert_se(real_open(z, O_CREAT|O_RDWR|O_CLOEXEC|O_EXCL, 0644 | S_ISUID | S_ISGID) < 0 && errno == EPERM);
@@ -1195,8 +1077,47 @@ TEST(restrict_suid_sgid) {
 
                 _exit(EXIT_SUCCESS);
         }
+}
 
-        assert_se(wait_for_terminate_and_check("suidsgidseccomp", pid, WAIT_LOG) == EXIT_SUCCESS);
+static void test_seccomp_suppress_sync_child(void) {
+        _cleanup_(unlink_and_freep) char *path = NULL;
+        _cleanup_close_ int fd = -EBADF;
+
+        ASSERT_OK(tempfn_random("/tmp/seccomp_suppress_sync", NULL, &path));
+        ASSERT_OK_ERRNO(fd = open(path, O_RDWR | O_CREAT | O_SYNC | O_CLOEXEC, 0666));
+        fd = safe_close(fd);
+
+        ASSERT_ERROR_ERRNO(fdatasync(-1), EBADF);
+        ASSERT_ERROR_ERRNO(fsync(-1), EBADF);
+        ASSERT_ERROR_ERRNO(syncfs(-1), EBADF);
+
+        ASSERT_ERROR_ERRNO(fdatasync(INT_MAX), EBADF);
+        ASSERT_ERROR_ERRNO(fsync(INT_MAX), EBADF);
+        ASSERT_ERROR_ERRNO(syncfs(INT_MAX), EBADF);
+
+        ASSERT_OK(seccomp_suppress_sync());
+
+        ASSERT_ERROR_ERRNO(fd = open(path, O_RDWR | O_CREAT | O_SYNC | O_CLOEXEC, 0666), EINVAL);
+
+        ASSERT_OK_ERRNO(fdatasync(INT_MAX));
+        ASSERT_OK_ERRNO(fsync(INT_MAX));
+        ASSERT_OK_ERRNO(syncfs(INT_MAX));
+
+        ASSERT_ERROR_ERRNO(fdatasync(-1), EBADF);
+        ASSERT_ERROR_ERRNO(fsync(-1), EBADF);
+        ASSERT_ERROR_ERRNO(syncfs(-1), EBADF);
+}
+
+TEST(seccomp_suppress_sync) {
+        int r;
+
+        CHECK_SECCOMP(/* skip_container = */ false);
+
+        ASSERT_OK(r = safe_fork("(suppress-sync)", FORK_LOG | FORK_WAIT, NULL));
+        if (r == 0) {
+                test_seccomp_suppress_sync_child();
+                _exit(EXIT_SUCCESS);
+        }
 }
 
 DEFINE_TEST_MAIN(LOG_DEBUG);

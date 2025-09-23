@@ -3,7 +3,6 @@
 #include <linux/if_arp.h>
 
 #include "arphrd-util.h"
-#include "string-util.h"
 #include "tests.h"
 
 TEST(arphrd) {
@@ -14,11 +13,11 @@ TEST(arphrd) {
                 if (name) {
                         log_info("%i: %s", i, name);
 
-                        assert_se(arphrd_from_name(name) == i);
+                        ASSERT_EQ(arphrd_from_name(name), i);
                 }
         }
 
-        assert_se(arphrd_to_name(ARPHRD_VOID + 1) == NULL);
+        ASSERT_NULL(arphrd_to_name(ARPHRD_VOID + 1));
         assert_se(arphrd_from_name("huddlduddl") == -EINVAL);
         assert_se(arphrd_from_name("") == -EINVAL);
 }

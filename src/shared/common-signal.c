@@ -1,20 +1,32 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
+#include <malloc.h>
+#include <sys/signalfd.h>
+
+#include "sd-event.h"
+
+#include "alloc-util.h"
 #include "common-signal.h"
-#include "fd-util.h"
-#include "fileio.h"
+#include "format-util.h"
+#include "log.h"
+#include "memstream-util.h"
 #include "process-util.h"
 #include "signal-util.h"
+#include "string-util.h"
 
 int sigrtmin18_handler(sd_event_source *s, const struct signalfd_siginfo *si, void *userdata) {
         struct sigrtmin18_info *info = userdata;
         _cleanup_free_ char *comm = NULL;
-        int r;
 
         assert(s);
         assert(si);
 
-        (void) get_process_comm(si->ssi_pid, &comm);
+        if (!si_code_from_process(si->ssi_code)) {
+                log_notice("Received control signal %s with unexpected .si_code %i, ignoring.", signal_to_string(si->ssi_signo), si->ssi_code);
+                return 0;
+        }
+
+        (void) pid_get_comm(si->ssi_pid, &comm);
 
         if (si->ssi_code != SI_QUEUE) {
                 log_notice("Received control signal %s from process " PID_FMT " (%s) without command value, ignoring.",
@@ -57,11 +69,10 @@ int sigrtmin18_handler(sd_event_source *s, const struct signalfd_siginfo *si, vo
                 break;
 
         case COMMON_SIGNAL_COMMAND_MALLOC_INFO: {
-                _cleanup_free_ char *data = NULL;
-                _cleanup_fclose_ FILE *f = NULL;
-                size_t sz;
+                _cleanup_(memstream_done) MemStream m = {};
+                FILE *f;
 
-                f = open_memstream_unlocked(&data, &sz);
+                f = memstream_init(&m);
                 if (!f) {
                         log_oom();
                         break;
@@ -72,22 +83,13 @@ int sigrtmin18_handler(sd_event_source *s, const struct signalfd_siginfo *si, vo
                         break;
                 }
 
-                fputc(0, f);
-
-                r = fflush_and_check(f);
-                if (r < 0) {
-                        log_error_errno(r, "Failed to flush malloc_info() buffer: %m");
-                        break;
-                }
-
-                log_dump(LOG_INFO, data);
+                (void) memstream_dump(LOG_INFO, &m);
                 break;
         }
 
         default:
                 log_notice("Received control signal %s with unknown command 0x%08x, ignoring.",
                            signal_to_string(si->ssi_signo), (unsigned) si->ssi_int);
-                break;
         }
 
         return 0;

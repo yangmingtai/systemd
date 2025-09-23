@@ -1,9 +1,7 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <errno.h>
 #include <getopt.h>
 #include <stdio.h>
-#include <unistd.h>
 
 #include "sd-device.h"
 
@@ -11,11 +9,12 @@
 #include "build.h"
 #include "cgroup-util.h"
 #include "conf-parser.h"
-#include "devnum-util.h"
 #include "device-util.h"
+#include "devnum-util.h"
 #include "main-func.h"
-#include "path-util.h"
-#include "pretty-print.h"
+#include "string-util.h"
+#include "strv.h"
+#include "udev-util.h"
 #include "verbs.h"
 
 static char *arg_target_solution = NULL;
@@ -248,14 +247,10 @@ static int query_solutions_for_path(const char *path) {
         if (r < 0)
                 return log_error_errno(r, "Error looking up device: %m");
 
-        r = sd_device_get_property_value(device, "ID_MODEL_FROM_DATABASE", &model_name);
+        r = device_get_model_string(device, &model_name);
         if (r == -ENOENT) {
-                log_device_debug(device, "Missing ID_MODEL_FROM_DATABASE property, trying ID_MODEL");
-                r = sd_device_get_property_value(device, "ID_MODEL", &model_name);
-                if (r == -ENOENT) {
-                        log_device_info(device, "Device model not found");
-                        return 0;
-                }
+                log_device_info(device, "Device model not found");
+                return 0;
         }
         if (r < 0)
                 return log_device_error_errno(device, r, "Model name for device %s is unknown", path);

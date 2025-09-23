@@ -6,9 +6,9 @@ subdir('rules')
 want_man = get_option('man')
 want_html = get_option('html')
 xsltproc = find_program('xsltproc',
-                        required : want_man == 'true' or want_html == 'true')
-want_man = want_man != 'false' and xsltproc.found()
-want_html = want_html != 'false' and xsltproc.found()
+                        required : want_man.enabled() or want_html.enabled())
+want_man = want_man.allowed() and xsltproc.found()
+want_html = want_html.allowed() and xsltproc.found()
 
 xsltproc_flags = [
         '--nonet',
@@ -20,17 +20,21 @@ xsltproc_flags = [
         '--stringparam', 'man.copyright.section.enabled', '0',
         '--stringparam', 'systemd.version', '@0@'.format(meson.project_version()),
         '--path',
-        '@0@:@1@'.format(meson.current_build_dir(), meson.current_source_dir())]
+        '@0@:@1@:@2@:@3@'.format(meson.current_build_dir(),
+                             meson.current_source_dir(),
+                             libshared_build_dir,
+                             libcore_build_dir)]
 
 custom_man_xsl = files('custom-man.xsl')
 custom_html_xsl = files('custom-html.xsl')
 xslt_cmd = [xsltproc, '-o', '@OUTPUT0@'] + xsltproc_flags
 
 custom_entities_ent = custom_target(
-        'custom-entities.ent',
         input : 'custom-entities.ent.in',
         output : 'custom-entities.ent',
         command : [jinja2_cmdline, '@INPUT@', '@OUTPUT@'])
+
+man_page_depends += custom_entities_ent
 
 man_pages = []
 html_pages = []
@@ -55,7 +59,15 @@ foreach tuple : manpages
 
         mandirn = get_option('mandir') / ('man' + section)
 
-        if condition == '' or conf.get(condition) == 1
+        have = true
+        foreach word : condition.split()
+                if conf.get(word) != 1
+                        have = false
+                        break
+                endif
+        endforeach
+
+        if have
                 file = files(tuple[0] + '.xml')
                 source_xml_files += file
                 if tuple[0].startswith('org.freedesktop.')
@@ -64,11 +76,10 @@ foreach tuple : manpages
 
                 if xsltproc.found()
                         p1 = custom_target(
-                                man,
                                 input : xml,
                                 output : [man] + manaliases,
                                 command : xslt_cmd + [custom_man_xsl, '@INPUT@'],
-                                depends : custom_entities_ent,
+                                depends : man_page_depends,
                                 install : want_man,
                                 install_dir : mandirn)
                         man_pages += p1
@@ -76,24 +87,22 @@ foreach tuple : manpages
                         p2 = []
                         foreach htmlalias : htmlaliases
                                 link = custom_target(
-                                        htmlalias,
                                         output : htmlalias,
                                         command : [ln, '-fs', html, '@OUTPUT@'])
                                 if want_html
-                                        dst = docdir / 'html' / htmlalias
-                                        cmd = 'ln -fs @0@ $DESTDIR@1@'.format(html, dst)
-                                        meson.add_install_script('sh', '-c', cmd)
+                                        install_symlink(htmlalias,
+                                                        pointing_to : html,
+                                                        install_dir : docdir / 'html')
                                         p2 += link
                                 endif
                                 html_pages += link
                         endforeach
 
                         p3 = custom_target(
-                                html,
                                 input : xml,
                                 output : html,
                                 command : xslt_cmd + [custom_html_xsl, '@INPUT@'],
-                                depends : [custom_entities_ent, p2],
+                                depends : [man_page_depends, p2],
                                 install : want_html,
                                 install_dir : docdir / 'html')
                         html_pages += p3
@@ -111,21 +120,19 @@ if not have_lxml
 endif
 
 systemd_directives_xml = custom_target(
-        'systemd.directives.xml',
         input : ['directives-template.xml', source_xml_files],
         output : 'systemd.directives.xml',
-        depends : custom_entities_ent,
+        depends : man_page_depends,
         command : [make_directive_index_py, '@OUTPUT@', '@INPUT@'])
 
 nonindex_xml_files = source_xml_files + [systemd_directives_xml]
 systemd_index_xml = custom_target(
-        'systemd.index.xml',
         input : nonindex_xml_files,
         output : 'systemd.index.xml',
         command : [make_man_index_py, '@OUTPUT@'] + nonindex_xml_files)
 
-foreach tuple : xsltproc.found() ? [['systemd.directives', '7', systemd_directives_xml],
-                                    ['systemd.index',      '7', systemd_index_xml]] : []
+foreach tuple : xsltproc.found() and have_lxml ? [['systemd.directives', '7', systemd_directives_xml],
+                                                  ['systemd.index',      '7', systemd_index_xml]] : []
         stem = tuple[0]
         section = tuple[1]
         xml = tuple[2]
@@ -136,11 +143,10 @@ foreach tuple : xsltproc.found() ? [['systemd.directives', '7', systemd_directiv
         mandirn = get_option('mandir') / ('man' + section)
 
         p1 = custom_target(
-                man,
                 input : xml,
                 output : man,
                 command : xslt_cmd + [custom_man_xsl, '@INPUT@'],
-                install : want_man and have_lxml,
+                install : want_man,
                 install_dir : mandirn)
         man_pages += p1
 
@@ -148,26 +154,24 @@ foreach tuple : xsltproc.found() ? [['systemd.directives', '7', systemd_directiv
         if html == 'systemd.index.html'
                 htmlalias = 'index.html'
                 link = custom_target(
-                        htmlalias,
                         input : p2,
                         output : htmlalias,
                         command : [ln, '-fs', html, '@OUTPUT@'])
                 if want_html
-                        dst = docdir / 'html' / htmlalias
-                        cmd = 'ln -fs @0@ $DESTDIR@1@'.format(html, dst)
-                        meson.add_install_script('sh', '-c', cmd)
+                        install_symlink(htmlalias,
+                                        pointing_to : html,
+                                        install_dir : docdir / 'html')
                         p2 += link
                 endif
                 html_pages += link
         endif
 
         p3 = custom_target(
-                html,
                 input : xml,
                 output : html,
                 command : xslt_cmd + [custom_html_xsl, '@INPUT@'],
-                depends : [custom_entities_ent, p2],
-                install : want_html and have_lxml,
+                depends : [man_page_depends, p2],
+                install : want_html,
                 install_dir : docdir / 'html')
         html_pages += p3
 endforeach
@@ -175,13 +179,11 @@ endforeach
 # Cannot use run_target because those targets are used in depends
 # Also see https://github.com/mesonbuild/meson/issues/368.
 man = custom_target(
-        'man',
         output : 'man',
         depends : man_pages,
         command : [echo])
 
 html = custom_target(
-        'html',
         output : 'html',
         depends : html_pages,
         command : [echo])
@@ -190,12 +192,9 @@ if rsync.found()
         run_target(
                 'doc-sync',
                 depends : man_pages + html_pages,
-                command : [rsync, '-rlv',
-                           '--delete-excluded',
-                           '--include=man',
-                           '--include=*.html',
-                           '--exclude=*',
-                           '--omit-dir-times',
+                command : [sync_docs_py,
+                           '--version',
+                           '@0@'.format(meson.project_version()),
                            meson.current_build_dir(),
                            get_option('www-target')])
 endif
@@ -203,7 +202,7 @@ endif
 ############################################################
 
 buildroot_substs = configuration_data()
-buildroot_substs.set_quoted('BUILD_ROOT', project_build_root)
+buildroot_substs.set_quoted('BUILD_ROOT', meson.project_build_root())
 
 configure_file(
         input : 'man.in',
@@ -220,21 +219,115 @@ configure_file(
 update_dbus_docs = custom_target(
         'update-dbus-docs-impl',
         output : 'update-dbus-docs',
-        command : [update_dbus_docs_py, '--build-dir', project_build_root, '@INPUT@'],
-        input : dbus_docs)
+        command : [update_dbus_docs_py, '--build-dir', meson.project_build_root(), '@INPUT@'],
+        input : dbus_docs,
+        depends : dbus_programs)
 
 if conf.get('BUILD_MODE_DEVELOPER') == 1
         test('dbus-docs-fresh',
              update_dbus_docs_py,
-             suite : 'dist-check',
-             args : ['--build-dir', project_build_root, '--test', dbus_docs],
+             suite : 'dist',
+             args : ['--build-dir', meson.project_build_root(), '--test', dbus_docs],
              depends : dbus_programs)
+
+        test('check-version-history',
+             check_version_history_py,
+             suite : 'dist',
+             args : source_xml_files)
 endif
 
 update_man_rules = custom_target(
         'update-man-rules-impl',
         output : 'update-man-rules',
         command : [update_man_rules_py,
-                   '@0@/man/*.xml'.format(project_source_root),
+                   '@0@/man/*.xml'.format(meson.project_source_root()),
                    '@0@/rules/meson.build'.format(meson.current_source_dir())],
-        depends : custom_entities_ent)
+        depends : man_page_depends)
+
+############################################################
+
+simple_examples = files(
+        'event-quick-child.c',
+        'hwdb-usb-device.c',
+        'id128-app-specific.c',
+        'inotify-watch-tmp.c',
+        'journal-enumerate-fields.c',
+        'journal-iterate-foreach.c',
+        'journal-iterate-poll.c',
+        'journal-iterate-unique.c',
+        'journal-iterate-wait.c',
+        'journal-stream-fd.c',
+        'logcontrol-example.c',
+        'notify-selfcontained-example.c',
+        'path-documents.c',
+        'print-unit-path-call-method.c',
+        'print-unit-path.c',
+        'sd-bus-container-append.c',
+        'sd-bus-container-read.c',
+        'sd_bus_error-example.c',
+        'sd_bus_service_reconnect.c',
+        'sd_device_enumerator_add_match_parent-example.c',
+        'sd_device_enumerator_new-example.c',
+        'send-unit-files-changed.c',
+        'vtable-example.c',
+)
+
+examples = []
+foreach example : simple_examples
+        examples += [ { 'file' : example } ]
+endforeach
+
+if conf.get('HAVE_GLIB') == 1
+        examples += [
+                {
+                        'file' : files('glib-event-glue.c'),
+                        'opts' : [
+                                '-I', libglib.get_variable('includedir') / 'glib-2.0',
+                                '-I', libglib.get_variable('libdir') / 'glib-2.0/include',
+                        ],
+                },
+        ]
+endif
+
+default_args = [
+        cc.cmd_array(),
+        '-c',
+        '-x', 'c',
+        '-pedantic',
+        '-Wall',
+        '-Werror',
+        '-Wextra',
+        '-Wno-unused-parameter',
+        '-o', '/dev/null',
+        '-I', meson.current_source_dir() / '../src',
+]
+
+std_args_in = [
+        [ '-std=c90', '-Wno-pedantic', '-Wno-variadic-macros', ],
+        [ '-std=c99', ],
+        [ '-std=c11', ],
+        [ '-std=c17', ],
+        [ '-std=c23', ],
+        [ '-std=gnu90', '-Wno-pedantic', '-Wno-variadic-macros', ],
+        [ '-std=gnu99', ],
+        [ '-std=gnu11', ],
+        [ '-std=gnu17', ],
+        [ '-std=gnu23', ],
+]
+
+std_args = []
+foreach std : std_args_in
+        if cc.has_argument(std[0])
+                std_args += [std]
+        endif
+endforeach
+
+foreach item : examples
+        foreach std : std_args
+                file = item.get('file')
+                test('cc-' + fs.stem(file) + '-' + std[0].split('=')[1],
+                     env,
+                     suite : 'example',
+                     args : default_args + std + item.get('opts', []) + [file])
+        endforeach
+endforeach

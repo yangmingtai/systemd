@@ -1,12 +1,22 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
+#include "sd-bus.h"
+
+#include "alloc-util.h"
 #include "bus-error.h"
 #include "bus-locator.h"
+#include "bus-unit-util.h"
+#include "bus-util.h"
+#include "install.h"
+#include "log.h"
 #include "proc-cmdline.h"
+#include "string-util.h"
+#include "systemctl.h"
 #include "systemctl-daemon-reload.h"
 #include "systemctl-set-default.h"
 #include "systemctl-util.h"
-#include "systemctl.h"
+#include "unit-file.h"
+#include "unit-name.h"
 
 static int parse_proc_cmdline_item(const char *key, const char *value, void *data) {
         char **ret = data;
@@ -31,7 +41,7 @@ static int parse_proc_cmdline_item(const char *key, const char *value, void *dat
 
 static void emit_cmdline_warning(void) {
         if (arg_quiet || arg_root)
-                /* don't bother checking the commandline if we're operating on a container */
+                /* don't bother checking the command line if we're operating on a container */
                 return;
 
         _cleanup_free_ char *override = NULL;
@@ -41,7 +51,7 @@ static void emit_cmdline_warning(void) {
         if (r < 0)
                 log_debug_errno(r, "Failed to parse kernel command line, ignoring: %m");
         if (override)
-                log_notice("Note: found \"%s\" on the kernel commandline, which overrides the default unit.",
+                log_notice("Note: found \"%s\" on the kernel command line, which overrides the default unit.",
                            override);
 }
 

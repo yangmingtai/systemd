@@ -5,6 +5,7 @@
 #include "fd-util.h"
 #include "log.h"
 #include "main-func.h"
+#include "tests.h"
 
 static char *arg_root = NULL;
 static int arg_flags = 0;
@@ -24,6 +25,7 @@ static int parse_argv(int argc, char *argv[]) {
                 { "prefix-root",         no_argument,       NULL, CHASE_PREFIX_ROOT       },
                 { "nonexistent",         no_argument,       NULL, CHASE_NONEXISTENT       },
                 { "no_autofs",           no_argument,       NULL, CHASE_NO_AUTOFS         },
+                { "trigger-autofs",      no_argument,       NULL, CHASE_TRIGGER_AUTOFS    },
                 { "safe",                no_argument,       NULL, CHASE_SAFE              },
                 { "trail-slash",         no_argument,       NULL, CHASE_TRAIL_SLASH       },
                 { "step",                no_argument,       NULL, CHASE_STEP              },
@@ -45,8 +47,8 @@ static int parse_argv(int argc, char *argv[]) {
                                "  %s [OPTION...] path...\n"
                                "Options:\n"
                                , argv[0]);
-                        for (size_t i = 0; i < ELEMENTSOF(options) - 1; i++)
-                                printf("  --%s\n", options[i].name);
+                        FOREACH_ARRAY(option, options, ELEMENTSOF(options) - 1)
+                                printf("  --%s\n", option->name);
                         return 0;
 
                 case ARG_ROOT:
@@ -60,6 +62,7 @@ static int parse_argv(int argc, char *argv[]) {
                 case CHASE_PREFIX_ROOT:
                 case CHASE_NONEXISTENT:
                 case CHASE_NO_AUTOFS:
+                case CHASE_TRIGGER_AUTOFS:
                 case CHASE_SAFE:
                 case CHASE_TRAIL_SLASH:
                 case CHASE_STEP:
@@ -84,7 +87,7 @@ static int parse_argv(int argc, char *argv[]) {
 static int run(int argc, char **argv) {
         int r;
 
-        log_setup();
+        test_setup_logging(LOG_DEBUG);
 
         r = parse_argv(argc, argv);
         if (r <= 0)

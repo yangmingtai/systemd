@@ -9,7 +9,7 @@
  * increase it at the slightly cost of lengthen test-duration on other machines.
  */
 
-#include <stdio.h>
+#include <stdlib.h>
 #include <sys/time.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -30,13 +30,7 @@ static void set_alarm(usec_t usecs) {
         struct itimerval v = { };
 
         timeval_store(&v.it_value, usecs);
-        assert_se(setitimer(ITIMER_REAL, &v, NULL) >= 0);
-}
-
-static void sleep_for(usec_t usecs) {
-        /* stupid usleep() might fail if >1000000 */
-        assert_se(usecs < USEC_PER_SEC);
-        usleep(usecs);
+        ASSERT_OK(setitimer(ITIMER_REAL, &v, NULL));
 }
 
 #define TEST_BARRIER(_FUNCTION, _CHILD_CODE, _WAIT_CHILD, _PARENT_CODE, _WAIT_PARENT)  \
@@ -44,14 +38,14 @@ static void sleep_for(usec_t usecs) {
                 Barrier b = BARRIER_NULL;                               \
                 pid_t pid1, pid2;                                       \
                                                                         \
-                assert_se(barrier_create(&b) >= 0);                     \
-                assert_se(b.me > 0);                                    \
-                assert_se(b.them > 0);                                  \
-                assert_se(b.pipe[0] > 0);                               \
-                assert_se(b.pipe[1] > 0);                               \
+                ASSERT_OK(barrier_create(&b));                          \
+                ASSERT_GT(b.me, 0);                                     \
+                ASSERT_GT(b.them, 0);                                   \
+                ASSERT_GT(b.pipe[0], 0);                                \
+                ASSERT_GT(b.pipe[1], 0);                                \
                                                                         \
                 pid1 = fork();                                          \
-                assert_se(pid1 >= 0);                                   \
+                ASSERT_OK(pid1);                                        \
                 if (pid1 == 0) {                                        \
                         barrier_set_role(&b, BARRIER_CHILD);            \
                         { _CHILD_CODE; }                                \
@@ -59,7 +53,7 @@ static void sleep_for(usec_t usecs) {
                 }                                                       \
                                                                         \
                 pid2 = fork();                                          \
-                assert_se(pid2 >= 0);                                   \
+                ASSERT_OK(pid2);                                        \
                 if (pid2 == 0) {                                        \
                         barrier_set_role(&b, BARRIER_PARENT);           \
                         { _PARENT_CODE; }                               \
@@ -77,16 +71,16 @@ static void sleep_for(usec_t usecs) {
                 ({                                                      \
                         int pidr, status;                               \
                         pidr = waitpid(_pid, &status, 0);               \
-                        assert_se(pidr == _pid);                        \
+                        ASSERT_EQ(pidr, _pid);                          \
                         assert_se(WIFEXITED(status));                   \
-                        assert_se(WEXITSTATUS(status) == 42);           \
+                        ASSERT_EQ(WEXITSTATUS(status), 42);             \
                 })
 
 #define TEST_BARRIER_WAIT_ALARM(_pid) \
                 ({                                                      \
                         int pidr, status;                               \
                         pidr = waitpid(_pid, &status, 0);               \
-                        assert_se(pidr == _pid);                        \
+                        ASSERT_EQ(pidr, _pid);                          \
                         assert_se(WIFSIGNALED(status));                 \
                         assert_se(WTERMSIG(status) == SIGALRM);         \
                 })
@@ -94,9 +88,9 @@ static void sleep_for(usec_t usecs) {
 /*
  * Test basic sync points
  * This places a barrier in both processes and waits synchronously for them.
- * The timeout makes sure the sync works as expected. The sleep_for() on one side
+ * The timeout makes sure the sync works as expected. The usleep_safe() on one side
  * makes sure the exit of the parent does not overwrite previous barriers. Due
- * to the sleep_for(), we know that the parent already exited, thus there's a
+ * to the usleep_safe(), we know that the parent already exited, thus there's a
  * pending HUP on the pipe. However, the barrier_sync() prefers reads on the
  * eventfd, thus we can safely wait on the barrier.
  */
@@ -104,7 +98,7 @@ TEST_BARRIER(barrier_sync,
         ({
                 set_alarm(BASE_TIME * 10);
                 assert_se(barrier_place(&b));
-                sleep_for(BASE_TIME * 2);
+                usleep_safe(BASE_TIME * 2);
                 assert_se(barrier_sync(&b));
         }),
         TEST_BARRIER_WAIT_SUCCESS(pid1),
@@ -124,7 +118,7 @@ TEST_BARRIER(barrier_sync,
  */
 TEST_BARRIER(barrier_wait_next,
         ({
-                sleep_for(BASE_TIME);
+                usleep_safe(BASE_TIME);
                 set_alarm(BASE_TIME * 10);
                 assert_se(barrier_wait_next(&b));
                 assert_se(barrier_place(&b));
@@ -150,7 +144,7 @@ TEST_BARRIER(barrier_wait_next,
  */
 TEST_BARRIER(barrier_wait_next_twice,
         ({
-                sleep_for(BASE_TIME);
+                usleep_safe(BASE_TIME);
                 set_alarm(BASE_TIME);
                 assert_se(barrier_wait_next(&b));
                 assert_se(barrier_wait_next(&b));
@@ -161,7 +155,7 @@ TEST_BARRIER(barrier_wait_next_twice,
                 set_alarm(BASE_TIME * 10);
                 assert_se(barrier_place(&b));
                 assert_se(barrier_place(&b));
-                sleep_for(BASE_TIME * 4);
+                usleep_safe(BASE_TIME * 4);
         }),
         TEST_BARRIER_WAIT_SUCCESS(pid2));
 
@@ -173,7 +167,7 @@ TEST_BARRIER(barrier_wait_next_twice,
  */
 TEST_BARRIER(barrier_wait_next_twice_local,
         ({
-                sleep_for(BASE_TIME);
+                usleep_safe(BASE_TIME);
                 set_alarm(BASE_TIME);
                 assert_se(barrier_wait_next(&b));
                 assert_se(barrier_place(&b));
@@ -186,7 +180,7 @@ TEST_BARRIER(barrier_wait_next_twice_local,
                 set_alarm(BASE_TIME * 10);
                 assert_se(barrier_place(&b));
                 assert_se(barrier_place(&b));
-                sleep_for(BASE_TIME * 4);
+                usleep_safe(BASE_TIME * 4);
         }),
         TEST_BARRIER_WAIT_SUCCESS(pid2));
 
@@ -198,7 +192,7 @@ TEST_BARRIER(barrier_wait_next_twice_local,
  */
 TEST_BARRIER(barrier_wait_next_twice_sync,
         ({
-                sleep_for(BASE_TIME);
+                usleep_safe(BASE_TIME);
                 set_alarm(BASE_TIME);
                 assert_se(barrier_wait_next(&b));
                 assert_se(barrier_sync_next(&b));
@@ -219,7 +213,7 @@ TEST_BARRIER(barrier_wait_next_twice_sync,
  */
 TEST_BARRIER(barrier_wait_next_twice_local_sync,
         ({
-                sleep_for(BASE_TIME);
+                usleep_safe(BASE_TIME);
                 set_alarm(BASE_TIME);
                 assert_se(barrier_wait_next(&b));
                 assert_se(barrier_place(&b));
@@ -253,7 +247,7 @@ TEST_BARRIER(barrier_sync_next,
         TEST_BARRIER_WAIT_SUCCESS(pid1),
         ({
                 set_alarm(BASE_TIME * 10);
-                sleep_for(BASE_TIME);
+                usleep_safe(BASE_TIME);
                 assert_se(barrier_place(&b));
                 assert_se(barrier_place(&b));
                 assert_se(barrier_sync(&b));
@@ -274,7 +268,7 @@ TEST_BARRIER(barrier_sync_next_local,
         }),
         TEST_BARRIER_WAIT_ALARM(pid1),
         ({
-                sleep_for(BASE_TIME * 2);
+                usleep_safe(BASE_TIME * 2);
         }),
         TEST_BARRIER_WAIT_SUCCESS(pid2));
 
@@ -323,7 +317,7 @@ TEST_BARRIER(barrier_wait_abortion_unmatched,
         }),
         TEST_BARRIER_WAIT_ALARM(pid1),
         ({
-                sleep_for(BASE_TIME * 2);
+                usleep_safe(BASE_TIME * 2);
         }),
         TEST_BARRIER_WAIT_SUCCESS(pid2));
 
@@ -356,7 +350,7 @@ TEST_BARRIER(barrier_wait_abortion_local_unmatched,
         }),
         TEST_BARRIER_WAIT_ALARM(pid1),
         ({
-                sleep_for(BASE_TIME * 2);
+                usleep_safe(BASE_TIME * 2);
         }),
         TEST_BARRIER_WAIT_SUCCESS(pid2));
 
@@ -379,12 +373,12 @@ TEST_BARRIER(barrier_exit,
 /*
  * Test child exit with sleep
  * Same as test_barrier_exit but verifies the test really works due to the
- * child-exit. We add a usleep() which triggers the alarm in the parent and
+ * child-exit. We add a usleep_safe() which triggers the alarm in the parent and
  * causes the test to time out.
  */
 TEST_BARRIER(barrier_no_exit,
         ({
-                sleep_for(BASE_TIME * 2);
+                usleep_safe(BASE_TIME * 2);
         }),
         TEST_BARRIER_WAIT_SUCCESS(pid1),
         ({
@@ -407,7 +401,7 @@ TEST_BARRIER(barrier_no_exit,
 TEST_BARRIER(barrier_pending_exit,
         ({
                 set_alarm(BASE_TIME * 4);
-                sleep_for(BASE_TIME * 2);
+                usleep_safe(BASE_TIME * 2);
                 assert_se(barrier_wait_next(&b));
                 assert_se(barrier_sync_next(&b));
                 assert_se(barrier_place(&b));
@@ -420,7 +414,6 @@ TEST_BARRIER(barrier_pending_exit,
                 assert_se(barrier_place(&b));
         }),
         TEST_BARRIER_WAIT_SUCCESS(pid2));
-
 
 static int intro(void) {
         if (!slow_tests_enabled())
@@ -435,7 +428,7 @@ static int intro(void) {
          */
 
         Virtualization v = detect_virtualization();
-        if (v < 0 && ERRNO_IS_PRIVILEGE(v))
+        if (ERRNO_IS_NEG_PRIVILEGE(v))
                 return log_tests_skipped("Cannot detect virtualization");
 
         if (v != VIRTUALIZATION_NONE)

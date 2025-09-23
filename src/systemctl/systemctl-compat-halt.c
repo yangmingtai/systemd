@@ -1,21 +1,19 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <getopt.h>
-#include <unistd.h>
 
 #include "sd-daemon.h"
 
 #include "alloc-util.h"
+#include "log.h"
 #include "pretty-print.h"
 #include "process-util.h"
 #include "reboot-util.h"
+#include "systemctl.h"
 #include "systemctl-compat-halt.h"
-#include "systemctl-compat-telinit.h"
 #include "systemctl-logind.h"
 #include "systemctl-start-unit.h"
 #include "systemctl-util.h"
-#include "systemctl.h"
-#include "terminal-util.h"
 #include "utmp-wtmp.h"
 
 static int halt_help(void) {
@@ -25,6 +23,11 @@ static int halt_help(void) {
         r = terminal_urlify_man("halt", "8", &link);
         if (r < 0)
                 return log_oom();
+
+        /* Note: if you are tempted to add new command line switches here, please do not. Let this
+         * compatibility command rest in peace. Its interface is not even owned by us as much as it is by
+         * sysvinit. If you add something new, add it to "systemctl halt", "systemctl reboot", "systemctl
+         * poweroff" instead. */
 
         printf("%s [OPTIONS...]%s\n"
                "\n%s%s the system.%s\n"
@@ -37,14 +40,16 @@ static int halt_help(void) {
                "  -w --wtmp-only Don't halt/power-off/reboot, just write wtmp record\n"
                "  -d --no-wtmp   Don't write wtmp record\n"
                "     --no-wall   Don't send wall message before halt/power-off/reboot\n"
+               "\n%sThis is a compatibility interface, please use the more powerful 'systemctl %s' command instead.%s\n"
                "\nSee the %s for details.\n",
                program_invocation_short_name,
                arg_action == ACTION_REBOOT ? " [ARG]" : "",
-               ansi_highlight(),
-               arg_action == ACTION_REBOOT           ? "Reboot" :
-                       arg_action == ACTION_POWEROFF ? "Power off" :
-                                                       "Halt",
-               ansi_normal(),
+               ansi_highlight(), arg_action == ACTION_REBOOT   ? "Reboot" :
+                                 arg_action == ACTION_POWEROFF ? "Power off" :
+                                                                 "Halt", ansi_normal(),
+               ansi_highlight_red(), arg_action == ACTION_REBOOT   ? "reboot" :
+                                     arg_action == ACTION_POWEROFF ? "poweroff" :
+                                                                     "halt", ansi_normal(),
                link);
 
         return 0;
@@ -71,15 +76,10 @@ int halt_parse_argv(int argc, char *argv[]) {
                 {}
         };
 
-        int c, r, runlevel;
+        int c, r;
 
         assert(argc >= 0);
         assert(argv);
-
-        /* called in sysvinit system as last command in shutdown/reboot so this is always forceful */
-        if (utmp_get_runlevel(&runlevel, NULL) >= 0)
-                if (IN_SET(runlevel, '0', '6'))
-                        arg_force = 2;
 
         while ((c = getopt_long(argc, argv, "pfwdnih", options, NULL)) >= 0)
                 switch (c) {
@@ -170,13 +170,12 @@ int halt_main(void) {
                 arg_no_block = true;
 
                 if (!arg_dry_run)
-                        return start_with_fallback();
+                        return verb_start(0, NULL, NULL);
         }
 
-        if (geteuid() != 0) {
-                (void) must_be_root();
-                return -EPERM;
-        }
+        r = must_be_root();
+        if (r < 0)
+                return r;
 
         if (!arg_no_wtmp) {
                 if (sd_booted() > 0)

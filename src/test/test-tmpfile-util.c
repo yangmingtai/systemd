@@ -1,6 +1,10 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
+#include <stdlib.h>
+#include <unistd.h>
+
 #include "alloc-util.h"
+#include "argv-util.h"
 #include "errno-util.h"
 #include "fd-util.h"
 #include "fileio.h"
@@ -105,7 +109,7 @@ static void test_tempfn_xxxxxx_one(const char *p, const char *extra, const char 
                 const char *suffix;
 
                 assert_se(suffix = startswith(s, expect));
-                assert_se(streq(suffix, "XXXXXX"));
+                ASSERT_STREQ(suffix, "XXXXXX");
         }
         assert_se(ret == r);
 }
@@ -278,12 +282,12 @@ TEST(link_tmpfile) {
         assert_se(write(fd, "foobar\n", 7) == 7);
 
         assert_se(touch(d) >= 0);
-        assert_se(link_tmpfile(fd, tmp, d, /* replace= */ false) == -EEXIST);
+        assert_se(link_tmpfile(fd, tmp, d, /* flags= */ 0) == -EEXIST);
         assert_se(unlink(d) >= 0);
-        assert_se(link_tmpfile(fd, tmp, d, /* replace= */ false) >= 0);
+        assert_se(link_tmpfile(fd, tmp, d, /* flags= */ 0) >= 0);
 
         assert_se(read_one_line_file(d, &line) >= 0);
-        assert_se(streq(line, "foobar"));
+        ASSERT_STREQ(line, "foobar");
 
         fd = safe_close(fd);
         tmp = mfree(tmp);
@@ -293,12 +297,12 @@ TEST(link_tmpfile) {
 
         assert_se(write(fd, "waumiau\n", 8) == 8);
 
-        assert_se(link_tmpfile(fd, tmp, d, /* replace= */ false) == -EEXIST);
-        assert_se(link_tmpfile(fd, tmp, d, /* replace= */ true) >= 0);
+        assert_se(link_tmpfile(fd, tmp, d, /* flags= */ 0) == -EEXIST);
+        assert_se(link_tmpfile(fd, tmp, d, LINK_TMPFILE_REPLACE) >= 0);
 
         line = mfree(line);
         assert_se(read_one_line_file(d, &line) >= 0);
-        assert_se(streq(line, "waumiau"));
+        ASSERT_STREQ(line, "waumiau");
 
         assert_se(unlink(d) >= 0);
 }

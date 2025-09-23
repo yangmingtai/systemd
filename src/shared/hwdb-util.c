@@ -3,15 +3,18 @@
 #include <ctype.h>
 #include <stdio.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 #include "alloc-util.h"
 #include "conf-files.h"
+#include "errno-util.h"
 #include "fd-util.h"
 #include "fileio.h"
 #include "fs-util.h"
 #include "hwdb-internal.h"
 #include "hwdb-util.h"
-#include "label.h"
+#include "label-util.h"
+#include "log.h"
 #include "mkdir-label.h"
 #include "nulstr-util.h"
 #include "path-util.h"
@@ -19,7 +22,9 @@
 #include "strbuf.h"
 #include "string-util.h"
 #include "strv.h"
+#include "time-util.h"
 #include "tmpfile-util.h"
+#include "verbs.h"
 
 static const char* const conf_file_dirs[] = {
         "/etc/udev/hwdb.d",
@@ -75,18 +80,15 @@ static int trie_children_cmp(const struct trie_child_entry *a, const struct trie
 }
 
 static int node_add_child(struct trie *trie, struct trie_node *node, struct trie_node *node_child, uint8_t c) {
-        struct trie_child_entry *child;
-
         /* extend array, add new entry, sort for bisection */
-        child = reallocarray(node->children, node->children_count + 1, sizeof(struct trie_child_entry));
-        if (!child)
+        if (!GREEDY_REALLOC(node->children, node->children_count + 1))
                 return -ENOMEM;
 
-        node->children = child;
         trie->children_count++;
-        node->children[node->children_count].c = c;
-        node->children[node->children_count].child = node_child;
-        node->children_count++;
+        node->children[node->children_count++] = (struct trie_child_entry) {
+                .c = c,
+                .child = node_child,
+        };
         typesafe_qsort(node->children, node->children_count, trie_children_cmp);
         trie->nodes_count++;
 
@@ -135,17 +137,16 @@ static int trie_node_add_value(struct trie *trie, struct trie_node *node,
                                const char *key, const char *value,
                                const char *filename, uint16_t file_priority, uint32_t line_number, bool compat) {
         ssize_t k, v, fn = 0;
-        struct trie_value_entry *val;
 
-        k = strbuf_add_string(trie->strings, key, strlen(key));
+        k = strbuf_add_string(trie->strings, key);
         if (k < 0)
                 return k;
-        v = strbuf_add_string(trie->strings, value, strlen(value));
+        v = strbuf_add_string(trie->strings, value);
         if (v < 0)
                 return v;
 
         if (!compat) {
-                fn = strbuf_add_string(trie->strings, filename, strlen(filename));
+                fn = strbuf_add_string(trie->strings, filename);
                 if (fn < 0)
                         return fn;
         }
@@ -154,7 +155,7 @@ static int trie_node_add_value(struct trie *trie, struct trie_node *node,
                 struct trie_value_entry search = {
                         .key_off = k,
                         .value_off = v,
-                };
+                }, *val;
 
                 val = typesafe_bsearch_r(&search, node->values, node->values_count, trie_values_cmp, trie);
                 if (val) {
@@ -169,19 +170,17 @@ static int trie_node_add_value(struct trie *trie, struct trie_node *node,
         }
 
         /* extend array, add new entry, sort for bisection */
-        val = reallocarray(node->values, node->values_count + 1, sizeof(struct trie_value_entry));
-        if (!val)
+        if (!GREEDY_REALLOC(node->values, node->values_count + 1))
                 return -ENOMEM;
+
         trie->values_count++;
-        node->values = val;
-        node->values[node->values_count] = (struct trie_value_entry) {
+        node->values[node->values_count++] = (struct trie_value_entry) {
                 .key_off = k,
                 .value_off = v,
                 .filename_off = fn,
                 .file_priority = file_priority,
                 .line_number = line_number,
         };
-        node->values_count++;
         typesafe_qsort_r(node->values, node->values_count, trie_values_cmp, trie);
         return 0;
 }
@@ -193,7 +192,7 @@ static int trie_insert(struct trie *trie, struct trie_node *node, const char *se
 
         for (size_t i = 0;; i++) {
                 size_t p;
-                uint8_t c;
+                char c;
                 struct trie_node *child;
 
                 for (p = 0; (c = trie->strings->buf[node->prefix_off + p]); p++) {
@@ -223,7 +222,7 @@ static int trie_insert(struct trie *trie, struct trie_node *node, const char *se
                         if (!s)
                                 return -ENOMEM;
 
-                        off = strbuf_add_string(trie->strings, s, p);
+                        off = strbuf_add_string_full(trie->strings, s, p);
                         if (off < 0)
                                 return off;
 
@@ -253,7 +252,7 @@ static int trie_insert(struct trie *trie, struct trie_node *node, const char *se
                         if (!new_child)
                                 return -ENOMEM;
 
-                        off = strbuf_add_string(trie->strings, search + i+1, strlen(search + i+1));
+                        off = strbuf_add_string(trie->strings, search + i+1);
                         if (off < 0)
                                 return off;
 
@@ -408,9 +407,11 @@ static int trie_store(struct trie *trie, const char *filename, bool compat) {
                 return -errno;
         fwrite(&h, sizeof(struct trie_header_f), 1, f);
 
-        r = flink_tmpfile(f, filename_tmp, filename, /* replace= */ true);
+        r = flink_tmpfile(f, filename_tmp, filename, LINK_TMPFILE_REPLACE|LINK_TMPFILE_SYNC);
         if (r < 0)
                 return r;
+
+        filename_tmp = mfree(filename_tmp);
 
         /* write succeeded */
 
@@ -457,7 +458,7 @@ static int insert_data(struct trie *trie, char **match_list, char *line, const c
         return 0;
 }
 
-static int import_file(struct trie *trie, const char *filename, uint16_t file_priority, bool compat) {
+static int import_file(struct trie *trie, int fd, const char *filename, uint16_t file_priority, bool compat) {
         enum {
                 HW_NONE,
                 HW_MATCH,
@@ -466,9 +467,13 @@ static int import_file(struct trie *trie, const char *filename, uint16_t file_pr
         _cleanup_fclose_ FILE *f = NULL;
         _cleanup_strv_free_ char **match_list = NULL;
         uint32_t line_number = 0;
-        int r, err;
+        int r;
 
-        f = fopen(filename, "re");
+        assert(trie);
+        assert(fd >= 0);
+        assert(filename);
+
+        f = fopen(FORMAT_PROC_FD_PATH(fd), "re");
         if (!f)
                 return -errno;
 
@@ -483,7 +488,7 @@ static int import_file(struct trie *trie, const char *filename, uint16_t file_pr
                 if (r == 0)
                         break;
 
-                line_number ++;
+                line_number++;
 
                 /* comment line */
                 if (line[0] == '#')
@@ -506,24 +511,23 @@ static int import_file(struct trie *trie, const char *filename, uint16_t file_pr
                                 break;
 
                         if (line[0] == ' ') {
-                                r = log_syntax(NULL, LOG_WARNING, filename, line_number, SYNTHETIC_ERRNO(EINVAL),
-                                               "Match expected but got indented property \"%s\", ignoring line.", line);
+                                log_syntax(NULL, LOG_WARNING, filename, line_number, 0,
+                                           "Match expected but got indented property \"%s\", ignoring line.", line);
                                 break;
                         }
 
                         /* start of record, first match */
                         state = HW_MATCH;
 
-                        err = strv_extend(&match_list, line);
-                        if (err < 0)
-                                return err;
-
+                        r = strv_extend(&match_list, line);
+                        if (r < 0)
+                                return r;
                         break;
 
                 case HW_MATCH:
                         if (len == 0) {
-                                r = log_syntax(NULL, LOG_WARNING, filename, line_number, SYNTHETIC_ERRNO(EINVAL),
-                                               "Property expected, ignoring record with no properties.");
+                                log_syntax(NULL, LOG_WARNING, filename, line_number, 0,
+                                           "Property expected, ignoring record with no properties.");
                                 state = HW_NONE;
                                 match_list = strv_free(match_list);
                                 break;
@@ -531,18 +535,15 @@ static int import_file(struct trie *trie, const char *filename, uint16_t file_pr
 
                         if (line[0] != ' ') {
                                 /* another match */
-                                err = strv_extend(&match_list, line);
-                                if (err < 0)
-                                        return err;
-
+                                r = strv_extend(&match_list, line);
+                                if (r < 0)
+                                        return r;
                                 break;
                         }
 
                         /* first data */
                         state = HW_DATA;
-                        err = insert_data(trie, match_list, line, filename, file_priority, line_number, compat);
-                        if (err < 0)
-                                r = err;
+                        (void) insert_data(trie, match_list, line, filename, file_priority, line_number, compat);
                         break;
 
                 case HW_DATA:
@@ -554,16 +555,14 @@ static int import_file(struct trie *trie, const char *filename, uint16_t file_pr
                         }
 
                         if (line[0] != ' ') {
-                                r = log_syntax(NULL, LOG_WARNING, filename, line_number, SYNTHETIC_ERRNO(EINVAL),
-                                               "Property or empty line expected, got \"%s\", ignoring record.", line);
+                                log_syntax(NULL, LOG_WARNING, filename, line_number, 0,
+                                           "Property or empty line expected, got \"%s\", ignoring record.", line);
                                 state = HW_NONE;
                                 match_list = strv_free(match_list);
                                 break;
                         }
 
-                        err = insert_data(trie, match_list, line, filename, file_priority, line_number, compat);
-                        if (err < 0)
-                                r = err;
+                        (void) insert_data(trie, match_list, line, filename, file_priority, line_number, compat);
                         break;
                 };
         }
@@ -578,14 +577,17 @@ static int import_file(struct trie *trie, const char *filename, uint16_t file_pr
 int hwdb_update(const char *root, const char *hwdb_bin_dir, bool strict, bool compat) {
         _cleanup_free_ char *hwdb_bin = NULL;
         _cleanup_(trie_freep) struct trie *trie = NULL;
-        _cleanup_strv_free_ char **files = NULL;
         uint16_t file_priority = 1;
-        int r = 0, err;
+        int r, ret = 0;
 
         /* The argument 'compat' controls the format version of database. If false, then hwdb.bin will be
          * created with additional information such that priority, line number, and filename of database
          * source. If true, then hwdb.bin will be created without the information. systemd-hwdb command
          * should set the argument false, and 'udevadm hwdb' command should set it true. */
+
+        hwdb_bin = path_join(root, hwdb_bin_dir ?: "/etc/udev", "hwdb.bin");
+        if (!hwdb_bin)
+                return -ENOMEM;
 
         trie = new0(struct trie, 1);
         if (!trie)
@@ -603,15 +605,32 @@ int hwdb_update(const char *root, const char *hwdb_bin_dir, bool strict, bool co
 
         trie->nodes_count++;
 
-        err = conf_files_list_strv(&files, ".hwdb", root, 0, conf_file_dirs);
-        if (err < 0)
-                return log_error_errno(err, "Failed to enumerate hwdb files: %m");
+        ConfFile **files = NULL;
+        size_t n_files = 0;
 
-        STRV_FOREACH(f, files) {
-                log_debug("Reading file \"%s\"", *f);
-                err = import_file(trie, *f, file_priority++, compat);
-                if (err < 0 && strict)
-                        r = err;
+        CLEANUP_ARRAY(files, n_files, conf_file_free_many);
+
+        r = conf_files_list_strv_full(".hwdb", root, CONF_FILES_REGULAR | CONF_FILES_FILTER_MASKED, conf_file_dirs, &files, &n_files);
+        if (r < 0)
+                return log_error_errno(r, "Failed to enumerate hwdb files: %m");
+
+        if (n_files == 0) {
+                if (unlink(hwdb_bin) < 0) {
+                        if (errno != ENOENT)
+                                return log_error_errno(errno, "Failed to remove compiled hwdb database %s: %m", hwdb_bin);
+
+                        log_info("No hwdb files found, skipping.");
+                } else
+                        log_info("No hwdb files found, compiled hwdb database %s removed.", hwdb_bin);
+
+                return 0;
+        }
+
+        FOREACH_ARRAY(i, files, n_files) {
+                ConfFile *c = *i;
+
+                log_debug("Reading file \"%s\" -> \"%s\"", c->original_path, c->resolved_path);
+                RET_GATHER(ret, import_file(trie, c->fd, c->original_path, file_priority++, compat));
         }
 
         strbuf_complete(trie->strings);
@@ -630,20 +649,16 @@ int hwdb_update(const char *root, const char *hwdb_bin_dir, bool strict, bool co
         log_debug("strings dedup'ed: %8zu bytes (%8zu)",
                   trie->strings->dedup_len, trie->strings->dedup_count);
 
-        hwdb_bin = path_join(root, hwdb_bin_dir ?: "/etc/udev", "hwdb.bin");
-        if (!hwdb_bin)
-                return -ENOMEM;
-
         (void) mkdir_parents_label(hwdb_bin, 0755);
-        err = trie_store(trie, hwdb_bin, compat);
-        if (err < 0)
-                return log_error_errno(err, "Failed to write database %s: %m", hwdb_bin);
+        r = trie_store(trie, hwdb_bin, compat);
+        if (r < 0)
+                return log_error_errno(r, "Failed to write database %s: %m", hwdb_bin);
 
-        err = label_fix(hwdb_bin, 0);
-        if (err < 0)
-                return err;
+        r = label_fix(hwdb_bin, 0);
+        if (r < 0)
+                return r;
 
-        return r;
+        return strict ? ret : 0;
 }
 
 int hwdb_query(const char *modalias, const char *root) {
@@ -654,7 +669,7 @@ int hwdb_query(const char *modalias, const char *root) {
         assert(modalias);
 
         if (!isempty(root))
-                NULSTR_FOREACH(p, hwdb_bin_paths) {
+                NULSTR_FOREACH(p, HWDB_BIN_PATHS) {
                         _cleanup_free_ char *hwdb_bin = NULL;
 
                         hwdb_bin = path_join(root, p);
@@ -686,7 +701,7 @@ bool hwdb_should_reload(sd_hwdb *hwdb) {
                 return false;
 
         /* if hwdb.bin doesn't exist anywhere, we need to update */
-        NULSTR_FOREACH(p, hwdb_bin_paths)
+        NULSTR_FOREACH(p, HWDB_BIN_PATHS)
                 if (stat(p, &st) >= 0) {
                         found = true;
                         break;
@@ -697,4 +712,8 @@ bool hwdb_should_reload(sd_hwdb *hwdb) {
         if (timespec_load(&hwdb->st.st_mtim) != timespec_load(&st.st_mtim))
                 return true;
         return false;
+}
+
+int hwdb_bypass(void) {
+        return should_bypass("SYSTEMD_HWDB_UPDATE");
 }

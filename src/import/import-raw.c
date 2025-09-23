@@ -1,32 +1,32 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <linux/fs.h>
+#include <sys/stat.h>
 
 #include "sd-daemon.h"
 #include "sd-event.h"
 
 #include "alloc-util.h"
-#include "btrfs-util.h"
 #include "copy.h"
 #include "fd-util.h"
 #include "format-util.h"
 #include "fs-util.h"
-#include "hostname-util.h"
 #include "import-common.h"
 #include "import-compress.h"
 #include "import-raw.h"
+#include "import-util.h"
 #include "install-file.h"
 #include "io-util.h"
-#include "machine-pool.h"
+#include "log.h"
 #include "mkdir-label.h"
-#include "path-util.h"
+#include "pretty-print.h"
 #include "qcow2-util.h"
 #include "ratelimit.h"
-#include "rm-rf.h"
 #include "string-util.h"
+#include "terminal-util.h"
+#include "time-util.h"
 #include "tmpfile-util.h"
 
-struct RawImport {
+typedef struct RawImport {
         sd_event *event;
 
         char *image_root;
@@ -47,7 +47,7 @@ struct RawImport {
 
         sd_event_source *input_event_source;
 
-        uint8_t buffer[16*1024];
+        uint8_t buffer[IMPORT_BUFFER_SIZE];
         size_t buffer_size;
 
         uint64_t written_compressed;
@@ -61,7 +61,7 @@ struct RawImport {
 
         uint64_t offset;
         uint64_t size_max;
-};
+} RawImport;
 
 RawImport* raw_import_unref(RawImport *i) {
         if (!i)
@@ -95,8 +95,9 @@ int raw_import_new(
         int r;
 
         assert(ret);
+        assert(image_root);
 
-        root = strdup(image_root ?: "/var/lib/machines");
+        root = strdup(image_root);
         if (!root)
                 return -ENOMEM;
 
@@ -147,8 +148,17 @@ static void raw_import_report_progress(RawImport *i) {
         if (!ratelimit_below(&i->progress_ratelimit))
                 return;
 
-        sd_notifyf(false, "X_IMPORT_PROGRESS=%u", percent);
-        log_info("Imported %u%%.", percent);
+        sd_notifyf(false, "X_IMPORT_PROGRESS=%u%%", percent);
+
+        if (isatty_safe(STDERR_FILENO))
+                (void) draw_progress_barf(
+                                percent,
+                                "%s %s/%s",
+                                glyph(GLYPH_ARROW_RIGHT),
+                                FORMAT_BYTES(i->written_compressed),
+                                FORMAT_BYTES(i->input_stat.st_size));
+        else
+                log_info("Imported %u%%.", percent);
 
         i->last_percent = percent;
 }
@@ -303,7 +313,7 @@ static int raw_import_open_disk(RawImport *i) {
                                        "Target file is not a regular file or block device");
 
         if (i->offset != UINT64_MAX) {
-                if (lseek(i->output_fd, i->offset, SEEK_SET) == (off_t) -1)
+                if (lseek(i->output_fd, i->offset, SEEK_SET) < 0)
                         return log_error_errno(errno, "Failed to seek to offset: %m");
         }
 
@@ -328,7 +338,7 @@ static int raw_import_try_reflink(RawImport *i) {
                 return 0;
 
         p = lseek(i->input_fd, 0, SEEK_CUR);
-        if (p == (off_t) -1)
+        if (p < 0)
                 return log_error_errno(errno, "Failed to read file offset of input file: %m");
 
         /* Let's only try a btrfs reflink, if we are reading from the beginning of the file */
@@ -378,7 +388,7 @@ static int raw_import_write(const void *p, size_t sz, void *userdata) {
                 if ((size_t) n < sz)
                         return log_error_errno(SYNTHETIC_ERRNO(EIO), "Short write");
         } else {
-                r = loop_write(i->output_fd, p, sz, false);
+                r = loop_write(i->output_fd, p, sz);
                 if (r < 0)
                         return log_error_errno(r, "Failed to write file: %m");
         }
@@ -405,6 +415,11 @@ static int raw_import_process(RawImport *i) {
                         return 0;
 
                 r = log_error_errno(errno, "Failed to read input file: %m");
+                goto finish;
+        }
+
+        if ((size_t) l > sizeof(i->buffer) - i->buffer_size) {
+                r = log_error_errno(SYNTHETIC_ERRNO(EBADMSG), "Read input file exceeded maximum size.");
                 goto finish;
         }
 
@@ -453,6 +468,9 @@ static int raw_import_process(RawImport *i) {
         return 0;
 
 complete:
+        if (isatty_safe(STDERR_FILENO))
+                clear_progress_bar(/* prefix= */ NULL);
+
         r = raw_import_finish(i);
 
 finish:

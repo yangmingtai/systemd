@@ -1,8 +1,9 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
+#pragma once
 
 #include <syslog.h>
 
-#include <sd-event.h>
+#include "forward.h"
 
 /* All our long-running services should implement a SIGRTMIN+18 handler that can be used to trigger certain
  * actions that affect service runtime. The specific action is indicated via the "value integer" you can pass
@@ -48,6 +49,10 @@ enum {
 
         COMMON_SIGNAL_COMMAND_MEMORY_PRESSURE = 0x300,
         COMMON_SIGNAL_COMMAND_MALLOC_INFO,
+
+        /* Private signals start at 0x500 */
+        _COMMON_SIGNAL_COMMAND_PRIVATE_BASE = 0x500,
+        _COMMON_SIGNAL_COMMAND_PRIVATE_END = 0xfff,
 };
 
 struct sigrtmin18_info {

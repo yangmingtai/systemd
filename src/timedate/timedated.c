@@ -1,9 +1,8 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <errno.h>
+#include <stdlib.h>
 #include <sys/stat.h>
 #include <sys/timex.h>
-#include <sys/types.h>
 #include <unistd.h>
 
 #include "sd-bus.h"
@@ -17,33 +16,41 @@
 #include "bus-locator.h"
 #include "bus-log-control-api.h"
 #include "bus-map-properties.h"
+#include "bus-message-util.h"
+#include "bus-object.h"
 #include "bus-polkit.h"
+#include "bus-unit-util.h"
+#include "bus-util.h"
 #include "clock-util.h"
 #include "conf-files.h"
 #include "constants.h"
+#include "daemon-util.h"
+#include "extract-word.h"
 #include "fd-util.h"
-#include "fileio-label.h"
 #include "fileio.h"
 #include "fs-util.h"
 #include "hashmap.h"
+#include "hwclock-util.h"
+#include "label-util.h"
 #include "list.h"
+#include "log.h"
+#include "log-context.h"
 #include "main-func.h"
 #include "memory-util.h"
-#include "missing_capability.h"
 #include "path-util.h"
-#include "selinux-util.h"
 #include "service-util.h"
-#include "signal-util.h"
+#include "set.h"
 #include "string-util.h"
 #include "strv.h"
+#include "time-util.h"
 #include "unit-def.h"
 #include "unit-name.h"
-#include "user-util.h"
 
 #define NULL_ADJTIME_UTC "0.0 0 0\n0\nUTC\n"
 #define NULL_ADJTIME_LOCAL "0.0 0 0\n0\nLOCAL\n"
 
 #define UNIT_LIST_DIRS (const char* const*) CONF_PATHS_STRV("systemd/ntp-units.d")
+#define SET_NTP_IN_FLIGHT_MAX 16
 
 typedef struct UnitStatusInfo {
         char *name;
@@ -60,39 +67,20 @@ typedef struct Context {
         bool local_rtc;
         Hashmap *polkit_registry;
         sd_bus_message *cache;
+        Set *set_ntp_calls;
 
         sd_bus_slot *slot_job_removed;
 
         LIST_HEAD(UnitStatusInfo, units);
 } Context;
 
-#define log_unit_full_errno_zerook(unit, level, error, ...)             \
-        ({                                                              \
-                const UnitStatusInfo *_u = (unit);                      \
-                _u ? log_object_internal(level, error, PROJECT_FILE, __LINE__, __func__, "UNIT=", _u->name, NULL, NULL, ##__VA_ARGS__) : \
-                        log_internal(level, error, PROJECT_FILE, __LINE__, __func__, ##__VA_ARGS__); \
-        })
+#define _LOG_CONTEXT_PUSH_UNIT(unit, u)               \
+        const UnitStatusInfo *u = (unit);             \
+        LOG_CONTEXT_PUSH_KEY_VALUE("UNIT=", u->name); \
+        LOG_SET_PREFIX(u->name)
 
-#define log_unit_full_errno(unit, level, error, ...) \
-        ({                                                              \
-                int _error = (error);                                   \
-                ASSERT_NON_ZERO(_error);                                \
-                log_unit_full_errno_zerook(unit, level, _error, ##__VA_ARGS__); \
-        })
-
-#define log_unit_full(unit, level, ...) (void) log_unit_full_errno_zerook(unit, level, 0, ##__VA_ARGS__)
-
-#define log_unit_debug(unit, ...)   log_unit_full(unit, LOG_DEBUG, ##__VA_ARGS__)
-#define log_unit_info(unit, ...)    log_unit_full(unit, LOG_INFO, ##__VA_ARGS__)
-#define log_unit_notice(unit, ...)  log_unit_full(unit, LOG_NOTICE, ##__VA_ARGS__)
-#define log_unit_warning(unit, ...) log_unit_full(unit, LOG_WARNING, ##__VA_ARGS__)
-#define log_unit_error(unit, ...)   log_unit_full(unit, LOG_ERR, ##__VA_ARGS__)
-
-#define log_unit_debug_errno(unit, error, ...)   log_unit_full_errno(unit, LOG_DEBUG, error, ##__VA_ARGS__)
-#define log_unit_info_errno(unit, error, ...)    log_unit_full_errno(unit, LOG_INFO, error, ##__VA_ARGS__)
-#define log_unit_notice_errno(unit, error, ...)  log_unit_full_errno(unit, LOG_NOTICE, error, ##__VA_ARGS__)
-#define log_unit_warning_errno(unit, error, ...) log_unit_full_errno(unit, LOG_WARNING, error, ##__VA_ARGS__)
-#define log_unit_error_errno(unit, error, ...)   log_unit_full_errno(unit, LOG_ERR, error, ##__VA_ARGS__)
+#define LOG_CONTEXT_PUSH_UNIT(unit) \
+        _LOG_CONTEXT_PUSH_UNIT(unit, UNIQ_T(u, UNIQ))
 
 static void unit_status_info_clear(UnitStatusInfo *p) {
         assert(p);
@@ -115,20 +103,16 @@ static UnitStatusInfo *unit_status_info_free(UnitStatusInfo *p) {
 DEFINE_TRIVIAL_CLEANUP_FUNC(UnitStatusInfo*, unit_status_info_free);
 
 static void context_clear(Context *c) {
-        UnitStatusInfo *p;
-
         assert(c);
 
         free(c->zone);
-        bus_verify_polkit_async_registry_free(c->polkit_registry);
+        hashmap_free(c->polkit_registry);
         sd_bus_message_unref(c->cache);
+        set_free(c->set_ntp_calls);
 
         sd_bus_slot_unref(c->slot_job_removed);
 
-        while ((p = c->units)) {
-                LIST_REMOVE(units, c->units, p);
-                unit_status_info_free(p);
-        }
+        LIST_CLEAR(units, c->units, unit_status_info_free);
 }
 
 static int context_add_ntp_service(Context *c, const char *s, const char *source) {
@@ -154,8 +138,10 @@ static int context_add_ntp_service(Context *c, const char *s, const char *source
         if (!unit->name)
                 return -ENOMEM;
 
+        LOG_CONTEXT_PUSH_UNIT(unit);
+
         LIST_APPEND(units, c->units, unit);
-        log_unit_debug(unit, "added from %s.", source);
+        log_debug("added from %s.", source);
         TAKE_PTR(unit);
 
         return 0;
@@ -215,9 +201,8 @@ static int context_parse_ntp_services_from_disk(Context *c) {
 
                 for (;;) {
                         _cleanup_free_ char *line = NULL;
-                        const char *word;
 
-                        r = read_line(file, LINE_MAX, &line);
+                        r = read_stripped_line(file, LINE_MAX, &line);
                         if (r < 0) {
                                 log_error_errno(r, "Failed to read %s, ignoring: %m", *f);
                                 continue;
@@ -225,13 +210,12 @@ static int context_parse_ntp_services_from_disk(Context *c) {
                         if (r == 0)
                                 break;
 
-                        word = strstrip(line);
-                        if (isempty(word) || startswith(word, "#"))
+                        if (isempty(line) || startswith(line, "#"))
                                 continue;
 
-                        r = context_add_ntp_service(c, word, *f);
+                        r = context_add_ntp_service(c, line, *f);
                         if (r < 0)
-                                log_warning_errno(r, "Failed to add NTP service \"%s\", ignoring: %m", word);
+                                log_warning_errno(r, "Failed to add NTP service \"%s\", ignoring: %m", line);
                 }
         }
 
@@ -308,22 +292,32 @@ static int context_write_data_timezone(Context *c) {
 
                 if (access("/usr/share/zoneinfo/UTC", F_OK) < 0) {
 
-                        if (unlink("/etc/localtime") < 0 && errno != ENOENT)
+                        if (unlink(etc_localtime()) < 0 && errno != ENOENT)
                                 return -errno;
 
                         return 0;
                 }
 
-                source = "../usr/share/zoneinfo/UTC";
+                source = "/usr/share/zoneinfo/UTC";
         } else {
-                p = path_join("../usr/share/zoneinfo", c->zone);
+                p = path_join("/usr/share/zoneinfo", c->zone);
                 if (!p)
                         return -ENOMEM;
 
                 source = p;
         }
 
-        return symlink_atomic(source, "/etc/localtime");
+        return symlinkat_atomic_full(source, AT_FDCWD, etc_localtime(),
+                                     !secure_getenv("SYSTEMD_ETC_LOCALTIME"));
+}
+
+static const char* etc_adjtime(void) {
+        static const char *cached = NULL;
+
+        if (!cached)
+                cached = secure_getenv("SYSTEMD_ETC_ADJTIME") ?: "/etc/adjtime";
+
+        return cached;
 }
 
 static int context_write_data_local_rtc(Context *c) {
@@ -332,7 +326,7 @@ static int context_write_data_local_rtc(Context *c) {
 
         assert(c);
 
-        r = read_full_file("/etc/adjtime", &s, NULL);
+        r = read_full_file(etc_adjtime(), &s, NULL);
         if (r < 0) {
                 if (r != -ENOENT)
                         return r;
@@ -381,10 +375,10 @@ static int context_write_data_local_rtc(Context *c) {
                 if (!w)
                         return -ENOMEM;
 
-                *(char*) mempcpy(stpcpy(stpcpy(mempcpy(w, s, a), prepend), c->local_rtc ? "LOCAL" : "UTC"), e, b) = 0;
+                *mempcpy_typesafe(stpcpy(stpcpy(mempcpy(w, s, a), prepend), c->local_rtc ? "LOCAL" : "UTC"), e, b) = 0;
 
                 if (streq(w, NULL_ADJTIME_UTC)) {
-                        if (unlink("/etc/adjtime") < 0)
+                        if (unlink(etc_adjtime()) < 0)
                                 if (errno != ENOENT)
                                         return -errno;
 
@@ -392,11 +386,11 @@ static int context_write_data_local_rtc(Context *c) {
                 }
         }
 
-        r = mac_selinux_init();
+        r = mac_init();
         if (r < 0)
                 return r;
 
-        return write_string_file_atomic_label("/etc/adjtime", w);
+        return write_string_file(etc_adjtime(), w, WRITE_STRING_FILE_CREATE|WRITE_STRING_FILE_ATOMIC|WRITE_STRING_FILE_LABEL);
 }
 
 static int context_update_ntp_status(Context *c, sd_bus *bus, sd_bus_message *m) {
@@ -424,6 +418,8 @@ static int context_update_ntp_status(Context *c, sd_bus *bus, sd_bus_message *m)
                 _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
                 _cleanup_free_ char *path = NULL;
 
+                LOG_CONTEXT_PUSH_UNIT(u);
+
                 unit_status_info_clear(u);
 
                 path = unit_dbus_path_from_name(u->name);
@@ -440,7 +436,7 @@ static int context_update_ntp_status(Context *c, sd_bus *bus, sd_bus_message *m)
                                 NULL,
                                 u);
                 if (r < 0)
-                        return log_unit_error_errno(u, r, "Failed to get properties: %s", bus_error_message(&error, r));
+                        return log_error_errno(r, "Failed to get properties: %s", bus_error_message(&error, r));
         }
 
         return 0;
@@ -467,11 +463,19 @@ static int match_job_removed(sd_bus_message *m, void *userdata, sd_bus_error *er
                         n += !!u->path;
 
         if (n == 0) {
+                sd_bus_message *cm;
+
                 c->slot_job_removed = sd_bus_slot_unref(c->slot_job_removed);
 
                 (void) sd_bus_emit_properties_changed(sd_bus_message_get_bus(m),
                                                       "/org/freedesktop/timedate1", "org.freedesktop.timedate1", "NTP",
                                                       NULL);
+                while ((cm = set_steal_first(c->set_ntp_calls))) {
+                        r = sd_bus_reply_method_return(cm, NULL);
+                        if (r < 0)
+                                log_debug_errno(r, "Failed to reply to SetNTP method call, ignoring: %m");
+                        sd_bus_message_unref(cm);
+                }
         }
 
         return 0;
@@ -486,6 +490,8 @@ static int unit_start_or_stop(UnitStatusInfo *u, sd_bus *bus, sd_bus_error *erro
         assert(bus);
         assert(error);
 
+        LOG_CONTEXT_PUSH_UNIT(u);
+
         r = bus_call_method(
                 bus,
                 bus_systemd_mgr,
@@ -495,8 +501,8 @@ static int unit_start_or_stop(UnitStatusInfo *u, sd_bus *bus, sd_bus_error *erro
                 "ss",
                 u->name,
                 "replace");
-        log_unit_full_errno_zerook(u, r < 0 ? LOG_WARNING : LOG_DEBUG, r,
-                                   "%s unit: %m", start ? "Starting" : "Stopping");
+        log_full_errno_zerook(r < 0 ? LOG_WARNING : LOG_DEBUG, r,
+                              "%s unit: %m", start ? "Starting" : "Stopping");
         if (r < 0)
                 return r;
 
@@ -520,12 +526,14 @@ static int unit_enable_or_disable(UnitStatusInfo *u, sd_bus *bus, sd_bus_error *
 
         /* Call context_update_ntp_status() to update UnitStatusInfo before calling this. */
 
+        LOG_CONTEXT_PUSH_UNIT(u);
+
         if (streq(u->unit_file_state, "enabled") == enable) {
-                log_unit_debug(u, "already %sd.", enable_disable(enable));
+                log_debug("already %sd.", enable_disable(enable));
                 return 0;
         }
 
-        log_unit_info(u, "%s unit.", enable ? "Enabling" : "Disabling");
+        log_info("%s unit.", enable ? "Enabling" : "Disabling");
 
         if (enable)
                 r = bus_call_method(
@@ -550,7 +558,7 @@ static int unit_enable_or_disable(UnitStatusInfo *u, sd_bus *bus, sd_bus_error *
         if (r < 0)
                 return r;
 
-        r = bus_call_method(bus, bus_systemd_mgr, "Reload", error, NULL, NULL);
+        r = bus_service_manager_reload(bus);
         if (r < 0)
                 return r;
 
@@ -585,15 +593,20 @@ static int property_get_rtc_time(
         usec_t t = 0;
         int r;
 
-        r = clock_get_hwclock(&tm);
+        r = hwclock_get(&tm);
         if (r == -EBUSY)
                 log_warning("/dev/rtc is busy. Is somebody keeping it open continuously? That's not a good idea... Returning a bogus RTC timestamp.");
         else if (r == -ENOENT)
                 log_debug("/dev/rtc not found.");
+        else if (r == -ENODATA)
+                log_debug("/dev/rtc has no valid time, power loss probably occurred?");
         else if (r < 0)
                 return sd_bus_error_set_errnof(error, r, "Failed to read RTC: %m");
-        else
-                t = (usec_t) timegm(&tm) * USEC_PER_SEC;
+        else {
+                r = mktime_or_timegm_usec(&tm, /* utc= */ true, &t);
+                if (r < 0)
+                        log_warning_errno(r, "Failed to convert RTC time to UNIX time, ignoring: %m");
+        }
 
         return sd_bus_message_append(reply, "t", t);
 }
@@ -671,13 +684,12 @@ static int method_set_timezone(sd_bus_message *m, void *userdata, sd_bus_error *
         if (streq_ptr(z, c->zone))
                 return sd_bus_reply_method_return(m, NULL);
 
-        r = bus_verify_polkit_async(
+        r = bus_verify_polkit_async_full(
                         m,
-                        CAP_SYS_TIME,
                         "org.freedesktop.timedate1.set-timezone",
-                        NULL,
-                        interactive,
-                        UID_INVALID,
+                        /* details= */ NULL,
+                        /* good_user= */ UID_INVALID,
+                        interactive ? POLKIT_ALLOW_INTERACTIVE : 0,
                         &c->polkit_registry,
                         error);
         if (r < 0)
@@ -705,23 +717,24 @@ static int method_set_timezone(sd_bus_message *m, void *userdata, sd_bus_error *
                 log_debug_errno(r, "Failed to tell kernel about timezone, ignoring: %m");
 
         if (c->local_rtc) {
-                struct timespec ts;
                 struct tm tm;
 
                 /* 4. Sync RTC from system clock, with the new delta */
-                assert_se(clock_gettime(CLOCK_REALTIME, &ts) == 0);
-                assert_se(localtime_r(&ts.tv_sec, &tm));
-
-                r = clock_set_hwclock(&tm);
+                r = localtime_or_gmtime_usec(now(CLOCK_REALTIME), /* utc= */ false, &tm);
                 if (r < 0)
-                        log_debug_errno(r, "Failed to sync time to hardware clock, ignoring: %m");
+                        log_debug_errno(r, "Failed to convert system time to calendar time, ignoring: %m");
+                else {
+                        r = hwclock_set(&tm);
+                        if (r < 0)
+                                log_debug_errno(r, "Failed to sync time to hardware clock, ignoring: %m");
+                }
         }
 
         log_struct(LOG_INFO,
-                   "MESSAGE_ID=" SD_MESSAGE_TIMEZONE_CHANGE_STR,
-                   "TIMEZONE=%s", c->zone,
-                   "TIMEZONE_SHORTNAME=%s", tzname[daylight],
-                   "DAYLIGHT=%i", daylight,
+                   LOG_MESSAGE_ID(SD_MESSAGE_TIMEZONE_CHANGE_STR),
+                   LOG_ITEM("TIMEZONE=%s", c->zone),
+                   LOG_ITEM("TIMEZONE_SHORTNAME=%s", tzname[daylight]),
+                   LOG_ITEM("DAYLIGHT=%i", daylight),
                    LOG_MESSAGE("Changed time zone to '%s' (%s).", c->zone, tzname[daylight]));
 
         (void) sd_bus_emit_properties_changed(sd_bus_message_get_bus(m),
@@ -746,13 +759,12 @@ static int method_set_local_rtc(sd_bus_message *m, void *userdata, sd_bus_error 
         if (lrtc == c->local_rtc && !fix_system)
                 return sd_bus_reply_method_return(m, NULL);
 
-        r = bus_verify_polkit_async(
+        r = bus_verify_polkit_async_full(
                         m,
-                        CAP_SYS_TIME,
                         "org.freedesktop.timedate1.set-local-rtc",
-                        NULL,
-                        interactive,
-                        UID_INVALID,
+                        /* details= */ NULL,
+                        /* good_user= */ UID_INVALID,
+                        interactive ? POLKIT_ALLOW_INTERACTIVE : 0,
                         &c->polkit_registry,
                         error);
         if (r < 0)
@@ -780,32 +792,46 @@ static int method_set_local_rtc(sd_bus_message *m, void *userdata, sd_bus_error 
         assert_se(clock_gettime(CLOCK_REALTIME, &ts) == 0);
 
         if (fix_system) {
-                struct tm tm;
+                struct tm tm = {
+                        .tm_isdst = -1,
+                };
 
                 /* Sync system clock from RTC; first, initialize the timezone fields of struct tm. */
-                localtime_or_gmtime_r(&ts.tv_sec, &tm, !c->local_rtc);
+                r = localtime_or_gmtime_usec(timespec_load(&ts), !c->local_rtc, &tm);
+                if (r < 0)
+                        log_debug_errno(r, "Failed to determine current timezone, ignoring: %m");
 
                 /* Override the main fields of struct tm, but not the timezone fields */
-                r = clock_get_hwclock(&tm);
+                r = hwclock_get(&tm);
                 if (r < 0)
                         log_debug_errno(r, "Failed to get hardware clock, ignoring: %m");
                 else {
+                        usec_t t;
                         /* And set the system clock with this */
-                        ts.tv_sec = mktime_or_timegm(&tm, !c->local_rtc);
 
-                        if (clock_settime(CLOCK_REALTIME, &ts) < 0)
-                                log_debug_errno(errno, "Failed to update system clock, ignoring: %m");
+                        r = mktime_or_timegm_usec(&tm, !c->local_rtc, &t);
+                        if (r < 0)
+                                log_debug_errno(r, "Failed to convert calendar time to system time, ignoring: %m");
+                        else {
+                                /* We leave the subsecond offset as is! */
+                                ts.tv_sec = t / USEC_PER_SEC;
+
+                                if (clock_settime(CLOCK_REALTIME, &ts) < 0)
+                                        log_debug_errno(errno, "Failed to update system clock, ignoring: %m");
+                        }
                 }
-
         } else {
                 struct tm tm;
 
                 /* Sync RTC from system clock */
-                localtime_or_gmtime_r(&ts.tv_sec, &tm, !c->local_rtc);
-
-                r = clock_set_hwclock(&tm);
+                r = localtime_or_gmtime_usec(timespec_load(&ts), !c->local_rtc, &tm);
                 if (r < 0)
-                        log_debug_errno(r, "Failed to sync time to hardware clock, ignoring: %m");
+                        log_debug_errno(r, "Failed to convert time to calendar time, ignoring: %m");
+                else {
+                        r = hwclock_set(&tm);
+                        if (r < 0)
+                                log_debug_errno(r, "Failed to sync time to hardware clock, ignoring: %m");
+                }
         }
 
         log_info("RTC configured to %s time.", c->local_rtc ? "local" : "UTC");
@@ -819,7 +845,6 @@ static int method_set_local_rtc(sd_bus_message *m, void *userdata, sd_bus_error 
 
 static int method_set_time(sd_bus_message *m, void *userdata, sd_bus_error *error) {
         sd_bus *bus = sd_bus_message_get_bus(m);
-        char buf[FORMAT_TIMESTAMP_MAX];
         int relative, interactive, r;
         Context *c = ASSERT_PTR(userdata);
         int64_t utc;
@@ -853,26 +878,29 @@ static int method_set_time(sd_bus_message *m, void *userdata, sd_bus_error *erro
                 return sd_bus_reply_method_return(m, NULL);
 
         if (relative) {
-                usec_t n, x;
-
-                n = now(CLOCK_REALTIME);
-                x = n + utc;
-
-                if ((utc > 0 && x < n) ||
-                    (utc < 0 && x > n))
+                usec_t n = now(CLOCK_REALTIME);
+                bool valid;
+                if (utc > 0)
+                        valid = INC_SAFE(&n, (usec_t) utc);
+                else
+                        valid = DEC_SAFE(&n, (usec_t) -utc);
+                if (!valid)
                         return sd_bus_error_set(error, SD_BUS_ERROR_INVALID_ARGS, "Time value overflow");
 
-                timespec_store(&ts, x);
+                timespec_store(&ts, n);
         } else
                 timespec_store(&ts, (usec_t) utc);
 
-        r = bus_verify_polkit_async(
+        /* refuse the request when the time is before systemd build date time*/
+        if (ts.tv_sec < TIME_EPOCH)
+                return sd_bus_error_set(error, SD_BUS_ERROR_INVALID_ARGS, "Requested to set the clock to time before build time, refusing.");
+
+        r = bus_verify_polkit_async_full(
                         m,
-                        CAP_SYS_TIME,
                         "org.freedesktop.timedate1.set-time",
-                        NULL,
-                        interactive,
-                        UID_INVALID,
+                        /* details= */ NULL,
+                        /* good_user= */ UID_INVALID,
+                        interactive ? POLKIT_ALLOW_INTERACTIVE : 0,
                         &c->polkit_registry,
                         error);
         if (r < 0)
@@ -886,7 +914,7 @@ static int method_set_time(sd_bus_message *m, void *userdata, sd_bus_error *erro
         if (r < 0 && r != -ENODATA)
                 return r;
 
-        timespec_store(&ts, timespec_load(&ts) + (now(CLOCK_MONOTONIC) - start));
+        timespec_store(&ts, timespec_load(&ts) + usec_sub_unsigned(now(CLOCK_MONOTONIC), start));
 
         /* Set system clock */
         if (clock_settime(CLOCK_REALTIME, &ts) < 0) {
@@ -895,16 +923,19 @@ static int method_set_time(sd_bus_message *m, void *userdata, sd_bus_error *erro
         }
 
         /* Sync down to RTC */
-        localtime_or_gmtime_r(&ts.tv_sec, &tm, !c->local_rtc);
-
-        r = clock_set_hwclock(&tm);
+        r = localtime_or_gmtime_usec(timespec_load(&ts), !c->local_rtc, &tm);
         if (r < 0)
-                log_debug_errno(r, "Failed to update hardware clock, ignoring: %m");
+                log_debug_errno(r, "Failed to convert timestamp to calendar time, ignoring: %m");
+        else {
+                r = hwclock_set(&tm);
+                if (r < 0)
+                        log_debug_errno(r, "Failed to update hardware clock, ignoring: %m");
+        }
 
         log_struct(LOG_INFO,
-                   "MESSAGE_ID=" SD_MESSAGE_TIME_CHANGE_STR,
-                   "REALTIME="USEC_FMT, timespec_load(&ts),
-                   LOG_MESSAGE("Changed local time to %s", strnull(format_timestamp(buf, sizeof(buf), timespec_load(&ts)))));
+                   LOG_MESSAGE_ID(SD_MESSAGE_TIME_CHANGE_STR),
+                   LOG_ITEM("REALTIME="USEC_FMT, timespec_load(&ts)),
+                   LOG_MESSAGE("Changed local time to %s", strnull(FORMAT_TIMESTAMP(timespec_load(&ts)))));
 
         return sd_bus_reply_method_return(m, NULL);
 }
@@ -930,13 +961,12 @@ static int method_set_ntp(sd_bus_message *m, void *userdata, sd_bus_error *error
         if (context_ntp_service_exists(c) <= 0)
                 return sd_bus_error_set(error, BUS_ERROR_NO_NTP_SUPPORT, "NTP not supported");
 
-        r = bus_verify_polkit_async(
+        r = bus_verify_polkit_async_full(
                         m,
-                        CAP_SYS_TIME,
                         "org.freedesktop.timedate1.set-ntp",
-                        NULL,
-                        interactive,
-                        UID_INVALID,
+                        /* details= */ NULL,
+                        /* good_user= */ UID_INVALID,
+                        interactive ? POLKIT_ALLOW_INTERACTIVE : 0,
                         &c->polkit_registry,
                         error);
         if (r < 0)
@@ -947,6 +977,9 @@ static int method_set_ntp(sd_bus_message *m, void *userdata, sd_bus_error *error
         /* This method may be called frequently. Forget the previous job if it has not completed yet. */
         LIST_FOREACH(units, u, c->units)
                 u->path = mfree(u->path);
+
+        if (set_size(c->set_ntp_calls) >= SET_NTP_IN_FLIGHT_MAX)
+                return sd_bus_error_set_errnof(error, EAGAIN, "Too many calls in flight.");
 
         if (!c->slot_job_removed) {
                 r = bus_match_signal_async(
@@ -966,6 +999,8 @@ static int method_set_ntp(sd_bus_message *m, void *userdata, sd_bus_error *error
                         if (!streq(u->load_state, "loaded"))
                                 continue;
 
+                        LOG_CONTEXT_PUSH_UNIT(u);
+
                         r = unit_enable_or_disable(u, bus, error, enable_this_one);
                         if (r < 0)
                                 /* If enablement failed, don't start this unit. */
@@ -973,9 +1008,9 @@ static int method_set_ntp(sd_bus_message *m, void *userdata, sd_bus_error *error
 
                         r = unit_start_or_stop(u, bus, error, enable_this_one);
                         if (r < 0)
-                                log_unit_warning_errno(u, r, "Failed to %s %sd NTP unit, ignoring: %m",
-                                                       enable_this_one ? "start" : "stop",
-                                                       enable_disable(enable_this_one));
+                                log_warning_errno(r, "Failed to %s %sd NTP unit, ignoring: %m",
+                                                  enable_this_one ? "start" : "stop",
+                                                  enable_disable(enable_this_one));
                         if (enable_this_one)
                                 selected = u;
                 }
@@ -1002,11 +1037,12 @@ static int method_set_ntp(sd_bus_message *m, void *userdata, sd_bus_error *error
                 c->slot_job_removed = TAKE_PTR(slot);
 
         if (selected)
-                log_info("Set NTP to enabled (%s).", selected->name);
+                log_info("Set NTP to be enabled (%s).", selected->name);
         else
-                log_info("Set NTP to disabled.");
+                log_info("Set NTP to be disabled.");
 
-        return sd_bus_reply_method_return(m, NULL);
+        /* Asynchronous reply to m in match_job_removed() */
+        return set_ensure_consume(&c->set_ntp_calls, &bus_message_hash_ops, sd_bus_message_ref(m));
 }
 
 static int method_list_timezones(sd_bus_message *m, void *userdata, sd_bus_error *error) {
@@ -1028,7 +1064,7 @@ static int method_list_timezones(sd_bus_message *m, void *userdata, sd_bus_error
         if (r < 0)
                 return r;
 
-        return sd_bus_send(NULL, reply, NULL);
+        return sd_bus_message_send(reply);
 }
 
 static const sd_bus_vtable timedate_vtable[] = {
@@ -1110,6 +1146,12 @@ static int connect_bus(Context *c, sd_event *event, sd_bus **_bus) {
         return 0;
 }
 
+static bool context_check_idle(void *userdata) {
+        Context *c = ASSERT_PTR(userdata);
+
+        return hashmap_isempty(c->polkit_registry);
+}
+
 static int run(int argc, char *argv[]) {
         _cleanup_(context_clear) Context context = {};
         _cleanup_(sd_event_unrefp) sd_event *event = NULL;
@@ -1128,21 +1170,15 @@ static int run(int argc, char *argv[]) {
 
         umask(0022);
 
-        assert_se(sigprocmask_many(SIG_BLOCK, NULL, SIGTERM, SIGINT, -1) >= 0);
-
         r = sd_event_default(&event);
         if (r < 0)
                 return log_error_errno(r, "Failed to allocate event loop: %m");
 
         (void) sd_event_set_watchdog(event, true);
 
-        r = sd_event_add_signal(event, NULL, SIGINT, NULL, NULL);
+        r = sd_event_set_signal_exit(event, true);
         if (r < 0)
-                return log_error_errno(r, "Failed to install SIGINT handler: %m");
-
-        r = sd_event_add_signal(event, NULL, SIGTERM, NULL, NULL);
-        if (r < 0)
-                return log_error_errno(r, "Failed to install SIGTERM handler: %m");
+                return log_error_errno(r, "Failed to install SIGINT/SIGTERM handlers: %m");
 
         r = connect_bus(&context, event, &bus);
         if (r < 0)
@@ -1158,7 +1194,17 @@ static int run(int argc, char *argv[]) {
         if (r < 0)
                 return r;
 
-        r = bus_event_loop_with_idle(event, bus, "org.freedesktop.timedate1", DEFAULT_EXIT_USEC, NULL, NULL);
+        r = sd_notify(false, NOTIFY_READY_MESSAGE);
+        if (r < 0)
+                log_warning_errno(r, "Failed to send readiness notification, ignoring: %m");
+
+        r = bus_event_loop_with_idle(
+                        event,
+                        bus,
+                        "org.freedesktop.timedate1",
+                        DEFAULT_EXIT_USEC,
+                        context_check_idle,
+                        &context);
         if (r < 0)
                 return log_error_errno(r, "Failed to run event loop: %m");
 

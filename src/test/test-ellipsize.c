@@ -3,7 +3,8 @@
 #include <stdio.h>
 
 #include "alloc-util.h"
-#include "constants.h"
+#include "ansi-color.h"
+#include "escape.h"
 #include "string-util.h"
 #include "strv.h"
 #include "terminal-util.h"
@@ -56,9 +57,9 @@ static void test_ellipsize_mem_one(const char *s, size_t old_length, size_t new_
                 assert_se(utf8_console_width(t3) <= max_width);
 
         if (new_length >= old_length) {
-                assert_se(streq(t1, n));
-                assert_se(streq(t2, n));
-                assert_se(streq(t3, n));
+                ASSERT_STREQ(t1, n);
+                ASSERT_STREQ(t2, n);
+                ASSERT_STREQ(t3, n);
         }
 }
 
@@ -75,7 +76,7 @@ TEST(ellipsize_mem) {
 }
 
 static void test_ellipsize_one(const char *p) {
-        _cleanup_free_ char *t;
+        _cleanup_free_ char *t = NULL;
         t = ellipsize(p, columns(), 70);
         puts(t);
         free(t);
@@ -113,6 +114,46 @@ TEST(ellipsize) {
         test_ellipsize_one("🐮🐮🐮🐮🐮🐮🐮🐮🐮🐮🐮🐮🐮🐮🐮🐮🐮🐮🐮🐮🐮🐮🐮🐮🐮🐮🐮🐮🐮🐮🐮🐮🐮🐮🐮🐮🐮🐮🐮🐮🐮🐮🐮🐮🐮🐮🐮🐮🐮🐮🐮🐮🐮🐮🐮🐮🐮🐮🐮🐮🐮🐮🐮🐮🐮🐮🐮🐮🐮🐮🐮🐮🐮🐮🐮🐮🐮🐮🐮🐮🐮🐮🐮🐮🐮🐮🐮");
         test_ellipsize_one("Lorem ipsum dolor sit amet, consectetur adipisicing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum.");
         test_ellipsize_one("shórt");
+}
+
+TEST(ellipsize_ansi) {
+        const char *s = ANSI_HIGHLIGHT_YELLOW_UNDERLINE "yęllow"
+                        ANSI_HIGHLIGHT_GREY_UNDERLINE "grěy"
+                        ANSI_HIGHLIGHT_BLUE_UNDERLINE "blue"
+                        ANSI_NORMAL "nórmął";
+        size_t len = strlen(s);
+
+        for (unsigned percent = 0; percent <= 100; percent += 15)
+                for (ssize_t x = 21; x >= 0; x--) {
+                        _cleanup_free_ char *t = ellipsize_mem(s, len, x, percent);
+                        printf("%02zd: \"%s\"\n", x, t);
+                        assert_se(utf8_is_valid(t));
+
+                        if (DEBUG_LOGGING) {
+                                _cleanup_free_ char *e = cescape(t);
+                                printf("  : \"%s\"\n", e);
+                        }
+                }
+}
+
+TEST(ellipsize_ansi_cats) {
+        _cleanup_free_ char *e = NULL, *f = NULL, *g = NULL, *h = NULL;
+
+        /* Make sure we don't cut off in the middle of an ANSI escape sequence. */
+
+        e = ellipsize("01" ANSI_NORMAL "23", 4, 0);
+        puts(e);
+        ASSERT_STREQ(e, "01" ANSI_NORMAL "23");
+        f = ellipsize("ab" ANSI_NORMAL "cd", 4, 90);
+        puts(f);
+        ASSERT_STREQ(f, "ab" ANSI_NORMAL "cd");
+
+        g = ellipsize("🐱🐱" ANSI_NORMAL "🐱🐱" ANSI_NORMAL, 5, 0);
+        puts(g);
+        ASSERT_STREQ(g, "…" ANSI_NORMAL "🐱🐱" ANSI_NORMAL);
+        h = ellipsize("🐱🐱" ANSI_NORMAL "🐱🐱" ANSI_NORMAL, 5, 90);
+        puts(h);
+        ASSERT_STREQ(h, "🐱…" ANSI_NORMAL "🐱" ANSI_NORMAL);
 }
 
 DEFINE_TEST_MAIN(LOG_INFO);

@@ -1,53 +1,28 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <errno.h>
 #include <sys/stat.h>
-#include <sys/types.h>
-#include <unistd.h>
 
 #include "sd-bus.h"
+#include "sd-event.h"
 
 #include "alloc-util.h"
 #include "bus-error.h"
 #include "bus-locator.h"
 #include "bus-log-control-api.h"
-#include "bus-message.h"
+#include "bus-object.h"
 #include "bus-polkit.h"
+#include "bus-unit-util.h"
+#include "bus-util.h"
 #include "constants.h"
-#include "kbd-util.h"
+#include "daemon-util.h"
+#include "hashmap.h"
+#include "label-util.h"
 #include "localed-util.h"
-#include "macro.h"
+#include "log.h"
 #include "main-func.h"
-#include "missing_capability.h"
-#include "path-util.h"
-#include "selinux-util.h"
 #include "service-util.h"
-#include "signal-util.h"
 #include "string-util.h"
 #include "strv.h"
-#include "user-util.h"
-
-static int reload_system_manager(sd_bus *bus) {
-        _cleanup_(sd_bus_message_unrefp) sd_bus_message *m = NULL;
-        _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
-        int r;
-
-        assert(bus);
-
-        r = sd_bus_message_new_method_call(bus, &m,
-                        "org.freedesktop.systemd1",
-                        "/org/freedesktop/systemd1",
-                        "org.freedesktop.systemd1.Manager",
-                        "Reload");
-        if (r < 0)
-                return bus_log_create_error(r);
-
-        r = sd_bus_call(bus, m, 0, &error, NULL);
-        if (r < 0)
-                return log_error_errno(r, "Failed to reload system manager: %s", bus_error_message(&error, r));
-
-        return 0;
-}
 
 static int vconsole_reload(sd_bus *bus) {
         _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
@@ -56,10 +31,8 @@ static int vconsole_reload(sd_bus *bus) {
         assert(bus);
 
         r = bus_call_method(bus, bus_systemd_mgr, "RestartUnit", &error, NULL, "ss", "systemd-vconsole-setup.service", "replace");
-
         if (r < 0)
                 return log_error_errno(r, "Failed to issue method call: %s", bus_error_message(&error, r));
-
         return 0;
 }
 
@@ -180,11 +153,7 @@ static int process_locale_list_item(
                 if (new_locale[p])
                         return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Locale variable %s set twice, refusing.", name);
 
-                new_locale[p] = strdup(e);
-                if (!new_locale[p])
-                        return -ENOMEM;
-
-                return 0;
+                return strdup_to(&new_locale[p], e);
         }
 
         return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Locale assignment %s not valid, refusing.", assignment);
@@ -215,7 +184,7 @@ static int locale_gen_process_locale(char *new_locale[static _VARIABLE_LC_MAX], 
                         log_error_errno(r, "Failed to enable invalid locale %s for generation.", new_locale[p]);
                         return sd_bus_error_setf(error,
                                                  SD_BUS_ERROR_INVALID_ARGS,
-                                                 "Can not enable locale generation for invalid locale: %s",
+                                                 "Cannot enable locale generation for invalid locale: %s",
                                                  new_locale[p]);
                 }
                 if (r < 0) {
@@ -304,13 +273,12 @@ static int method_set_locale(sd_bus_message *m, void *userdata, sd_bus_error *er
                 return sd_bus_reply_method_return(m, NULL);
         }
 
-        r = bus_verify_polkit_async(
+        r = bus_verify_polkit_async_full(
                         m,
-                        CAP_SYS_ADMIN,
                         "org.freedesktop.locale1.set-locale",
-                        NULL,
-                        interactive,
-                        UID_INVALID,
+                        /* details= */ NULL,
+                        /* good_user= */ UID_INVALID,
+                        interactive ? POLKIT_ALLOW_INTERACTIVE : 0,
                         &c->polkit_registry,
                         error);
         if (r < 0)
@@ -338,7 +306,7 @@ static int method_set_locale(sd_bus_message *m, void *userdata, sd_bus_error *er
          * update its default locale settings. It's important to not use UnsetAndSetEnvironment or a similar
          * method because in this case unsetting variables means restoring them to PID1 default values, which
          * may be outdated, since locale.conf has just changed and PID1 hasn't read it */
-        (void) reload_system_manager(sd_bus_message_get_bus(m));
+        (void) bus_service_manager_reload(sd_bus_message_get_bus(m));
 
         if (!strv_isempty(l_set)) {
                 _cleanup_free_ char *line = NULL;
@@ -389,7 +357,7 @@ static int method_set_vc_keyboard(sd_bus_message *m, void *userdata, sd_bus_erro
         }
 
         if (convert) {
-                r = vconsole_convert_to_x11(&in, &converted);
+                r = vconsole_convert_to_x11(&in, x11_context_verify, &converted);
                 if (r < 0) {
                         log_error_errno(r, "Failed to convert keymap data: %m");
                         return sd_bus_error_set_errnof(error, r, "Failed to convert keymap data: %m");
@@ -409,13 +377,12 @@ static int method_set_vc_keyboard(sd_bus_message *m, void *userdata, sd_bus_erro
         if (vc_context_equal(&c->vc, &in) && !x_needs_update)
                 return sd_bus_reply_method_return(m, NULL);
 
-        r = bus_verify_polkit_async(
+        r = bus_verify_polkit_async_full(
                         m,
-                        CAP_SYS_ADMIN,
                         "org.freedesktop.locale1.set-keyboard",
-                        NULL,
-                        interactive,
-                        UID_INVALID,
+                        /* details= */ NULL,
+                        /* good_user= */ UID_INVALID,
+                        interactive ? POLKIT_ALLOW_INTERACTIVE : 0,
                         &c->polkit_registry,
                         error);
         if (r < 0)
@@ -529,13 +496,12 @@ static int method_set_x11_keyboard(sd_bus_message *m, void *userdata, sd_bus_err
         if (x11_context_equal(&c->x11_from_vc, &in) && x11_context_equal(&c->x11_from_xorg, &in) && !convert)
                 return sd_bus_reply_method_return(m, NULL);
 
-        r = bus_verify_polkit_async(
+        r = bus_verify_polkit_async_full(
                         m,
-                        CAP_SYS_ADMIN,
                         "org.freedesktop.locale1.set-keyboard",
-                        NULL,
-                        interactive,
-                        UID_INVALID,
+                        /* details= */ NULL,
+                        /* good_user= */ UID_INVALID,
+                        interactive ? POLKIT_ALLOW_INTERACTIVE : 0,
                         &c->polkit_registry,
                         error);
         if (r < 0)
@@ -651,6 +617,12 @@ static int connect_bus(Context *c, sd_event *event, sd_bus **_bus) {
         return 0;
 }
 
+static bool context_check_idle(void *userdata) {
+        Context *c = ASSERT_PTR(userdata);
+
+        return hashmap_isempty(c->polkit_registry);
+}
+
 static int run(int argc, char *argv[]) {
         _cleanup_(context_clear) Context context = {};
         _cleanup_(sd_event_unrefp) sd_event *event = NULL;
@@ -669,11 +641,9 @@ static int run(int argc, char *argv[]) {
 
         umask(0022);
 
-        r = mac_selinux_init();
+        r = mac_init();
         if (r < 0)
                 return r;
-
-        assert_se(sigprocmask_many(SIG_BLOCK, NULL, SIGTERM, SIGINT, -1) >= 0);
 
         r = sd_event_default(&event);
         if (r < 0)
@@ -681,19 +651,25 @@ static int run(int argc, char *argv[]) {
 
         (void) sd_event_set_watchdog(event, true);
 
-        r = sd_event_add_signal(event, NULL, SIGINT, NULL, NULL);
+        r = sd_event_set_signal_exit(event, true);
         if (r < 0)
-                return log_error_errno(r, "Failed to install SIGINT handler: %m");
-
-        r = sd_event_add_signal(event, NULL, SIGTERM, NULL, NULL);
-        if (r < 0)
-                return log_error_errno(r, "Failed to install SIGTERM handler: %m");
+                return log_error_errno(r, "Failed to install SIGINT/SIGTERM handlers: %m");
 
         r = connect_bus(&context, event, &bus);
         if (r < 0)
                 return r;
 
-        r = bus_event_loop_with_idle(event, bus, "org.freedesktop.locale1", DEFAULT_EXIT_USEC, NULL, NULL);
+        r = sd_notify(false, NOTIFY_READY_MESSAGE);
+        if (r < 0)
+                log_warning_errno(r, "Failed to send readiness notification, ignoring: %m");
+
+        r = bus_event_loop_with_idle(
+                        event,
+                        bus,
+                        "org.freedesktop.locale1",
+                        DEFAULT_EXIT_USEC,
+                        context_check_idle,
+                        &context);
         if (r < 0)
                 return log_error_errno(r, "Failed to run event loop: %m");
 

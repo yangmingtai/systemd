@@ -1,13 +1,8 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <unistd.h>
-
-#include "alloc-util.h"
-#include "fileio.h"
 #include "hostname-util.h"
 #include "string-util.h"
 #include "tests.h"
-#include "tmpfile-util.h"
 
 TEST(hostname_is_valid) {
         assert_se(hostname_is_valid("foobar", 0));
@@ -44,33 +39,36 @@ TEST(hostname_is_valid) {
         assert_se(!hostname_is_valid("foo..bar", VALID_HOSTNAME_TRAILING_DOT));
         assert_se(!hostname_is_valid("foo.bar..", VALID_HOSTNAME_TRAILING_DOT));
         assert_se(!hostname_is_valid("xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", VALID_HOSTNAME_TRAILING_DOT));
+
+        ASSERT_FALSE(hostname_is_valid("foo??bar", 0));
+        ASSERT_TRUE(hostname_is_valid("foo??bar", VALID_HOSTNAME_QUESTION_MARK));
 }
 
 TEST(hostname_cleanup) {
         char *s;
 
         s = strdupa_safe("foobar");
-        assert_se(streq(hostname_cleanup(s), "foobar"));
+        ASSERT_STREQ(hostname_cleanup(s), "foobar");
         s = strdupa_safe("foobar.com");
-        assert_se(streq(hostname_cleanup(s), "foobar.com"));
+        ASSERT_STREQ(hostname_cleanup(s), "foobar.com");
         s = strdupa_safe("foobar.com.");
-        assert_se(streq(hostname_cleanup(s), "foobar.com"));
+        ASSERT_STREQ(hostname_cleanup(s), "foobar.com");
         s = strdupa_safe("foo-bar.-com-.");
-        assert_se(streq(hostname_cleanup(s), "foo-bar.com"));
+        ASSERT_STREQ(hostname_cleanup(s), "foo-bar.com");
         s = strdupa_safe("foo-bar-.-com-.");
-        assert_se(streq(hostname_cleanup(s), "foo-bar--com"));
+        ASSERT_STREQ(hostname_cleanup(s), "foo-bar--com");
         s = strdupa_safe("--foo-bar.-com");
-        assert_se(streq(hostname_cleanup(s), "foo-bar.com"));
+        ASSERT_STREQ(hostname_cleanup(s), "foo-bar.com");
         s = strdupa_safe("fooBAR");
-        assert_se(streq(hostname_cleanup(s), "fooBAR"));
+        ASSERT_STREQ(hostname_cleanup(s), "fooBAR");
         s = strdupa_safe("fooBAR.com");
-        assert_se(streq(hostname_cleanup(s), "fooBAR.com"));
+        ASSERT_STREQ(hostname_cleanup(s), "fooBAR.com");
         s = strdupa_safe("fooBAR.");
-        assert_se(streq(hostname_cleanup(s), "fooBAR"));
+        ASSERT_STREQ(hostname_cleanup(s), "fooBAR");
         s = strdupa_safe("fooBAR.com.");
-        assert_se(streq(hostname_cleanup(s), "fooBAR.com"));
+        ASSERT_STREQ(hostname_cleanup(s), "fooBAR.com");
         s = strdupa_safe("fööbar");
-        assert_se(streq(hostname_cleanup(s), "fbar"));
+        ASSERT_STREQ(hostname_cleanup(s), "fbar");
         s = strdupa_safe("");
         assert_se(isempty(hostname_cleanup(s)));
         s = strdupa_safe(".");
@@ -78,39 +76,45 @@ TEST(hostname_cleanup) {
         s = strdupa_safe("..");
         assert_se(isempty(hostname_cleanup(s)));
         s = strdupa_safe("foobar.");
-        assert_se(streq(hostname_cleanup(s), "foobar"));
+        ASSERT_STREQ(hostname_cleanup(s), "foobar");
         s = strdupa_safe(".foobar");
-        assert_se(streq(hostname_cleanup(s), "foobar"));
+        ASSERT_STREQ(hostname_cleanup(s), "foobar");
         s = strdupa_safe("foo..bar");
-        assert_se(streq(hostname_cleanup(s), "foo.bar"));
+        ASSERT_STREQ(hostname_cleanup(s), "foo.bar");
         s = strdupa_safe("foo.bar..");
-        assert_se(streq(hostname_cleanup(s), "foo.bar"));
+        ASSERT_STREQ(hostname_cleanup(s), "foo.bar");
         s = strdupa_safe("xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx");
-        assert_se(streq(hostname_cleanup(s), "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"));
+        ASSERT_STREQ(hostname_cleanup(s), "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx");
         s = strdupa_safe("xxxx........xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx");
-        assert_se(streq(hostname_cleanup(s), "xxxx.xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"));
+        ASSERT_STREQ(hostname_cleanup(s), "xxxx.xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx");
 }
 
-TEST(hostname_malloc) {
-        _cleanup_free_ char *h = NULL, *l = NULL;
+static void test_split_user_at_host_one(const char *s, const char *expected_user, const char *expected_host, int ret) {
+        _cleanup_free_ char *u = NULL, *h = NULL;
 
-        assert_se(h = gethostname_malloc());
-        log_info("hostname_malloc: \"%s\"", h);
+        ASSERT_OK_EQ(split_user_at_host(s, &u, &h), ret);
+        ASSERT_STREQ(u, expected_user);
+        ASSERT_STREQ(h, expected_host);
 
-        assert_se(l = gethostname_short_malloc());
-        log_info("hostname_short_malloc: \"%s\"", l);
+        u = mfree(u);
+        h = mfree(h);
+
+        ASSERT_OK_EQ(split_user_at_host(s, &u, NULL), ret);
+        ASSERT_STREQ(u, expected_user);
+
+        ASSERT_OK_EQ(split_user_at_host(s, NULL, &h), ret);
+        ASSERT_STREQ(h, expected_host);
 }
 
-TEST(default_hostname) {
-        if (!hostname_is_valid(FALLBACK_HOSTNAME, 0)) {
-                log_error("Configured fallback hostname \"%s\" is not valid.", FALLBACK_HOSTNAME);
-                exit(EXIT_FAILURE);
-        }
+TEST(split_user_at_host) {
+        ASSERT_ERROR(split_user_at_host("", NULL, NULL), EINVAL);
 
-        _cleanup_free_ char *n = get_default_hostname();
-        assert_se(n);
-        log_info("get_default_hostname: \"%s\"", n);
-        assert_se(hostname_is_valid(n, 0));
+        test_split_user_at_host_one("@", NULL, NULL, 1);
+        test_split_user_at_host_one("a", NULL, "a", 0);
+        test_split_user_at_host_one("a@b", "a", "b", 1);
+        test_split_user_at_host_one("@b", NULL, "b", 1);
+        test_split_user_at_host_one("a@", "a", NULL, 1);
+        test_split_user_at_host_one("aa@@@bb", "aa", "@@bb", 1);
 }
 
 DEFINE_TEST_MAIN(LOG_DEBUG);

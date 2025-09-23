@@ -1,31 +1,36 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <fcntl.h>
+#include <linux/magic.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
 #include "alloc-util.h"
 #include "blockdev-util.h"
+#include "build-path.h"
 #include "chase.h"
 #include "device-util.h"
 #include "devnum-util.h"
 #include "dirent-util.h"
-#include "env-util.h"
+#include "errno-util.h"
 #include "fd-util.h"
+#include "fdisk-util.h"
 #include "fileio.h"
+#include "find-esp.h"
 #include "glyph-util.h"
 #include "gpt.h"
 #include "hexdecoct.h"
 #include "import-util.h"
-#include "macro.h"
 #include "process-util.h"
 #include "sort-util.h"
+#include "stat-util.h"
 #include "string-table.h"
+#include "strv.h"
 #include "sysupdate-cache.h"
 #include "sysupdate-instance.h"
 #include "sysupdate-pattern.h"
 #include "sysupdate-resource.h"
-#include "sysupdate.h"
+#include "time-util.h"
 #include "utf8.h"
 
 void resource_destroy(Resource *rr) {
@@ -68,30 +73,16 @@ static int resource_add_instance(
         return 0;
 }
 
-static int resource_load_from_directory(
+static int resource_load_from_directory_recursive(
                 Resource *rr,
+                DIR* d,
+                const char* relpath,
                 mode_t m) {
-
-        _cleanup_(closedirp) DIR *d = NULL;
         int r;
-
-        assert(rr);
-        assert(IN_SET(rr->type, RESOURCE_TAR, RESOURCE_REGULAR_FILE, RESOURCE_DIRECTORY, RESOURCE_SUBVOLUME));
-        assert(IN_SET(m, S_IFREG, S_IFDIR));
-
-        d = opendir(rr->path);
-        if (!d) {
-                if (errno == ENOENT) {
-                        log_debug("Directory %s does not exist, not loading any resources.", rr->path);
-                        return 0;
-                }
-
-                return log_error_errno(errno, "Failed to open directory '%s': %m", rr->path);
-        }
 
         for (;;) {
                 _cleanup_(instance_metadata_destroy) InstanceMetadata extracted_fields = INSTANCE_METADATA_NULL;
-                _cleanup_free_ char *joined = NULL;
+                _cleanup_free_ char *joined = NULL, *rel_joined = NULL;
                 Instance *instance;
                 struct dirent *de;
                 struct stat st;
@@ -110,7 +101,7 @@ static int resource_load_from_directory(
                         break;
 
                 case DT_DIR:
-                        if (m != S_IFDIR)
+                        if (!IN_SET(m, S_IFDIR, S_IFREG))
                                 continue;
 
                         break;
@@ -131,16 +122,36 @@ static int resource_load_from_directory(
                         return log_error_errno(errno, "Failed to stat %s/%s: %m", rr->path, de->d_name);
                 }
 
-                if ((st.st_mode & S_IFMT) != m)
+                if (!(S_ISDIR(st.st_mode) && S_ISREG(m)) && ((st.st_mode & S_IFMT) != m))
                         continue;
 
-                r = pattern_match_many(rr->patterns, de->d_name, &extracted_fields);
-                if (r < 0)
+                rel_joined = path_join(relpath, de->d_name);
+                if (!rel_joined)
+                        return log_oom();
+
+                r = pattern_match_many(rr->patterns, rel_joined, &extracted_fields);
+                if (r == PATTERN_MATCH_RETRY) {
+                        _cleanup_closedir_ DIR *subdir = NULL;
+
+                        subdir = xopendirat(dirfd(d), rel_joined, 0);
+                        if (!subdir)
+                                continue;
+
+                        r = resource_load_from_directory_recursive(rr, subdir, rel_joined, m);
+                        if (r < 0)
+                                return r;
+                        if (r == 0)
+                                continue;
+                }
+                else if (r < 0)
                         return log_error_errno(r, "Failed to match pattern: %m");
-                if (r == 0)
+                else if (r == PATTERN_MATCH_NO)
                         continue;
 
-                joined = path_join(rr->path, de->d_name);
+                if (de->d_type == DT_DIR && m != S_IFDIR)
+                        continue;
+
+                joined = path_join(rr->path, rel_joined);
                 if (!joined)
                         return log_oom();
 
@@ -159,6 +170,28 @@ static int resource_load_from_directory(
         return 0;
 }
 
+static int resource_load_from_directory(
+                Resource *rr,
+                mode_t m) {
+        _cleanup_closedir_ DIR *d = NULL;
+
+        assert(rr);
+        assert(IN_SET(rr->type, RESOURCE_TAR, RESOURCE_REGULAR_FILE, RESOURCE_DIRECTORY, RESOURCE_SUBVOLUME));
+        assert(IN_SET(m, S_IFREG, S_IFDIR));
+
+        d = opendir(rr->path);
+        if (!d) {
+                if (errno == ENOENT) {
+                        log_debug_errno(errno, "Directory %s does not exist, not loading any resources: %m", rr->path);
+                        return 0;
+                }
+
+                return log_error_errno(errno, "Failed to open directory '%s': %m", rr->path);
+        }
+
+        return resource_load_from_directory_recursive(rr, d, NULL, m);
+}
+
 static int resource_load_from_blockdev(Resource *rr) {
         _cleanup_(fdisk_unref_contextp) struct fdisk_context *c = NULL;
         _cleanup_(fdisk_unref_tablep) struct fdisk_table *t = NULL;
@@ -167,13 +200,9 @@ static int resource_load_from_blockdev(Resource *rr) {
 
         assert(rr);
 
-        c = fdisk_new_context();
-        if (!c)
-                return log_oom();
-
-        r = fdisk_assign_device(c, rr->path, /* readonly= */ true);
+        r = fdisk_new_context_at(AT_FDCWD, rr->path, /* read_only= */ true, /* sector_size= */ UINT32_MAX, &c);
         if (r < 0)
-                return log_error_errno(r, "Failed to open device '%s': %m", rr->path);
+                return log_error_errno(r, "Failed to create fdisk context from '%s': %m", rr->path);
 
         if (!fdisk_is_labeltype(c, FDISK_DISKLABEL_GPT))
                 return log_error_errno(SYNTHETIC_ERRNO(EHWPOISON), "Disk %s has no GPT disk label, not suitable.", rr->path);
@@ -207,7 +236,7 @@ static int resource_load_from_blockdev(Resource *rr) {
                 r = pattern_match_many(rr->patterns, pinfo.label, &extracted_fields);
                 if (r < 0)
                         return log_error_errno(r, "Failed to match pattern: %m");
-                if (r == 0)
+                if (IN_SET(r, PATTERN_MATCH_NO, PATTERN_MATCH_RETRY))
                         continue;
 
                 r = resource_add_instance(rr, pinfo.device, &extracted_fields, &instance);
@@ -242,7 +271,7 @@ static int download_manifest(
                 size_t *ret_size) {
 
         _cleanup_free_ char *buffer = NULL, *suffixed_url = NULL;
-        _cleanup_(close_pairp) int pfd[2] = PIPE_EBADF;
+        _cleanup_close_pair_ int pfd[2] = EBADF_PAIR;
         _cleanup_fclose_ FILE *manifest = NULL;
         size_t size = 0;
         pid_t pid;
@@ -261,13 +290,13 @@ static int download_manifest(
         if (pipe2(pfd, O_CLOEXEC) < 0)
                 return log_error_errno(errno, "Failed to allocate pipe: %m");
 
-        log_info("%s Acquiring manifest file %s%s", special_glyph(SPECIAL_GLYPH_DOWNLOAD),
-                 suffixed_url, special_glyph(SPECIAL_GLYPH_ELLIPSIS));
+        log_info("%s Acquiring manifest file %s%s", glyph(GLYPH_DOWNLOAD),
+                 suffixed_url, glyph(GLYPH_ELLIPSIS));
 
         r = safe_fork_full("(sd-pull)",
                            (int[]) { -EBADF, pfd[1], STDERR_FILENO },
                            NULL, 0,
-                           FORK_RESET_SIGNALS|FORK_CLOSE_ALL_FDS|FORK_DEATHSIG|FORK_REARRANGE_STDIO|FORK_LOG,
+                           FORK_RESET_SIGNALS|FORK_CLOSE_ALL_FDS|FORK_DEATHSIG_SIGTERM|FORK_REARRANGE_STDIO|FORK_LOG,
                            &pid);
         if (r < 0)
                 return r;
@@ -275,7 +304,7 @@ static int download_manifest(
                 /* Child */
 
                 const char *cmdline[] = {
-                        "systemd-pull",
+                        SYSTEMD_PULL_PATH,
                         "raw",
                         "--direct",                        /* just download the specified URL, don't download anything else */
                         "--verify", verify_signature ? "signature" : "no", /* verify the manifest file */
@@ -284,8 +313,8 @@ static int download_manifest(
                         NULL
                 };
 
-                execv(pull_binary_path(), (char *const*) cmdline);
-                log_error_errno(errno, "Failed to execute %s tool: %m", pull_binary_path());
+                r = invoke_callout_binary(SYSTEMD_PULL_PATH, (char *const*) cmdline);
+                log_error_errno(r, "Failed to execute %s tool: %m", SYSTEMD_PULL_PATH);
                 _exit(EXIT_FAILURE);
         };
 
@@ -298,7 +327,7 @@ static int download_manifest(
 
         manifest = fdopen(pfd[0], "r");
         if (!manifest)
-                return log_error_errno(errno, "Failed allocate FILE object for manifest file: %m");
+                return log_error_errno(errno, "Failed to allocate FILE object for manifest file: %m");
 
         TAKE_FD(pfd[0]);
 
@@ -373,7 +402,7 @@ static int resource_load_from_web(
                 if (p[0] == '\\')
                         return log_error_errno(SYNTHETIC_ERRNO(EOPNOTSUPP), "File names with escapes not supported in manifest at line %zu, refusing.", line_nr);
 
-                r = unhexmem(p, 64, &h, &hlen);
+                r = unhexmem_full(p, 64, /* secure = */ false, &h, &hlen);
                 if (r < 0)
                         return log_error_errno(r, "Failed to parse digest at manifest line %zu, refusing.", line_nr);
 
@@ -405,7 +434,7 @@ static int resource_load_from_web(
                 r = pattern_match_many(rr->patterns, fn, &extracted_fields);
                 if (r < 0)
                         return log_error_errno(r, "Failed to match pattern: %m");
-                if (r > 0) {
+                if (r == PATTERN_MATCH_YES) {
                         _cleanup_free_ char *path = NULL;
 
                         r = import_url_append_component(rr->path, fn, &path);
@@ -501,17 +530,76 @@ int resource_load_instances(Resource *rr, bool verify, Hashmap **web_cache) {
         return 0;
 }
 
+static int instance_version_match(Instance *const*a, Instance *const*b) {
+        assert(a);
+        assert(b);
+        assert(*a);
+        assert(*b);
+        assert((*a)->metadata.version);
+        assert((*b)->metadata.version);
+
+        /* List is sorted newest-to-oldest */
+        return -strverscmp_improved((*a)->metadata.version, (*b)->metadata.version);
+}
+
 Instance* resource_find_instance(Resource *rr, const char *version) {
         Instance key = {
                 .metadata.version = (char*) version,
         }, *k = &key;
 
-        return typesafe_bsearch(&k, rr->instances, rr->n_instances, instance_cmp);
+        Instance **found;
+        found = typesafe_bsearch(&k, rr->instances, rr->n_instances, instance_version_match);
+        if (!found)
+                return NULL;
+
+        return *found;
+}
+
+static int get_sysext_overlay_block(const char *p, dev_t *ret) {
+        int r;
+
+        assert(p);
+        assert(ret);
+
+        /* Tries to read the backing device information systemd-sysext puts in the virtual file
+         * /usr/.systemd-sysext/backing */
+
+        _cleanup_free_ char *j = path_join(p, ".systemd-sysext");
+        if (!j)
+                return log_oom_debug();
+
+        _cleanup_close_ int fd = open(j, O_RDONLY|O_DIRECTORY);
+        if (fd < 0)
+                return log_debug_errno(errno, "Failed to open '%s': %m", j);
+
+        r = fd_is_fs_type(fd, OVERLAYFS_SUPER_MAGIC);
+        if (r < 0)
+                return log_debug_errno(r, "Failed to determine backing file system of '%s': %m", j);
+        if (r == 0)
+                return log_debug_errno(SYNTHETIC_ERRNO(ENOTTY), "Backing file system of '%s' is not an overlayfs.", j);
+
+        _cleanup_free_ char *buf = NULL;
+        r = read_one_line_file_at(fd, "backing", &buf);
+        if (r < 0)
+                return log_debug_errno(r, "Failed to read contents of '%s/backing': %m", j);
+
+        r = parse_devnum(buf, ret);
+        if (r < 0)
+                return log_debug_errno(r, "Failed to parse contents of '%s/backing': %m", j);
+
+        if (major(*ret) == 0) { /* not a block device? */
+                *ret = 0;
+                return 0;
+        }
+
+        (void) block_get_originating(*ret, ret);
+        return 1;
 }
 
 int resource_resolve_path(
                 Resource *rr,
                 const char *root,
+                const char *relative_to_directory,
                 const char *node) {
 
         _cleanup_free_ char *p = NULL;
@@ -520,9 +608,13 @@ int resource_resolve_path(
 
         assert(rr);
 
-        if (rr->path_auto) {
-                struct stat orig_root_stats;
+        if (IN_SET(rr->path_relative_to, PATH_RELATIVE_TO_ESP, PATH_RELATIVE_TO_XBOOTLDR, PATH_RELATIVE_TO_BOOT) &&
+            !IN_SET(rr->type, RESOURCE_REGULAR_FILE, RESOURCE_DIRECTORY))
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                       "Paths relative to %s are only allowed for regular-file or directory resources.",
+                                       path_relative_to_to_string(rr->path_relative_to));
 
+        if (rr->path_auto) {
                 /* NB: If the root mount has been replaced by some form of volatile file system (overlayfs),
                  * the original root block device node is symlinked in /run/systemd/volatile-root. Let's
                  * follow that link here. If that doesn't exist, we check the backing device of "/usr". We
@@ -546,12 +638,18 @@ int resource_resolve_path(
                         return log_error_errno(SYNTHETIC_ERRNO(EPERM),
                                                "Block device is not allowed when using --root= mode.");
 
-                r = stat("/run/systemd/volatile-root", &orig_root_stats);
+                struct stat orig_root_stats;
+                r = RET_NERRNO(stat("/run/systemd/volatile-root", &orig_root_stats));
                 if (r < 0) {
-                        if (errno == ENOENT) /* volatile-root not found */
-                                r = get_block_device_harder("/usr/", &d);
-                        else
+                        if (r != -ENOENT)
                                 return log_error_errno(r, "Failed to stat /run/systemd/volatile-root: %m");
+
+                        /* volatile-root not found */
+                        r = get_block_device_harder("/usr/", &d);
+                        if (r == 0) /* Not backed by a block device? Let's see if this is a sysext overlayfs instance */
+                                r = get_sysext_overlay_block("/usr/", &d);
+                        if (r < 0)
+                                return log_error_errno(r, "Failed to determine block device of file system: %m");
                 } else if (!S_ISBLK(orig_root_stats.st_mode)) /* symlink was present but not block device */
                         return log_error_errno(SYNTHETIC_ERRNO(ENOTBLK), "/run/systemd/volatile-root is not linked to a block device.");
                 else /* symlink was present and a block device */
@@ -562,7 +660,7 @@ int resource_resolve_path(
                 _cleanup_free_ char *resolved = NULL;
                 struct stat st;
 
-                r = chase(rr->path, root, CHASE_PREFIX_ROOT, &resolved, &fd);
+                r = chase(rr->path, root, CHASE_PREFIX_ROOT|CHASE_TRIGGER_AUTOFS, &resolved, &fd);
                 if (r < 0)
                         return log_error_errno(r, "Failed to resolve '%s': %m", rr->path);
 
@@ -593,22 +691,46 @@ int resource_resolve_path(
                 if (real_fd < 0)
                         return log_error_errno(real_fd, "Failed to convert O_PATH file descriptor for %s to regular file descriptor: %m", rr->path);
 
-                r = get_block_device_harder_fd(fd, &d);
-
-        } else if (RESOURCE_IS_FILESYSTEM(rr->type) && root) {
-                _cleanup_free_ char *resolved = NULL;
-
-                r = chase(rr->path, root, CHASE_PREFIX_ROOT, &resolved, NULL);
+                r = get_block_device_harder_fd(real_fd, &d);
                 if (r < 0)
-                        return log_error_errno(r, "Failed to resolve '%s': %m", rr->path);
+                        return log_error_errno(r, "Failed to determine block device of file system: %m");
+
+        } else if (RESOURCE_IS_FILESYSTEM(rr->type)) {
+                _cleanup_free_ char *resolved = NULL, *relative_to = NULL;
+                ChaseFlags chase_flags = CHASE_NONEXISTENT | CHASE_PREFIX_ROOT | CHASE_TRIGGER_AUTOFS;
+
+                if (rr->path_relative_to == PATH_RELATIVE_TO_EXPLICIT) {
+                        assert(relative_to_directory);
+
+                        relative_to = strdup(relative_to_directory);
+                        if (!relative_to)
+                                return log_oom();
+                } else if (rr->path_relative_to == PATH_RELATIVE_TO_ROOT) {
+                        relative_to = strdup(empty_to_root(root));
+                        if (!relative_to)
+                                return log_oom();
+                } else { /* boot, esp, or xbootldr */
+                        r = 0;
+                        if (IN_SET(rr->path_relative_to, PATH_RELATIVE_TO_BOOT, PATH_RELATIVE_TO_XBOOTLDR))
+                                r = find_xbootldr_and_warn(root, NULL, /* unprivileged_mode= */ -1, &relative_to, NULL, NULL);
+                        if (r == -ENOKEY || rr->path_relative_to == PATH_RELATIVE_TO_ESP)
+                                r = find_esp_and_warn(root, NULL, -1, &relative_to, NULL, NULL, NULL, NULL, NULL);
+                        if (r < 0)
+                                return log_error_errno(r, "Failed to resolve $BOOT: %m");
+                        log_debug("Resolved $BOOT to '%s'", relative_to);
+
+                        /* Since this partition is read from EFI, there should be no symlinks */
+                        chase_flags |= CHASE_PROHIBIT_SYMLINKS;
+                }
+
+                r = chase(rr->path, relative_to, chase_flags, &resolved, NULL);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to resolve '%s' (relative to '%s'): %m", rr->path, relative_to);
 
                 free_and_replace(rr->path, resolved);
                 return 0;
         } else
                 return 0; /* Otherwise assume there's nothing to resolve */
-
-        if (r < 0)
-                return log_error_errno(r, "Failed to determine block device of file system: %m");
 
         r = block_get_whole_disk(d, &d);
         if (r < 0)
@@ -641,3 +763,13 @@ static const char *resource_type_table[_RESOURCE_TYPE_MAX] = {
 };
 
 DEFINE_STRING_TABLE_LOOKUP(resource_type, ResourceType);
+
+static const char *path_relative_to_table[_PATH_RELATIVE_TO_MAX] = {
+        [PATH_RELATIVE_TO_ROOT]     = "root",
+        [PATH_RELATIVE_TO_ESP]      = "esp",
+        [PATH_RELATIVE_TO_XBOOTLDR] = "xbootldr",
+        [PATH_RELATIVE_TO_BOOT]     = "boot",
+        [PATH_RELATIVE_TO_EXPLICIT] = "explicit",
+};
+
+DEFINE_STRING_TABLE_LOOKUP(path_relative_to, PathRelativeTo);

@@ -26,7 +26,7 @@
                         <allow_inactive>no</allow_inactive>
                         <allow_active>auth_admin_keep</allow_active>
                 </defaults>
-                <annotate key="org.freedesktop.policykit.exec.path">{{ROOTLIBEXECDIR}}/systemd-reply-password</annotate>
+                <annotate key="org.freedesktop.policykit.exec.path">{{LIBEXECDIR}}/systemd-reply-password</annotate>
         </action>
 
         <action id="org.freedesktop.systemd1.manage-units">
@@ -63,6 +63,16 @@
         <action id="org.freedesktop.systemd1.reload-daemon">
                 <description gettext-domain="systemd">Reload the systemd state</description>
                 <message gettext-domain="systemd">Authentication is required to reload the systemd state.</message>
+                <defaults>
+                        <allow_any>auth_admin</allow_any>
+                        <allow_inactive>auth_admin</allow_inactive>
+                        <allow_active>auth_admin_keep</allow_active>
+                </defaults>
+        </action>
+
+        <action id="org.freedesktop.systemd1.bypass-dump-ratelimit">
+                <description gettext-domain="systemd">Dump the systemd state without rate limits</description>
+                <message gettext-domain="systemd">Authentication is required to dump the systemd state without rate limits.</message>
                 <defaults>
                         <allow_any>auth_admin</allow_any>
                         <allow_inactive>auth_admin</allow_inactive>

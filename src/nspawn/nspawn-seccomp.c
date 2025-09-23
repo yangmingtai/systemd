@@ -1,22 +1,12 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <errno.h>
+#include <linux/capability.h>
 #include <linux/netlink.h>
-#include <sys/capability.h>
 #include <sys/socket.h>
-#include <sys/types.h>
 
-#if HAVE_SECCOMP
-#include <seccomp.h>
-#endif
-
-#include "alloc-util.h"
 #include "log.h"
 #include "nspawn-seccomp.h"
-#if HAVE_SECCOMP
 #include "seccomp-util.h"
-#endif
-#include "string-util.h"
 #include "strv.h"
 
 #if HAVE_SECCOMP
@@ -40,6 +30,7 @@ static int add_syscall_filters(
                 { 0,                  "@file-system"                 },
                 { 0,                  "@io-event"                    },
                 { 0,                  "@ipc"                         },
+                { 0,                  "@keyring"                     },
                 { 0,                  "@mount"                       },
                 { 0,                  "@network-io"                  },
                 { 0,                  "@process"                     },
@@ -56,6 +47,7 @@ static int add_syscall_filters(
                 { CAP_IPC_LOCK,       "@memlock"                     },
 
                 /* Plus a good set of additional syscalls which are not part of any of the groups above */
+                { 0,                  "arm_fadvise64_64"             },
                 { 0,                  "brk"                          },
                 { 0,                  "capget"                       },
                 { 0,                  "capset"                       },
@@ -90,7 +82,6 @@ static int add_syscall_filters(
                 { 0,                  "sched_rr_get_interval"        },
                 { 0,                  "sched_rr_get_interval_time64" },
                 { 0,                  "sched_yield"                  },
-                { 0,                  "seccomp"                      },
                 { 0,                  "sendfile"                     },
                 { 0,                  "sendfile64"                   },
                 { 0,                  "setdomainname"                },
@@ -117,17 +108,16 @@ static int add_syscall_filters(
                 { CAP_SYS_BOOT,       "reboot"                       },
                 { CAP_SYSLOG,         "syslog"                       },
                 { CAP_SYS_TTY_CONFIG, "vhangup"                      },
+                { CAP_BPF,            "bpf",                         },
 
                 /*
                  * The following syscalls and groups are knowingly excluded:
                  *
                  * @cpu-emulation
-                 * @keyring           (NB: keyring is not namespaced!)
                  * @obsolete
                  * @pkey
                  * @swap
                  *
-                 * bpf
                  * fanotify_init
                  * fanotify_mark
                  * kexec_file_load
@@ -143,18 +133,18 @@ static int add_syscall_filters(
         _cleanup_strv_free_ char **added = NULL;
         int r;
 
-        for (size_t i = 0; i < ELEMENTSOF(allow_list); i++) {
-                if (allow_list[i].capability != 0 && (cap_list_retain & (1ULL << allow_list[i].capability)) == 0)
+        FOREACH_ELEMENT(i, allow_list) {
+                if (i->capability != 0 && (cap_list_retain & (1ULL << i->capability)) == 0)
                         continue;
 
                 r = seccomp_add_syscall_filter_item(ctx,
-                                                    allow_list[i].name,
+                                                    i->name,
                                                     SCMP_ACT_ALLOW,
                                                     syscall_deny_list,
                                                     false,
                                                     &added);
                 if (r < 0)
-                        return log_error_errno(r, "Failed to add syscall filter item %s: %m", allow_list[i].name);
+                        return log_error_errno(r, "Failed to add syscall filter item %s: %m", i->name);
         }
 
         STRV_FOREACH(p, syscall_allow_list) {
@@ -175,7 +165,7 @@ static int add_syscall_filters(
         /* We have a large filter here, so let's turn on the binary tree mode if possible. */
         r = seccomp_attr_set(ctx, SCMP_FLTATR_CTL_OPTIMIZE, 2);
         if (r < 0)
-                return r;
+                log_warning_errno(r, "Failed to set SCMP_FLTATR_CTL_OPTIMIZE, ignoring: %m");
 #endif
 
         return 0;
@@ -206,10 +196,11 @@ int setup_seccomp(uint64_t cap_list_retain, char **syscall_allow_list, char **sy
                         return r;
 
                 r = seccomp_load(seccomp);
-                if (ERRNO_IS_SECCOMP_FATAL(r))
+                if (ERRNO_IS_NEG_SECCOMP_FATAL(r))
                         return log_error_errno(r, "Failed to install seccomp filter: %m");
                 if (r < 0)
-                        log_debug_errno(r, "Failed to install filter set for architecture %s, skipping: %m", seccomp_arch_to_string(arch));
+                        log_debug_errno(r, "Failed to install filter set for architecture %s, skipping: %m",
+                                        seccomp_arch_to_string(arch));
         }
 
         SECCOMP_FOREACH_LOCAL_ARCH(arch) {
@@ -242,10 +233,11 @@ int setup_seccomp(uint64_t cap_list_retain, char **syscall_allow_list, char **sy
                 }
 
                 r = seccomp_load(seccomp);
-                if (ERRNO_IS_SECCOMP_FATAL(r))
+                if (ERRNO_IS_NEG_SECCOMP_FATAL(r))
                         return log_error_errno(r, "Failed to install seccomp audit filter: %m");
                 if (r < 0)
-                        log_debug_errno(r, "Failed to install filter set for architecture %s, skipping: %m", seccomp_arch_to_string(arch));
+                        log_debug_errno(r, "Failed to install filter set for architecture %s, skipping: %m",
+                                        seccomp_arch_to_string(arch));
         }
 
         return 0;

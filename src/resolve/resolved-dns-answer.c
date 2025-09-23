@@ -4,9 +4,11 @@
 
 #include "alloc-util.h"
 #include "dns-domain.h"
+#include "log.h"
 #include "random-util.h"
 #include "resolved-dns-answer.h"
-#include "resolved-dns-dnssec.h"
+#include "resolved-dns-rr.h"
+#include "siphash24.h"
 #include "string-util.h"
 
 static DnsAnswerItem *dns_answer_item_free(DnsAnswerItem *item) {
@@ -26,7 +28,7 @@ static void dns_answer_item_hash_func(const DnsAnswerItem *a, struct siphash *st
         assert(a);
         assert(state);
 
-        siphash24_compress(&a->ifindex, sizeof(a->ifindex), state);
+        siphash24_compress_typesafe(a->ifindex, state);
 
         dns_resource_record_hash_func(a->rr, state);
 }
@@ -107,7 +109,8 @@ static int dns_answer_add_raw(
                 DnsResourceRecord *rr,
                 int ifindex,
                 DnsAnswerFlags flags,
-                DnsResourceRecord *rrsig) {
+                DnsResourceRecord *rrsig,
+                usec_t until) {
 
         _cleanup_(dns_answer_item_unrefp) DnsAnswerItem *item = NULL;
         int r;
@@ -129,6 +132,7 @@ static int dns_answer_add_raw(
                 .rr = dns_resource_record_ref(rr),
                 .ifindex = ifindex,
                 .flags = flags,
+                .until = until,
                 .rrsig = dns_resource_record_ref(rrsig),
         };
 
@@ -150,7 +154,8 @@ static int dns_answer_add_raw_all(DnsAnswer *a, DnsAnswer *source) {
                                 item->rr,
                                 item->ifindex,
                                 item->flags,
-                                item->rrsig);
+                                item->rrsig,
+                                /* until= */ USEC_INFINITY);
                 if (r < 0)
                         return r;
         }
@@ -158,12 +163,13 @@ static int dns_answer_add_raw_all(DnsAnswer *a, DnsAnswer *source) {
         return 0;
 }
 
-int dns_answer_add(
+int dns_answer_add_full(
                 DnsAnswer *a,
                 DnsResourceRecord *rr,
                 int ifindex,
                 DnsAnswerFlags flags,
-                DnsResourceRecord *rrsig) {
+                DnsResourceRecord *rrsig,
+                usec_t until) {
 
         DnsAnswerItem tmp, *exist;
 
@@ -181,11 +187,23 @@ int dns_answer_add(
 
         exist = ordered_set_get(a->items, &tmp);
         if (exist) {
-                /* There's already an RR of the same RRset in place! Let's see if the TTLs more or less
-                 * match. We don't really care if they match precisely, but we do care whether one is 0 and
-                 * the other is not. See RFC 2181, Section 5.2. */
-                if ((rr->ttl == 0) != (exist->rr->ttl == 0))
-                        return -EINVAL;
+                /* There's already an RR of the same RRset in place! Let's see if the TTLs more or
+                 * less match. RFC 2181, Section 5.2 suggests clients should reject RRsets
+                 * containing RRs with differing TTLs. We are more tolerant of this situation except
+                 * if one RR has a zero TTL and the other a nonzero TTL. In mDNS, zero TTLs are
+                 * special, so we must error in that case. */
+                if ((rr->ttl == 0) != (exist->rr->ttl == 0)) {
+                        if ((exist->flags | flags) & DNS_ANSWER_REFUSE_TTL_NO_MATCH)
+                                return log_debug_errno(
+                                                SYNTHETIC_ERRNO(EINVAL),
+                                                "Refusing to merge RRs with zero TTL and non-zero TTL: %s vs. %s",
+                                                dns_resource_record_to_string(rr),
+                                                dns_resource_record_to_string(exist->rr));
+
+                        log_debug("Merging RRs with zero TTL and non-zero TTL (not RFC 2181/5.2 compliant): %s vs. %s",
+                                  dns_resource_record_to_string(rr),
+                                  dns_resource_record_to_string(exist->rr));
+                }
 
                 /* Entry already exists, keep the entry with the higher TTL. */
                 if (rr->ttl > exist->rr->ttl) {
@@ -206,7 +224,7 @@ int dns_answer_add(
                 return 0;
         }
 
-        return dns_answer_add_raw(a, rr, ifindex, flags, rrsig);
+        return dns_answer_add_raw(a, rr, ifindex, flags, rrsig, until);
 }
 
 static int dns_answer_add_all(DnsAnswer *a, DnsAnswer *b) {
@@ -222,12 +240,13 @@ static int dns_answer_add_all(DnsAnswer *a, DnsAnswer *b) {
         return 0;
 }
 
-int dns_answer_add_extend(
+int dns_answer_add_extend_full(
                 DnsAnswer **a,
                 DnsResourceRecord *rr,
                 int ifindex,
                 DnsAnswerFlags flags,
-                DnsResourceRecord *rrsig) {
+                DnsResourceRecord *rrsig,
+                usec_t until) {
 
         int r;
 
@@ -238,7 +257,7 @@ int dns_answer_add_extend(
         if (r < 0)
                 return r;
 
-        return dns_answer_add(*a, rr, ifindex, flags, rrsig);
+        return dns_answer_add_full(*a, rr, ifindex, flags, rrsig, until);
 }
 
 int dns_answer_add_soa(DnsAnswer *a, const char *name, uint32_t ttl, int ifindex) {
@@ -650,7 +669,6 @@ void dns_answer_order_by_scope(DnsAnswer *a, bool prefer_link_local) {
         DNS_ANSWER_FOREACH_ITEM(item, a)
                 if (dns_resource_record_is_link_local_address(item->rr) != prefer_link_local)
                         *p++ = dns_answer_item_ref(item);
-
 
         assert((size_t) (p - items) == n);
 

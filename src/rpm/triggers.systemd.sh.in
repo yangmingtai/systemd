@@ -61,7 +61,7 @@ journalctl --update-catalog || :
 if test -d "/run/systemd/system"; then
   # systemd-binfmt might fail if binfmt_misc kernel module is not loaded
   # during install
-  {{ROOTLIBEXECDIR}}/systemd-binfmt || :
+  {{LIBEXECDIR}}/systemd-binfmt || :
 fi
 
 %transfiletriggerin -P 1000600 -- {{TMPFILES_DIR}}
@@ -75,13 +75,11 @@ fi
 %transfiletriggerin -P 1000600 udev -- {{UDEV_RULES_DIR}}
 # This script will automatically update udev with new rules if files
 # have been installed or updated in {{UDEV_RULES_DIR}}.
-if test -e /run/udev/control; then
-  udevadm control --reload || :
-fi
+{{SYSTEMD_UPDATE_HELPER_PATH}} mark-reload-system-units systemd-udevd.service || :
 
 %transfiletriggerin -P 1000500 -- {{SYSCTL_DIR}}
 # This script will automatically apply sysctl rules if files have been
 # installed or updated in {{SYSCTL_DIR}}.
 if test -d "/run/systemd/system"; then
-  {{ROOTLIBEXECDIR}}/systemd-sysctl || :
+  {{LIBEXECDIR}}/systemd-sysctl || :
 fi

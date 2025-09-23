@@ -1,22 +1,18 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <sys/mman.h>
+#include <stdlib.h>
+#include <unistd.h>
 
 #include "alloc-util.h"
+#include "errno-util.h"
 #include "fd-util.h"
 #include "fileio.h"
 #include "fs-util.h"
-#include "hexdecoct.h"
-#include "macro.h"
-#include "memfd-util.h"
-#include "missing_fcntl.h"
-#include "missing_syscall.h"
+#include "log.h"
 #include "path-util.h"
-#include "process-util.h"
 #include "random-util.h"
-#include "stat-util.h"
-#include "stdio-util.h"
 #include "string-util.h"
+#include "sync-util.h"
 #include "tmpfile-util.h"
 #include "umask-util.h"
 
@@ -115,6 +111,17 @@ int fmkostemp_safe(char *pattern, const char *mode, FILE **ret_f) {
 
         *ret_f = f;
         return 0;
+}
+
+void unlink_tempfilep(char (*p)[]) {
+        assert(p);
+
+        /* If the file is created with mkstemp(), it will (almost always) change the suffix.
+         * Treat this as a sign that the file was successfully created. We ignore both the rare case
+         * where the original suffix is used and unlink failures. */
+
+        if (!endswith(*p, ".XXXXXX"))
+                (void) unlink(*p);
 }
 
 static int tempfn_build(const char *p, const char *pre, const char *post, bool child, char **ret) {
@@ -307,7 +314,7 @@ int open_tmpfile_linkable_at(int dir_fd, const char *target, int flags, char **r
         return fd;
 }
 
-int fopen_tmpfile_linkable(const char *target, int flags, char **ret_path, FILE **ret_file) {
+int fopen_tmpfile_linkable_at(int dir_fd, const char *target, int flags, char **ret_path, FILE **ret_file) {
         _cleanup_free_ char *path = NULL;
         _cleanup_fclose_ FILE *f = NULL;
         _cleanup_close_ int fd = -EBADF;
@@ -316,7 +323,7 @@ int fopen_tmpfile_linkable(const char *target, int flags, char **ret_path, FILE 
         assert(ret_file);
         assert(ret_path);
 
-        fd = open_tmpfile_linkable(target, flags, &path);
+        fd = open_tmpfile_linkable_at(dir_fd, target, flags, &path);
         if (fd < 0)
                 return fd;
 
@@ -329,28 +336,7 @@ int fopen_tmpfile_linkable(const char *target, int flags, char **ret_path, FILE 
         return 0;
 }
 
-static int link_fd(int fd, int newdirfd, const char *newpath) {
-        int r;
-
-        assert(fd >= 0);
-        assert(newdirfd >= 0 || newdirfd == AT_FDCWD);
-        assert(newpath);
-
-        /* Try symlinking via /proc/fd/ first. */
-        r = RET_NERRNO(linkat(AT_FDCWD, FORMAT_PROC_FD_PATH(fd), newdirfd, newpath, AT_SYMLINK_FOLLOW));
-        if (r != -ENOENT)
-                return r;
-
-        /* Fall back to symlinking via AT_EMPTY_PATH as fallback (this requires CAP_DAC_READ_SEARCH and a
-         * more recent kernel, but does not require /proc/ mounted) */
-        if (proc_mounted() != 0)
-                return r;
-
-        return RET_NERRNO(linkat(fd, "", newdirfd, newpath, AT_EMPTY_PATH));
-}
-
-int link_tmpfile_at(int fd, int dir_fd, const char *path, const char *target, bool replace) {
-        _cleanup_free_ char *tmp = NULL;
+int link_tmpfile_at(int fd, int dir_fd, const char *path, const char *target, LinkTmpfileFlags flags) {
         int r;
 
         assert(fd >= 0);
@@ -361,40 +347,33 @@ int link_tmpfile_at(int fd, int dir_fd, const char *path, const char *target, bo
          * an fd created with O_TMPFILE is assumed, and linkat() is used. Otherwise it is assumed O_TMPFILE
          * is not supported on the directory, and renameat2() is used instead. */
 
+        if (FLAGS_SET(flags, LINK_TMPFILE_SYNC) && fsync(fd) < 0)
+                return -errno;
+
         if (path) {
-                if (replace)
-                        return RET_NERRNO(renameat(dir_fd, path, dir_fd, target));
-
-                return rename_noreplace(dir_fd, path, dir_fd, target);
+                if (FLAGS_SET(flags, LINK_TMPFILE_REPLACE))
+                        r = RET_NERRNO(renameat(dir_fd, path, dir_fd, target));
+                else
+                        r = rename_noreplace(dir_fd, path, dir_fd, target);
+        } else {
+                if (FLAGS_SET(flags, LINK_TMPFILE_REPLACE))
+                        r = linkat_replace(fd, /* oldpath= */ NULL, dir_fd, target);
+                else
+                        r = link_fd(fd, dir_fd, target);
         }
-
-        r = link_fd(fd, dir_fd, target);
-        if (r != -EEXIST || !replace)
-                return r;
-
-        /* So the target already exists and we were asked to replace it. That sucks a bit, since the kernel's
-         * linkat() logic does not allow that. We work-around this by linking the file to a random name
-         * first, and then renaming that to the final name. This reintroduces the race O_TMPFILE kinda is
-         * trying to fix, but at least the vulnerability window (i.e. where the file is linked into the file
-         * system under a temporary name) is very short. */
-
-        r = tempfn_random(target, NULL, &tmp);
         if (r < 0)
                 return r;
 
-        if (link_fd(fd, dir_fd, tmp) < 0)
-                return -EEXIST; /* propagate original error */
-
-        r = RET_NERRNO(renameat(dir_fd, tmp, dir_fd, target));
-        if (r < 0) {
-                (void) unlinkat(dir_fd, tmp, 0);
-                return r;
+        if (FLAGS_SET(flags, LINK_TMPFILE_SYNC)) {
+                r = fsync_full(fd);
+                if (r < 0)
+                        return r;
         }
 
         return 0;
 }
 
-int flink_tmpfile(FILE *f, const char *path, const char *target, bool replace) {
+int flink_tmpfile_at(FILE *f, int dir_fd, const char *path, const char *target, LinkTmpfileFlags flags) {
         int fd, r;
 
         assert(f);
@@ -404,11 +383,11 @@ int flink_tmpfile(FILE *f, const char *path, const char *target, bool replace) {
         if (fd < 0) /* Not all FILE* objects encapsulate fds */
                 return -EBADF;
 
-        r = fflush_sync_and_check(f);
+        r = fflush_and_check(f);
         if (r < 0)
                 return r;
 
-        return link_tmpfile(fd, path, target, replace);
+        return link_tmpfile_at(fd, dir_fd, path, target, flags);
 }
 
 int mkdtemp_malloc(const char *template, char **ret) {
@@ -456,4 +435,18 @@ int mkdtemp_open(const char *template, int flags, char **ret) {
                 *ret = TAKE_PTR(p);
 
         return fd;
+}
+
+void cleanup_tmpfile_data_done(struct cleanup_tmpfile_data *d) {
+        assert(d);
+
+        if (!d->dir_fd ||
+            *d->dir_fd < 0 ||
+            !d->filename ||
+            !*d->filename)
+                return;
+
+        (void) unlinkat(*d->dir_fd, *d->filename, 0);
+        d->dir_fd = NULL;
+        d->filename = NULL;
 }

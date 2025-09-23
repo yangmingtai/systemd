@@ -2,14 +2,14 @@
  * Copyright © 2019 VMware, Inc. */
 
 #include <linux/pkt_sched.h>
+#include "sd-netlink.h"
 
-#include "alloc-util.h"
-#include "conf-parser.h"
+#include "log-link.h"
 #include "netem.h"
-#include "netlink-util.h"
-#include "networkd-manager.h"
+#include "networkd-link.h"
 #include "parse-util.h"
 #include "qdisc.h"
+#include "string-util.h"
 #include "strv.h"
 #include "tc-util.h"
 
@@ -48,7 +48,7 @@ static int network_emulator_fill_message(Link *link, QDisc *qdisc, sd_netlink_me
         return 0;
 }
 
-int config_parse_network_emulator_delay(
+int config_parse_netem_delay(
                 const char *unit,
                 const char *filename,
                 unsigned line,
@@ -60,7 +60,7 @@ int config_parse_network_emulator_delay(
                 void *data,
                 void *userdata) {
 
-        _cleanup_(qdisc_free_or_set_invalidp) QDisc *qdisc = NULL;
+        _cleanup_(qdisc_unref_or_set_invalidp) QDisc *qdisc = NULL;
         Network *network = ASSERT_PTR(data);
         NetworkEmulator *ne;
         usec_t u;
@@ -109,7 +109,7 @@ int config_parse_network_emulator_delay(
         return 0;
 }
 
-int config_parse_network_emulator_rate(
+int config_parse_netem_rate(
                 const char *unit,
                 const char *filename,
                 unsigned line,
@@ -121,7 +121,7 @@ int config_parse_network_emulator_rate(
                 void *data,
                 void *userdata) {
 
-        _cleanup_(qdisc_free_or_set_invalidp) QDisc *qdisc = NULL;
+        _cleanup_(qdisc_unref_or_set_invalidp) QDisc *qdisc = NULL;
         Network *network = ASSERT_PTR(data);
         NetworkEmulator *ne;
         uint32_t rate;
@@ -169,7 +169,7 @@ int config_parse_network_emulator_rate(
         return 0;
 }
 
-int config_parse_network_emulator_packet_limit(
+int config_parse_netem_packet_limit(
                 const char *unit,
                 const char *filename,
                 unsigned line,
@@ -181,7 +181,7 @@ int config_parse_network_emulator_packet_limit(
                 void *data,
                 void *userdata) {
 
-        _cleanup_(qdisc_free_or_set_invalidp) QDisc *qdisc = NULL;
+        _cleanup_(qdisc_unref_or_set_invalidp) QDisc *qdisc = NULL;
         Network *network = ASSERT_PTR(data);
         NetworkEmulator *ne;
         int r;

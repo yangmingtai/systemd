@@ -4,10 +4,9 @@
 
 #include "alloc-util.h"
 #include "coredump-util.h"
-#include "fileio.h"
 #include "fd-util.h"
+#include "fileio.h"
 #include "format-util.h"
-#include "macro.h"
 #include "tests.h"
 
 TEST(coredump_filter_to_from_string) {
@@ -130,7 +129,7 @@ static void test_parse_auxv_one(
         }
 }
 
-TEST(test_parse_auxv) {
+TEST(parse_auxv) {
         _cleanup_free_ char *dir = NULL;
         _cleanup_close_ int dir_fd = -EBADF;
 

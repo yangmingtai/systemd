@@ -1,18 +1,20 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <errno.h>
 #include <fcntl.h>
-#include <linux/fs.h>
 #include <linux/loop.h>
 #include <linux/magic.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <sys/file.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <unistd.h>
 
+#include "sd-json.h"
+#include "sd-path.h"
+
 #include "alloc-util.h"
+#include "blockdev-util.h"
 #include "btrfs-util.h"
 #include "chase.h"
 #include "chattr-util.h"
@@ -32,21 +34,21 @@
 #include "lock-util.h"
 #include "log.h"
 #include "loop-util.h"
-#include "macro.h"
 #include "mkdir.h"
 #include "nulstr-util.h"
 #include "os-util.h"
 #include "path-util.h"
 #include "rm-rf.h"
+#include "runtime-scope.h"
 #include "stat-util.h"
 #include "string-table.h"
 #include "string-util.h"
 #include "strv.h"
 #include "time-util.h"
-#include "utf8.h"
+#include "vpick.h"
 #include "xattr-util.h"
 
-static const char* const image_search_path[_IMAGE_CLASS_MAX] = {
+const char* const image_search_path[_IMAGE_CLASS_MAX] = {
         [IMAGE_MACHINE] =   "/etc/machines\0"              /* only place symlinks here */
                             "/run/machines\0"              /* and here too */
                             "/var/lib/machines\0"          /* the main place for images */
@@ -74,18 +76,50 @@ static const char* const image_search_path[_IMAGE_CLASS_MAX] = {
                             "/usr/lib/confexts\0",
 };
 
-/* Inside the initrd, use a slightly different set of search path (i.e. include .extra/sysext in extension
- * search dir) */
+/* Inside the initrd, use a slightly different set of search path (i.e. include .extra/sysext/,
+ * /.extra/global_sysext, .extra/confext/, and /.extra/global_confext in extension search dir) */
 static const char* const image_search_path_initrd[_IMAGE_CLASS_MAX] = {
         /* (entries that aren't listed here will get the same search path as for the non initrd-case) */
 
         [IMAGE_SYSEXT] =    "/etc/extensions\0"            /* only place symlinks here */
                             "/run/extensions\0"            /* and here too */
                             "/var/lib/extensions\0"        /* the main place for images */
-                            "/.extra/sysext\0"             /* put sysext picked up by systemd-stub last, since not trusted */
+                            "/.extra/sysext\0"             /* put sysext (per-UKI and global) picked up by systemd-stub */
+                            "/.extra/global_sysext\0",     /* last, since not trusted */
+
+        [IMAGE_CONFEXT] =   "/run/confexts\0"              /* only place symlinks here */
+                            "/var/lib/confexts\0"          /* the main place for images */
+                            "/usr/local/lib/confexts\0"
+                            "/.extra/confext\0"            /* put confext (per-UKI and global) picked up by systemd-stub */
+                            "/.extra/global_confext\0",    /* last, since not trusted. */
 };
 
-static Image *image_free(Image *i) {
+static const char* image_class_suffix_table[_IMAGE_CLASS_MAX] = {
+        [IMAGE_SYSEXT]  = ".sysext",
+        [IMAGE_CONFEXT] = ".confext",
+};
+
+DEFINE_PRIVATE_STRING_TABLE_LOOKUP_TO_STRING(image_class_suffix, ImageClass);
+
+static const char *const image_root_table[_IMAGE_CLASS_MAX] = {
+        [IMAGE_MACHINE]  = "/var/lib/machines",
+        [IMAGE_PORTABLE] = "/var/lib/portables",
+        [IMAGE_SYSEXT]   = "/var/lib/extensions",
+        [IMAGE_CONFEXT]  = "/var/lib/confexts",
+};
+
+DEFINE_STRING_TABLE_LOOKUP_TO_STRING(image_root, ImageClass);
+
+static const char *const image_root_runtime_table[_IMAGE_CLASS_MAX] = {
+        [IMAGE_MACHINE]  = "/run/machines",
+        [IMAGE_PORTABLE] = "/run/portables",
+        [IMAGE_SYSEXT]   = "/run/extensions",
+        [IMAGE_CONFEXT]  = "/run/confexts",
+};
+
+DEFINE_STRING_TABLE_LOOKUP_TO_STRING(image_root_runtime, ImageClass);
+
+static Image* image_free(Image *i) {
         assert(i);
 
         free(i->name);
@@ -94,7 +128,8 @@ static Image *image_free(Image *i) {
         free(i->hostname);
         strv_free(i->machine_info);
         strv_free(i->os_release);
-        strv_free(i->extension_release);
+        strv_free(i->sysext_release);
+        strv_free(i->confext_release);
 
         return mfree(i);
 }
@@ -103,7 +138,7 @@ DEFINE_TRIVIAL_REF_UNREF_FUNC(Image, image, image_free);
 DEFINE_HASH_OPS_WITH_VALUE_DESTRUCTOR(image_hash_ops, char, string_hash_func, string_compare_func,
                                       Image, image_unref);
 
-static char **image_settings_path(Image *image) {
+static char** image_settings_path(Image *image) {
         _cleanup_strv_free_ char **l = NULL;
         _cleanup_free_ char *fn = NULL;
         size_t i = 0;
@@ -201,52 +236,122 @@ static int image_new(
         return 0;
 }
 
-static int extract_pretty(const char *path, const char *suffix, char **ret) {
-        _cleanup_free_ char *name = NULL;
-        const char *p;
+static int extract_image_basename(
+                const char *path,
+                const char *class_suffix,  /* e.g. ".sysext" (this is an optional suffix) */
+                char **format_suffixes,    /* e.g. ".raw"    (one of these will be required) */
+                char **ret_basename,
+                char **ret_suffix) {
+
+        _cleanup_free_ char *name = NULL, *suffix = NULL;
+        int r;
 
         assert(path);
-        assert(ret);
 
-        p = last_path_component(path);
+        r = path_extract_filename(path, &name);
+        if (r < 0)
+                return r;
 
-        name = strdupcspn(p, "/");
-        if (!name)
-                return -ENOMEM;
-
-        if (suffix) {
-                char *e;
-
-                e = endswith(name, suffix);
-                if (!e)
+        if (format_suffixes) {
+                char *e = endswith_strv(name, format_suffixes);
+                if (!e) /* Format suffix is required */
                         return -EINVAL;
 
+                if (ret_suffix) {
+                        suffix = strdup(e);
+                        if (!suffix)
+                                return -ENOMEM;
+                }
+
                 *e = 0;
+        }
+
+        if (class_suffix) {
+                char *e = endswith(name, class_suffix);
+                if (e) { /* Class suffix is optional */
+                        if (ret_suffix) {
+                                _cleanup_free_ char *j = strjoin(e, suffix);
+                                if (!j)
+                                        return -ENOMEM;
+
+                                free_and_replace(suffix, j);
+                        }
+
+                        *e = 0;
+                }
         }
 
         if (!image_name_is_valid(name))
                 return -EINVAL;
 
-        *ret = TAKE_PTR(name);
+        if (ret_suffix)
+                *ret_suffix = TAKE_PTR(suffix);
+
+        if (ret_basename)
+                *ret_basename = TAKE_PTR(name);
+
         return 0;
+}
+
+static int image_update_quota(Image *i, int fd) {
+        _cleanup_close_ int fd_close = -EBADF;
+        int r;
+
+        assert(i);
+
+        if (image_is_vendor(i) || image_is_host(i))
+                return -EROFS;
+
+        if (i->type != IMAGE_SUBVOLUME)
+                return -EOPNOTSUPP;
+
+        if (fd < 0) {
+                fd_close = open(i->path, O_CLOEXEC|O_DIRECTORY);
+                if (fd_close < 0)
+                        return -errno;
+                fd = fd_close;
+        } else {
+                /* Convert from O_PATH to proper fd, if needed */
+                fd = fd_reopen_condition(fd, O_CLOEXEC|O_DIRECTORY, O_PATH, &fd_close);
+                if (fd < 0)
+                        return fd;
+        }
+
+        r = btrfs_quota_scan_ongoing(fd);
+        if (r < 0)
+                return r;
+        if (r > 0)
+                return 0;
+
+        BtrfsQuotaInfo quota;
+        r = btrfs_subvol_get_subtree_quota_fd(fd, 0, &quota);
+        if (r < 0)
+                return r;
+
+        i->usage = quota.referenced;
+        i->usage_exclusive = quota.exclusive;
+        i->limit = quota.referenced_max;
+        i->limit_exclusive = quota.exclusive_max;
+
+        return 1;
 }
 
 static int image_make(
                 ImageClass c,
                 const char *pretty,
-                int dfd,
-                const char *path,
+                int dir_fd,
+                const char *dir_path,
                 const char *filename,
+                int fd, /* O_PATH fd */
                 const struct stat *st,
                 Image **ret) {
 
-        _cleanup_free_ char *pretty_buffer = NULL, *parent = NULL;
-        struct stat stbuf;
+        _cleanup_free_ char *pretty_buffer = NULL;
         bool read_only;
         int r;
 
-        assert(dfd >= 0 || dfd == AT_FDCWD);
-        assert(path || dfd == AT_FDCWD);
+        assert(dir_fd >= 0 || dir_fd == AT_FDCWD);
+        assert(dir_path || dir_fd == AT_FDCWD);
         assert(filename);
 
         /* We explicitly *do* follow symlinks here, since we want to allow symlinking trees, raw files and block
@@ -255,26 +360,36 @@ static int image_make(
          * This function returns -ENOENT if we can't find the image after all, and -EMEDIUMTYPE if it's not a file we
          * recognize. */
 
+        _cleanup_close_ int _fd = -EBADF;
+        if (fd < 0) {
+                /* If we didn't get an fd passed in, then let's pin it via O_PATH now */
+                _fd = openat(dir_fd, filename, O_PATH|O_CLOEXEC);
+                if (_fd < 0)
+                        return -errno;
+
+                fd = _fd;
+                st = NULL; /* refresh stat() data now that we have the inode pinned */
+        }
+
+        struct stat stbuf;
         if (!st) {
-                if (fstatat(dfd, filename, &stbuf, 0) < 0)
+                if (fstat(fd, &stbuf) < 0)
                         return -errno;
 
                 st = &stbuf;
         }
 
-        if (!path) {
-                if (dfd == AT_FDCWD)
-                        (void) safe_getcwd(&parent);
-                else
-                        (void) fd_get_path(dfd, &parent);
+        _cleanup_free_ char *parent = NULL;
+        if (!dir_path) {
+                (void) fd_get_path(dir_fd, &parent);
+                dir_path = parent;
         }
 
         read_only =
-                (path && path_startswith(path, "/usr")) ||
-                (faccessat(dfd, filename, W_OK, AT_EACCESS) < 0 && errno == EROFS);
+                (dir_path && path_startswith(dir_path, "/usr")) ||
+                (faccessat(fd, "", W_OK, AT_EACCESS|AT_EMPTY_PATH) < 0 && errno == EROFS);
 
         if (S_ISDIR(st->st_mode)) {
-                _cleanup_close_ int fd = -EBADF;
                 unsigned file_attr = 0;
                 usec_t crtime = 0;
 
@@ -282,23 +397,24 @@ static int image_make(
                         return 0;
 
                 if (!pretty) {
-                        r = extract_pretty(filename, NULL, &pretty_buffer);
+                        r = extract_image_basename(
+                                        filename,
+                                        image_class_suffix_to_string(c),
+                                        /* format_suffixes= */ NULL,
+                                        &pretty_buffer,
+                                        /* ret_suffix= */ NULL);
                         if (r < 0)
                                 return r;
 
                         pretty = pretty_buffer;
                 }
 
-                fd = openat(dfd, filename, O_CLOEXEC|O_NOCTTY|O_DIRECTORY);
-                if (fd < 0)
-                        return -errno;
-
                 if (btrfs_might_be_subvol(st)) {
 
                         r = fd_is_fs_type(fd, BTRFS_SUPER_MAGIC);
                         if (r < 0)
                                 return r;
-                        if (r) {
+                        if (r > 0) {
                                 BtrfsSubvolInfo info;
 
                                 /* It's a btrfs subvolume */
@@ -310,28 +426,16 @@ static int image_make(
                                 r = image_new(IMAGE_SUBVOLUME,
                                               c,
                                               pretty,
-                                              path,
+                                              dir_path,
                                               filename,
                                               info.read_only || read_only,
                                               info.otime,
-                                              0,
+                                              info.ctime,
                                               ret);
                                 if (r < 0)
                                         return r;
 
-                                if (btrfs_quota_scan_ongoing(fd) == 0) {
-                                        BtrfsQuotaInfo quota;
-
-                                        r = btrfs_subvol_get_subtree_quota_fd(fd, 0, &quota);
-                                        if (r >= 0) {
-                                                (*ret)->usage = quota.referenced;
-                                                (*ret)->usage_exclusive = quota.exclusive;
-
-                                                (*ret)->limit = quota.referenced_max;
-                                                (*ret)->limit_exclusive = quota.exclusive_max;
-                                        }
-                                }
-
+                                (void) image_update_quota(*ret, fd);
                                 return 0;
                         }
                 }
@@ -347,7 +451,7 @@ static int image_make(
                 r = image_new(IMAGE_DIRECTORY,
                               c,
                               pretty,
-                              path,
+                              dir_path,
                               filename,
                               read_only || (file_attr & FS_IMMUTABLE_FL),
                               crtime,
@@ -366,10 +470,15 @@ static int image_make(
                 if (!ret)
                         return 0;
 
-                (void) fd_getcrtime_at(dfd, filename, AT_SYMLINK_FOLLOW, &crtime);
+                (void) fd_getcrtime(fd, &crtime);
 
                 if (!pretty) {
-                        r = extract_pretty(filename, ".raw", &pretty_buffer);
+                        r = extract_image_basename(
+                                        filename,
+                                        image_class_suffix_to_string(c),
+                                        STRV_MAKE(".raw"),
+                                        &pretty_buffer,
+                                        /* ret_suffix= */ NULL);
                         if (r < 0)
                                 return r;
 
@@ -379,7 +488,7 @@ static int image_make(
                 r = image_new(IMAGE_RAW,
                               c,
                               pretty,
-                              path,
+                              dir_path,
                               filename,
                               !(st->st_mode & 0222) || read_only,
                               crtime,
@@ -394,7 +503,6 @@ static int image_make(
                 return 0;
 
         } else if (S_ISBLK(st->st_mode)) {
-                _cleanup_close_ int block_fd = -EBADF;
                 uint64_t size = UINT64_MAX;
 
                 /* A block device */
@@ -403,36 +511,34 @@ static int image_make(
                         return 0;
 
                 if (!pretty) {
-                        r = extract_pretty(filename, NULL, &pretty_buffer);
+                        r = extract_image_basename(
+                                        filename,
+                                        /* class_suffix= */ NULL,
+                                        /* format_suffix= */ NULL,
+                                        &pretty_buffer,
+                                        /* ret_suffix= */ NULL);
                         if (r < 0)
                                 return r;
 
                         pretty = pretty_buffer;
                 }
 
-                block_fd = openat(dfd, filename, O_RDONLY|O_NONBLOCK|O_CLOEXEC|O_NOCTTY);
+                _cleanup_close_ int block_fd = fd_reopen(fd, O_RDONLY|O_NONBLOCK|O_CLOEXEC|O_NOCTTY);
                 if (block_fd < 0)
-                        log_debug_errno(errno, "Failed to open block device %s/%s, ignoring: %m", path ?: strnull(parent), filename);
+                        log_debug_errno(errno, "Failed to open block device %s/%s, ignoring: %m", strnull(dir_path), filename);
                 else {
-                        /* Refresh stat data after opening the node */
-                        if (fstat(block_fd, &stbuf) < 0)
-                                return -errno;
-                        st = &stbuf;
-
-                        if (!S_ISBLK(st->st_mode)) /* Verify that what we opened is actually what we think it is */
-                                return -ENOTTY;
-
                         if (!read_only) {
                                 int state = 0;
 
                                 if (ioctl(block_fd, BLKROGET, &state) < 0)
-                                        log_debug_errno(errno, "Failed to issue BLKROGET on device %s/%s, ignoring: %m", path ?: strnull(parent), filename);
+                                        log_debug_errno(errno, "Failed to issue BLKROGET on device %s/%s, ignoring: %m", strnull(dir_path), filename);
                                 else if (state)
                                         read_only = true;
                         }
 
-                        if (ioctl(block_fd, BLKGETSIZE64, &size) < 0)
-                                log_debug_errno(errno, "Failed to issue BLKGETSIZE64 on device %s/%s, ignoring: %m", path ?: strnull(parent), filename);
+                        r = blockdev_get_device_size(block_fd, &size);
+                        if (r < 0)
+                                log_debug_errno(r, "Failed to issue BLKGETSIZE64 on device %s/%s, ignoring: %m", strnull(dir_path), filename);
 
                         block_fd = safe_close(block_fd);
                 }
@@ -440,7 +546,7 @@ static int image_make(
                 r = image_new(IMAGE_BLOCK,
                               c,
                               pretty,
-                              path,
+                              dir_path,
                               filename,
                               !(st->st_mode & 0222) || read_only,
                               0,
@@ -458,21 +564,140 @@ static int image_make(
         return -EMEDIUMTYPE;
 }
 
-static const char *pick_image_search_path(ImageClass class) {
-        if (class < 0 || class >= _IMAGE_CLASS_MAX)
-                return NULL;
+static int pick_image_search_path(
+                RuntimeScope scope,
+                ImageClass class,
+                char ***ret) {
 
-        /* Use the initrd search path if there is one, otherwise use the common one */
-        return in_initrd() && image_search_path_initrd[class] ? image_search_path_initrd[class] : image_search_path[class];
+        int r;
+
+        assert(scope < _RUNTIME_SCOPE_MAX && scope != RUNTIME_SCOPE_GLOBAL);
+        assert(class < _IMAGE_CLASS_MAX);
+        assert(ret);
+
+        if (class < 0) {
+                *ret = NULL;
+                return 0;
+        }
+
+        if (scope < 0) {
+                _cleanup_strv_free_ char **a = NULL, **b = NULL;
+
+                r = pick_image_search_path(RUNTIME_SCOPE_USER, class, &a);
+                if (r < 0)
+                        return r;
+
+                r = pick_image_search_path(RUNTIME_SCOPE_SYSTEM, class, &b);
+                if (r < 0)
+                        return r;
+
+                r = strv_extend_strv(&a, b, /* filter_duplicates= */ false);
+                if (r < 0)
+                        return r;
+
+                *ret = TAKE_PTR(a);
+                return 0;
+        }
+
+        switch (scope) {
+
+        case RUNTIME_SCOPE_SYSTEM: {
+                const char *ns;
+                /* Use the initrd search path if there is one, otherwise use the common one */
+                ns = in_initrd() && image_search_path_initrd[class] ?
+                        image_search_path_initrd[class] :
+                        image_search_path[class];
+                if (!ns)
+                        break;
+
+                _cleanup_strv_free_ char **search = strv_split_nulstr(ns);
+                if (!search)
+                        return -ENOMEM;
+
+                *ret = TAKE_PTR(search);
+                return 0;
+        }
+
+        case RUNTIME_SCOPE_USER: {
+                if (class != IMAGE_MACHINE)
+                        break;
+
+                static const uint64_t dirs[] = {
+                        SD_PATH_USER_RUNTIME,
+                        SD_PATH_USER_STATE_PRIVATE,
+                        SD_PATH_USER_LIBRARY_PRIVATE,
+                };
+
+                _cleanup_strv_free_ char **search = NULL;
+                FOREACH_ELEMENT(d, dirs) {
+                        _cleanup_free_ char *p = NULL;
+
+                        r = sd_path_lookup(*d, "machines", &p);
+                        if (r == -ENXIO) /* No XDG_RUNTIME_DIR set */
+                                continue;
+                        if (r < 0)
+                                return r;
+
+                        r = strv_consume(&search, TAKE_PTR(p));
+                        if (r < 0)
+                                return r;
+                }
+
+                *ret = TAKE_PTR(search);
+                return 0;
+        }
+
+        default:
+                assert_not_reached();
+        }
+
+        *ret = NULL;
+        return 0;
 }
 
-int image_find(ImageClass class,
+static char** make_possible_filenames(ImageClass class, const char *image_name) {
+        _cleanup_strv_free_ char **l = NULL;
+
+        assert(image_name);
+
+        FOREACH_STRING(v_suffix, "", ".v")
+                FOREACH_STRING(format_suffix, "", ".raw") {
+                        _cleanup_free_ char *j = NULL;
+                        const char *class_suffix;
+
+                        class_suffix = image_class_suffix_to_string(class);
+                        if (class_suffix) {
+                                j = strjoin(image_name, class_suffix, format_suffix, v_suffix);
+                                if (!j)
+                                        return NULL;
+
+                                if (strv_consume(&l, TAKE_PTR(j)) < 0)
+                                        return NULL;
+                        }
+
+                        j = strjoin(image_name, format_suffix, v_suffix);
+                        if (!j)
+                                return NULL;
+
+                        if (strv_consume(&l, TAKE_PTR(j)) < 0)
+                                return NULL;
+                }
+
+        return TAKE_PTR(l);
+}
+
+int image_find(RuntimeScope scope,
+               ImageClass class,
                const char *name,
                const char *root,
                Image **ret) {
 
-        int r;
+        /* As mentioned above, we follow symlinks on this fstatat(), because we want to permit people to
+         * symlink block devices into the search path. (For now, we disable that when operating relative to
+         * some root directory.) */
+        int open_flags = root ? O_NOFOLLOW : 0, r;
 
+        assert(scope < _RUNTIME_SCOPE_MAX && scope != RUNTIME_SCOPE_GLOBAL);
         assert(class >= 0);
         assert(class < _IMAGE_CLASS_MAX);
         assert(name);
@@ -481,52 +706,132 @@ int image_find(ImageClass class,
         if (!image_name_is_valid(name))
                 return -ENOENT;
 
-        NULSTR_FOREACH(path, pick_image_search_path(class)) {
+        _cleanup_strv_free_ char **names = make_possible_filenames(class, name);
+        if (!names)
+                return -ENOMEM;
+
+        _cleanup_strv_free_ char **search = NULL;
+        r = pick_image_search_path(scope, class, &search);
+        if (r < 0)
+                return r;
+
+        STRV_FOREACH(path, search) {
                 _cleanup_free_ char *resolved = NULL;
                 _cleanup_closedir_ DIR *d = NULL;
-                struct stat st;
-                int flags;
 
-                r = chase_and_opendir(path, root, CHASE_PREFIX_ROOT, &resolved, &d);
+                r = chase_and_opendir(*path, root, CHASE_PREFIX_ROOT, &resolved, &d);
                 if (r == -ENOENT)
                         continue;
                 if (r < 0)
                         return r;
 
-                /* As mentioned above, we follow symlinks on this fstatat(), because we want to permit people
-                 * to symlink block devices into the search path. (For now, we disable that when operating
-                 * relative to some root directory.) */
-                flags = root ? AT_SYMLINK_NOFOLLOW : 0;
-                if (fstatat(dirfd(d), name, &st, flags) < 0) {
-                        _cleanup_free_ char *raw = NULL;
+                STRV_FOREACH(n, names) {
+                        _cleanup_free_ char *fname_buf = NULL;
+                        const char *fname = *n;
 
-                        if (errno != ENOENT)
-                                return -errno;
+                        _cleanup_close_ int fd = openat(dirfd(d), fname, O_PATH|O_CLOEXEC|open_flags);
+                        if (fd < 0) {
+                                if (errno != ENOENT)
+                                        return -errno;
 
-                        raw = strjoin(name, ".raw");
-                        if (!raw)
-                                return -ENOMEM;
-
-                        if (fstatat(dirfd(d), raw, &st, flags) < 0) {
-                                if (errno == ENOENT)
-                                        continue;
-
-                                return -errno;
+                                continue;
                         }
 
-                        if (!S_ISREG(st.st_mode))
+                        struct stat st;
+                        if (fstat(fd, &st) < 0)
+                                return -errno;
+
+                        if (endswith(fname, ".raw")) {
+                                if (!S_ISREG(st.st_mode)) {
+                                        log_debug("Ignoring non-regular file '%s' with .raw suffix.", fname);
+                                        continue;
+                                }
+
+                        } else if (endswith(fname, ".v")) {
+
+                                if (!S_ISDIR(st.st_mode)) {
+                                        log_debug("Ignoring non-directory file '%s' with .v suffix.", fname);
+                                        continue;
+                                }
+
+                                _cleanup_free_ char *suffix = NULL;
+                                suffix = strdup(ASSERT_PTR(startswith(fname, name)));
+                                if (!suffix)
+                                        return -ENOMEM;
+
+                                *ASSERT_PTR(endswith(suffix, ".v")) = 0;
+
+                                _cleanup_free_ char *vp = path_join(resolved, fname);
+                                if (!vp)
+                                        return -ENOMEM;
+
+                                PickFilter filter = {
+                                        .type_mask = endswith(suffix, ".raw") ? (UINT32_C(1) << DT_REG) | (UINT32_C(1) << DT_BLK) : (UINT32_C(1) << DT_DIR),
+                                        .basename = name,
+                                        .architecture = _ARCHITECTURE_INVALID,
+                                        .suffix = STRV_MAKE(suffix),
+                                };
+
+                                _cleanup_(pick_result_done) PickResult result = PICK_RESULT_NULL;
+                                r = path_pick(root,
+                                              /* toplevel_fd= */ AT_FDCWD,
+                                              vp,
+                                              &filter,
+                                              PICK_ARCHITECTURE|PICK_TRIES,
+                                              &result);
+                                if (r < 0) {
+                                        log_debug_errno(r, "Failed to pick versioned image on '%s', skipping: %m", vp);
+                                        continue;
+                                }
+                                if (!result.path) {
+                                        log_debug("Found versioned directory '%s', without matching entry, skipping: %m", vp);
+                                        continue;
+                                }
+
+                                /* Refresh the stat data for the discovered target */
+                                st = result.st;
+                                fd = safe_close(fd);
+
+                                _cleanup_free_ char *bn = NULL;
+                                r = path_extract_filename(result.path, &bn);
+                                if (r < 0) {
+                                        log_debug_errno(r, "Failed to extract basename of image path '%s', skipping: %m", result.path);
+                                        continue;
+                                }
+
+                                fname_buf = path_join(fname, bn);
+                                if (!fname_buf)
+                                        return log_oom();
+
+                                fname = fname_buf;
+
+                        } else if (!S_ISDIR(st.st_mode) && !S_ISBLK(st.st_mode)) {
+                                log_debug("Ignoring non-directory and non-block device file '%s' without suffix.", fname);
                                 continue;
+                        }
 
-                        r = image_make(class, name, dirfd(d), resolved, raw, &st, ret);
-
-                } else {
-                        if (!S_ISDIR(st.st_mode) && !S_ISBLK(st.st_mode))
+                        r = image_make(class, name, dirfd(d), resolved, fname, fd, &st, ret);
+                        if (IN_SET(r, -ENOENT, -EMEDIUMTYPE))
                                 continue;
+                        if (r < 0)
+                                return r;
 
-                        r = image_make(class, name, dirfd(d), resolved, name, &st, ret);
+                        if (ret)
+                                (*ret)->discoverable = true;
+
+                        return 1;
                 }
-                if (IN_SET(r, -ENOENT, -EMEDIUMTYPE))
-                        continue;
+        }
+
+        if (scope == RUNTIME_SCOPE_SYSTEM && class == IMAGE_MACHINE && streq(name, ".host")) {
+                r = image_make(class,
+                               ".host",
+                               /* dir_fd= */ AT_FDCWD,
+                               /* dir_path= */ NULL,
+                               /* filename= */ empty_to_root(root),
+                               /* fd= */ -EBADF,
+                               /* st= */ NULL,
+                               ret);
                 if (r < 0)
                         return r;
 
@@ -534,17 +839,6 @@ int image_find(ImageClass class,
                         (*ret)->discoverable = true;
 
                 return 1;
-        }
-
-        if (class == IMAGE_MACHINE && streq(name, ".host")) {
-                r = image_make(class, ".host", AT_FDCWD, NULL, empty_to_root(root), NULL, ret);
-                if (r < 0)
-                        return r;
-
-                if (ret)
-                        (*ret)->discoverable = true;
-
-                return r;
         }
 
         return -ENOENT;
@@ -557,83 +851,200 @@ int image_from_path(const char *path, Image **ret) {
          * overridden by another, different image earlier in the search path */
 
         if (path_equal(path, "/"))
-                return image_make(IMAGE_MACHINE, ".host", AT_FDCWD, NULL, "/", NULL, ret);
+                return image_make(
+                                IMAGE_MACHINE,
+                                ".host",
+                                /* dir_fd= */ AT_FDCWD,
+                                /* dir_path= */ NULL,
+                                /* filename= */ "/",
+                                /* fd= */ -EBADF,
+                                /* st= */ NULL,
+                                ret);
 
-        return image_make(_IMAGE_CLASS_INVALID, NULL, AT_FDCWD, NULL, path, NULL, ret);
+        return image_make(
+                        _IMAGE_CLASS_INVALID,
+                        /* pretty= */ NULL,
+                        /* dir_fd= */ AT_FDCWD,
+                        /* dir_path= */ NULL,
+                        /* filename= */ path,
+                        /* fd= */ -EBADF,
+                        /* st= */ NULL,
+                        ret);
 }
 
-int image_find_harder(ImageClass class, const char *name_or_path, const char *root, Image **ret) {
+int image_find_harder(
+                RuntimeScope scope,
+                ImageClass class,
+                const char *name_or_path,
+                const char *root,
+                Image **ret) {
+
         if (image_name_is_valid(name_or_path))
-                return image_find(class, name_or_path, root, ret);
+                return image_find(scope, class, name_or_path, root, ret);
 
         return image_from_path(name_or_path, ret);
 }
 
 int image_discover(
+                RuntimeScope scope,
                 ImageClass class,
                 const char *root,
-                Hashmap *h) {
+                Hashmap **images) {
 
-        int r;
+        /* As mentioned above, we follow symlinks on this fstatat(), because we want to permit people to
+         * symlink block devices into the search path. (For now, we disable that when operating relative to
+         * some root directory.) */
+        int open_flags = root ? O_NOFOLLOW : 0, r;
 
+        assert(scope < _RUNTIME_SCOPE_MAX && scope != RUNTIME_SCOPE_GLOBAL);
         assert(class >= 0);
         assert(class < _IMAGE_CLASS_MAX);
-        assert(h);
+        assert(images);
 
-        NULSTR_FOREACH(path, pick_image_search_path(class)) {
+        _cleanup_strv_free_ char **search = NULL;
+        r = pick_image_search_path(scope, class, &search);
+        if (r < 0)
+                return r;
+
+        STRV_FOREACH(path, search) {
                 _cleanup_free_ char *resolved = NULL;
                 _cleanup_closedir_ DIR *d = NULL;
 
-                r = chase_and_opendir(path, root, CHASE_PREFIX_ROOT, &resolved, &d);
+                r = chase_and_opendir(*path, root, CHASE_PREFIX_ROOT, &resolved, &d);
                 if (r == -ENOENT)
                         continue;
                 if (r < 0)
                         return r;
 
                 FOREACH_DIRENT_ALL(de, d, return -errno) {
+                        _cleanup_free_ char *pretty = NULL, *fname_buf = NULL;
                         _cleanup_(image_unrefp) Image *image = NULL;
-                        _cleanup_free_ char *truncated = NULL;
-                        const char *pretty;
-                        struct stat st;
-                        int flags;
+                        const char *fname = de->d_name;
 
-                        if (dot_or_dot_dot(de->d_name))
+                        if (dot_or_dot_dot(fname))
                                 continue;
 
-                        /* As mentioned above, we follow symlinks on this fstatat(), because we want to
-                         * permit people to symlink block devices into the search path. */
-                        flags = root ? AT_SYMLINK_NOFOLLOW : 0;
-                        if (fstatat(dirfd(d), de->d_name, &st, flags) < 0) {
-                                if (errno == ENOENT)
-                                        continue;
+                        _cleanup_close_ int fd = openat(dirfd(d), fname, O_PATH|O_CLOEXEC|open_flags);
+                        if (fd < 0) {
+                                if (errno != ENOENT)
+                                        return -errno;
 
-                                return -errno;
+                                continue; /* Vanished while we were looking at it */
                         }
 
+                        struct stat st;
+                        if (fstat(fd, &st) < 0)
+                                return -errno;
+
                         if (S_ISREG(st.st_mode)) {
-                                const char *e;
-
-                                e = endswith(de->d_name, ".raw");
-                                if (!e)
+                                r = extract_image_basename(
+                                                fname,
+                                                image_class_suffix_to_string(class),
+                                                STRV_MAKE(".raw"),
+                                                &pretty,
+                                                /* ret_suffix= */ NULL);
+                                if (r < 0) {
+                                        log_debug_errno(r, "Skipping directory entry '%s', which doesn't look like an image.", fname);
                                         continue;
+                                }
+                        } else if (S_ISDIR(st.st_mode)) {
+                                const char *v;
 
-                                truncated = strndup(de->d_name, e - de->d_name);
-                                if (!truncated)
-                                        return -ENOMEM;
+                                v = endswith(fname, ".v");
+                                if (v) {
+                                        _cleanup_free_ char *suffix = NULL, *nov = NULL;
 
-                                pretty = truncated;
-                        } else if (S_ISDIR(st.st_mode) || S_ISBLK(st.st_mode))
-                                pretty = de->d_name;
-                        else
+                                        nov = strndup(fname, v - fname); /* Chop off the .v */
+                                        if (!nov)
+                                                return -ENOMEM;
+
+                                        r = extract_image_basename(
+                                                        nov,
+                                                        image_class_suffix_to_string(class),
+                                                        STRV_MAKE(".raw", ""),
+                                                        &pretty,
+                                                        &suffix);
+                                        if (r < 0) {
+                                                log_debug_errno(r, "Skipping directory entry '%s', which doesn't look like a versioned image.", fname);
+                                                continue;
+                                        }
+
+                                        _cleanup_free_ char *vp = path_join(resolved, fname);
+                                        if (!vp)
+                                                return -ENOMEM;
+
+                                        PickFilter filter = {
+                                                .type_mask = endswith(suffix, ".raw") ? (UINT32_C(1) << DT_REG) | (UINT32_C(1) << DT_BLK) : (UINT32_C(1) << DT_DIR),
+                                                .basename = pretty,
+                                                .architecture = _ARCHITECTURE_INVALID,
+                                                .suffix = STRV_MAKE(suffix),
+                                        };
+
+                                        _cleanup_(pick_result_done) PickResult result = PICK_RESULT_NULL;
+                                        r = path_pick(root,
+                                                      /* toplevel_fd= */ AT_FDCWD,
+                                                      vp,
+                                                      &filter,
+                                                      PICK_ARCHITECTURE|PICK_TRIES,
+                                                      &result);
+                                        if (r < 0) {
+                                                log_debug_errno(r, "Failed to pick versioned image on '%s', skipping: %m", vp);
+                                                continue;
+                                        }
+                                        if (!result.path) {
+                                                log_debug("Found versioned directory '%s', without matching entry, skipping: %m", vp);
+                                                continue;
+                                        }
+
+                                        /* Refresh the stat data for the discovered target */
+                                        st = result.st;
+                                        fd = safe_close(fd);
+
+                                        _cleanup_free_ char *bn = NULL;
+                                        r = path_extract_filename(result.path, &bn);
+                                        if (r < 0) {
+                                                log_debug_errno(r, "Failed to extract basename of image path '%s', skipping: %m", result.path);
+                                                continue;
+                                        }
+
+                                        fname_buf = path_join(fname, bn);
+                                        if (!fname_buf)
+                                                return log_oom();
+
+                                        fname = fname_buf;
+                                } else {
+                                        r = extract_image_basename(
+                                                        fname,
+                                                        image_class_suffix_to_string(class),
+                                                        /* format_suffixes= */ NULL,
+                                                        &pretty,
+                                                        /* ret_suffix= */ NULL);
+                                        if (r < 0) {
+                                                log_debug_errno(r, "Skipping directory entry '%s', which doesn't look like an image.", fname);
+                                                continue;
+                                        }
+                                }
+
+                        } else if (S_ISBLK(st.st_mode)) {
+                                r = extract_image_basename(
+                                                fname,
+                                                /* class_suffix= */ NULL,
+                                                /* format_suffix= */ NULL,
+                                                &pretty,
+                                                /* ret_suffix= */ NULL);
+                                if (r < 0) {
+                                        log_debug_errno(r, "Skipping directory entry '%s', which doesn't look like an image.", fname);
+                                        continue;
+                                }
+                        } else {
+                                log_debug("Skipping directory entry '%s', which is neither regular file, directory nor block device.", fname);
+                                continue;
+                        }
+
+                        if (hashmap_contains(*images, pretty))
                                 continue;
 
-                        if (!image_name_is_valid(pretty))
-                                continue;
-
-                        if (hashmap_contains(h, pretty))
-                                continue;
-
-                        r = image_make(class, pretty, dirfd(d), resolved, de->d_name, &st, &image);
+                        r = image_make(class, pretty, dirfd(d), resolved, fname, fd, &st, &image);
                         if (IN_SET(r, -ENOENT, -EMEDIUMTYPE))
                                 continue;
                         if (r < 0)
@@ -641,24 +1052,31 @@ int image_discover(
 
                         image->discoverable = true;
 
-                        r = hashmap_put(h, image->name, image);
+                        r = hashmap_ensure_put(images, &image_hash_ops, image->name, image);
                         if (r < 0)
                                 return r;
 
-                        image = NULL;
+                        TAKE_PTR(image);
                 }
         }
 
-        if (class == IMAGE_MACHINE && !hashmap_contains(h, ".host")) {
+        if (scope == RUNTIME_SCOPE_SYSTEM && class == IMAGE_MACHINE && !hashmap_contains(*images, ".host")) {
                 _cleanup_(image_unrefp) Image *image = NULL;
 
-                r = image_make(IMAGE_MACHINE, ".host", AT_FDCWD, NULL, empty_to_root("/"), NULL, &image);
+                r = image_make(IMAGE_MACHINE,
+                               ".host",
+                               /* dir_fd= */ AT_FDCWD,
+                               /* dir_path= */ NULL,
+                               empty_to_root(root),
+                               /* fd= */ -EBADF,
+                               /* st= */ NULL,
+                               &image);
                 if (r < 0)
                         return r;
 
                 image->discoverable = true;
 
-                r = hashmap_put(h, image->name, image);
+                r = hashmap_ensure_put(images, &image_hash_ops, image->name, image);
                 if (r < 0)
                         return r;
 
@@ -676,7 +1094,7 @@ int image_remove(Image *i) {
 
         assert(i);
 
-        if (IMAGE_IS_VENDOR(i) || IMAGE_IS_HOST(i))
+        if (image_is_vendor(i) || image_is_host(i))
                 return -EROFS;
 
         settings = image_settings_path(i);
@@ -708,7 +1126,7 @@ int image_remove(Image *i) {
 
         case IMAGE_DIRECTORY:
                 /* Allow deletion of read-only directories */
-                (void) chattr_path(i->path, 0, FS_IMMUTABLE_FL, NULL);
+                (void) chattr_path(i->path, 0, FS_IMMUTABLE_FL);
                 r = rm_rf(i->path, REMOVE_ROOT|REMOVE_PHYSICAL|REMOVE_SUBVOLUME);
                 if (r < 0)
                         return r;
@@ -759,7 +1177,7 @@ static int rename_auxiliary_file(const char *path, const char *new_name, const c
         return rename_noreplace(AT_FDCWD, path, AT_FDCWD, rs);
 }
 
-int image_rename(Image *i, const char *new_name) {
+int image_rename(Image *i, const char *new_name, RuntimeScope scope) {
         _cleanup_(release_lock_file) LockFile global_lock = LOCK_FILE_INIT, local_lock = LOCK_FILE_INIT, name_lock = LOCK_FILE_INIT;
         _cleanup_free_ char *new_path = NULL, *nn = NULL, *roothash = NULL;
         _cleanup_strv_free_ char **settings = NULL;
@@ -771,7 +1189,7 @@ int image_rename(Image *i, const char *new_name) {
         if (!image_name_is_valid(new_name))
                 return -EINVAL;
 
-        if (IMAGE_IS_VENDOR(i) || IMAGE_IS_HOST(i))
+        if (image_is_vendor(i) || image_is_host(i))
                 return -EROFS;
 
         settings = image_settings_path(i);
@@ -794,7 +1212,7 @@ int image_rename(Image *i, const char *new_name) {
         if (r < 0)
                 return r;
 
-        r = image_find(IMAGE_MACHINE, new_name, NULL, NULL);
+        r = image_find(scope, IMAGE_MACHINE, new_name, NULL, NULL);
         if (r >= 0)
                 return -EEXIST;
         if (r != -ENOENT)
@@ -804,10 +1222,10 @@ int image_rename(Image *i, const char *new_name) {
 
         case IMAGE_DIRECTORY:
                 /* Turn of the immutable bit while we rename the image, so that we can rename it */
-                (void) read_attr_path(i->path, &file_attr);
+                (void) read_attr_at(AT_FDCWD, i->path, &file_attr);
 
                 if (file_attr & FS_IMMUTABLE_FL)
-                        (void) chattr_path(i->path, 0, FS_IMMUTABLE_FL, NULL);
+                        (void) chattr_path(i->path, 0, FS_IMMUTABLE_FL);
 
                 _fallthrough_;
         case IMAGE_SUBVOLUME:
@@ -848,7 +1266,7 @@ int image_rename(Image *i, const char *new_name) {
 
         /* Restore the immutable bit, if it was set before */
         if (file_attr & FS_IMMUTABLE_FL)
-                (void) chattr_path(new_path, FS_IMMUTABLE_FL, FS_IMMUTABLE_FL, NULL);
+                (void) chattr_path(new_path, FS_IMMUTABLE_FL, FS_IMMUTABLE_FL);
 
         free_and_replace(i->path, new_path);
         free_and_replace(i->name, nn);
@@ -881,7 +1299,7 @@ static int clone_auxiliary_file(const char *path, const char *new_name, const ch
         return copy_file_atomic(path, rs, 0664, COPY_REFLINK);
 }
 
-int image_clone(Image *i, const char *new_name, bool read_only) {
+int image_clone(Image *i, const char *new_name, bool read_only, RuntimeScope scope) {
         _cleanup_(release_lock_file) LockFile name_lock = LOCK_FILE_INIT;
         _cleanup_strv_free_ char **settings = NULL;
         _cleanup_free_ char *roothash = NULL;
@@ -908,7 +1326,7 @@ int image_clone(Image *i, const char *new_name, bool read_only) {
         if (r < 0)
                 return r;
 
-        r = image_find(IMAGE_MACHINE, new_name, NULL, NULL);
+        r = image_find(scope, IMAGE_MACHINE, new_name, NULL, NULL);
         if (r >= 0)
                 return -EEXIST;
         if (r != -ENOENT)
@@ -923,13 +1341,13 @@ int image_clone(Image *i, const char *new_name, bool read_only) {
 
                 new_path = strjoina("/var/lib/machines/", new_name);
 
-                r = btrfs_subvol_snapshot(i->path, new_path,
-                                          (read_only ? BTRFS_SNAPSHOT_READ_ONLY : 0) |
-                                          BTRFS_SNAPSHOT_FALLBACK_COPY |
-                                          BTRFS_SNAPSHOT_FALLBACK_DIRECTORY |
-                                          BTRFS_SNAPSHOT_FALLBACK_IMMUTABLE |
-                                          BTRFS_SNAPSHOT_RECURSIVE |
-                                          BTRFS_SNAPSHOT_QUOTA);
+                r = btrfs_subvol_snapshot_at(AT_FDCWD, i->path, AT_FDCWD, new_path,
+                                             (read_only ? BTRFS_SNAPSHOT_READ_ONLY : 0) |
+                                             BTRFS_SNAPSHOT_FALLBACK_COPY |
+                                             BTRFS_SNAPSHOT_FALLBACK_DIRECTORY |
+                                             BTRFS_SNAPSHOT_FALLBACK_IMMUTABLE |
+                                             BTRFS_SNAPSHOT_RECURSIVE |
+                                             BTRFS_SNAPSHOT_QUOTA);
                 if (r >= 0)
                         /* Enable "subtree" quotas for the copy, if we didn't copy any quota from the source. */
                         (void) btrfs_subvol_auto_qgroup(new_path, 0, true);
@@ -939,8 +1357,8 @@ int image_clone(Image *i, const char *new_name, bool read_only) {
         case IMAGE_RAW:
                 new_path = strjoina("/var/lib/machines/", new_name, ".raw");
 
-                r = copy_file_atomic_full(i->path, new_path, read_only ? 0444 : 0644, FS_NOCOW_FL, FS_NOCOW_FL,
-                                          COPY_REFLINK|COPY_CRTIME, NULL, NULL);
+                r = copy_file_atomic(i->path, new_path, read_only ? 0444 : 0644,
+                                     COPY_REFLINK|COPY_CRTIME|COPY_NOCOW_AFTER);
                 break;
 
         case IMAGE_BLOCK:
@@ -970,7 +1388,7 @@ int image_read_only(Image *i, bool b) {
 
         assert(i);
 
-        if (IMAGE_IS_VENDOR(i) || IMAGE_IS_HOST(i))
+        if (image_is_vendor(i) || image_is_host(i))
                 return -EROFS;
 
         /* Make sure we don't interfere with a running nspawn */
@@ -1000,7 +1418,7 @@ int image_read_only(Image *i, bool b) {
                    a read-only subvolume, but at least something, and
                    we can read the value back. */
 
-                r = chattr_path(i->path, b ? FS_IMMUTABLE_FL : 0, FS_IMMUTABLE_FL, NULL);
+                r = chattr_path(i->path, b ? FS_IMMUTABLE_FL : 0, FS_IMMUTABLE_FL);
                 if (r < 0)
                         return r;
 
@@ -1047,10 +1465,21 @@ int image_read_only(Image *i, bool b) {
                 return -EOPNOTSUPP;
         }
 
+        i->read_only = b;
         return 0;
 }
 
-int image_path_lock(const char *path, int operation, LockFile *global, LockFile *local) {
+static void make_lock_dir(void) {
+        (void) mkdir_p("/run/systemd/nspawn", 0755);
+        (void) mkdir("/run/systemd/nspawn/locks", 0700);
+}
+
+int image_path_lock(
+                const char *path,
+                int operation,
+                LockFile *ret_global,
+                LockFile *ret_local) {
+
         _cleanup_free_ char *p = NULL;
         LockFile t = LOCK_FILE_INIT;
         struct stat st;
@@ -1058,8 +1487,7 @@ int image_path_lock(const char *path, int operation, LockFile *global, LockFile 
         int r;
 
         assert(path);
-        assert(global);
-        assert(local);
+        assert(ret_local);
 
         /* Locks an image path. This actually creates two locks: one "local" one, next to the image path
          * itself, which might be shared via NFS. And another "global" one, in /run, that uses the
@@ -1081,7 +1509,9 @@ int image_path_lock(const char *path, int operation, LockFile *global, LockFile 
         }
 
         if (getenv_bool("SYSTEMD_NSPAWN_LOCK") == 0) {
-                *local = *global = (LockFile) LOCK_FILE_INIT;
+                *ret_local = LOCK_FILE_INIT;
+                if (ret_global)
+                        *ret_global = LOCK_FILE_INIT;
                 return 0;
         }
 
@@ -1097,19 +1527,23 @@ int image_path_lock(const char *path, int operation, LockFile *global, LockFile 
                 if (exclusive)
                         return -EBUSY;
 
-                *local = *global = (LockFile) LOCK_FILE_INIT;
+                *ret_local = LOCK_FILE_INIT;
+                if (ret_global)
+                        *ret_global = LOCK_FILE_INIT;
                 return 0;
         }
 
-        if (stat(path, &st) >= 0) {
-                if (S_ISBLK(st.st_mode))
-                        r = asprintf(&p, "/run/systemd/nspawn/locks/block-%u:%u", major(st.st_rdev), minor(st.st_rdev));
-                else if (S_ISDIR(st.st_mode) || S_ISREG(st.st_mode))
-                        r = asprintf(&p, "/run/systemd/nspawn/locks/inode-%lu:%lu", (unsigned long) st.st_dev, (unsigned long) st.st_ino);
-                else
-                        return -ENOTTY;
-                if (r < 0)
-                        return -ENOMEM;
+        if (ret_global) {
+                if (stat(path, &st) >= 0) {
+                        if (S_ISBLK(st.st_mode))
+                                r = asprintf(&p, "/run/systemd/nspawn/locks/block-%u:%u", major(st.st_rdev), minor(st.st_rdev));
+                        else if (S_ISDIR(st.st_mode) || S_ISREG(st.st_mode))
+                                r = asprintf(&p, "/run/systemd/nspawn/locks/inode-%lu:%lu", (unsigned long) st.st_dev, (unsigned long) st.st_ino);
+                        else
+                                return -ENOTTY;
+                        if (r < 0)
+                                return -ENOMEM;
+                }
         }
 
         /* For block devices we don't need the "local" lock, as the major/minor lock above should be
@@ -1125,24 +1559,26 @@ int image_path_lock(const char *path, int operation, LockFile *global, LockFile 
         }
 
         if (p) {
-                (void) mkdir_p("/run/systemd/nspawn/locks", 0700);
+                make_lock_dir();
 
-                r = make_lock_file(p, operation, global);
+                r = make_lock_file(p, operation, ret_global);
                 if (r < 0) {
                         release_lock_file(&t);
                         return r;
                 }
-        } else
-                *global = (LockFile) LOCK_FILE_INIT;
+        } else if (ret_global)
+                *ret_global = LOCK_FILE_INIT;
 
-        *local = t;
+        *ret_local = t;
         return 0;
 }
 
 int image_set_limit(Image *i, uint64_t referenced_max) {
+        int r;
+
         assert(i);
 
-        if (IMAGE_IS_VENDOR(i) || IMAGE_IS_HOST(i))
+        if (image_is_vendor(i) || image_is_host(i))
                 return -EROFS;
 
         if (i->type != IMAGE_SUBVOLUME)
@@ -1155,7 +1591,35 @@ int image_set_limit(Image *i, uint64_t referenced_max) {
 
         (void) btrfs_qgroup_set_limit(i->path, 0, referenced_max);
         (void) btrfs_subvol_auto_qgroup(i->path, 0, true);
-        return btrfs_subvol_set_subtree_quota_limit(i->path, 0, referenced_max);
+        r = btrfs_subvol_set_subtree_quota_limit(i->path, 0, referenced_max);
+        if (r < 0)
+                return r;
+
+        (void) image_update_quota(i, -EBADF);
+        return 0;
+}
+
+int image_set_pool_limit(ImageClass class, uint64_t referenced_max) {
+        const char *dir;
+        int r;
+
+        assert(class >= 0 && class < _IMAGE_CLASS_MAX);
+
+        dir = image_root_to_string(class);
+
+        r = btrfs_qgroup_set_limit(dir, /* qgroupid = */ 0, referenced_max);
+        if (ERRNO_IS_NEG_NOT_SUPPORTED(r))
+                return r;
+        if (r < 0)
+                log_debug_errno(r, "Failed to set limit on btrfs quota group for '%s', ignoring: %m", dir);
+
+        r = btrfs_subvol_set_subtree_quota_limit(dir, /* subvol_id = */ 0, referenced_max);
+        if (ERRNO_IS_NEG_NOT_SUPPORTED(r))
+                return r;
+        if (r < 0)
+                return log_debug_errno(r, "Failed to set subtree quota limit for '%s': %m", dir);
+
+        return 0;
 }
 
 int image_read_metadata(Image *i, const ImagePolicy *image_policy) {
@@ -1172,10 +1636,9 @@ int image_read_metadata(Image *i, const ImagePolicy *image_policy) {
 
         case IMAGE_SUBVOLUME:
         case IMAGE_DIRECTORY: {
-                _cleanup_strv_free_ char **machine_info = NULL, **os_release = NULL, **extension_release = NULL;
+                _cleanup_strv_free_ char **machine_info = NULL, **os_release = NULL, **sysext_release = NULL, **confext_release = NULL;
+                _cleanup_free_ char *hostname = NULL, *path = NULL;
                 sd_id128_t machine_id = SD_ID128_NULL;
-                _cleanup_free_ char *hostname = NULL;
-                _cleanup_free_ char *path = NULL;
 
                 if (i->class == IMAGE_SYSEXT) {
                         r = extension_has_forbidden_content(i->path);
@@ -1191,9 +1654,9 @@ int image_read_metadata(Image *i, const ImagePolicy *image_policy) {
                 if (r < 0 && r != -ENOENT)
                         log_debug_errno(r, "Failed to chase /etc/hostname in image %s: %m", i->name);
                 else if (r >= 0) {
-                        r = read_etc_hostname(path, &hostname);
+                        r = read_etc_hostname(path, /* substitute_wildcards= */ false, &hostname);
                         if (r < 0)
-                                log_debug_errno(errno, "Failed to read /etc/hostname of image %s: %m", i->name);
+                                log_debug_errno(r, "Failed to read /etc/hostname of image %s: %m", i->name);
                 }
 
                 path = mfree(path);
@@ -1215,16 +1678,20 @@ int image_read_metadata(Image *i, const ImagePolicy *image_policy) {
                 if (r < 0)
                         log_debug_errno(r, "Failed to read os-release in image, ignoring: %m");
 
-                r = load_extension_release_pairs(i->path, i->class, i->name, /* relax_extension_release_check= */ false, &extension_release);
+                r = load_extension_release_pairs(i->path, IMAGE_SYSEXT, i->name, /* relax_extension_release_check= */ false, &sysext_release);
                 if (r < 0)
-                        log_debug_errno(r, "Failed to read extension-release in image, ignoring: %m");
+                        log_debug_errno(r, "Failed to read sysext-release in image, ignoring: %m");
+
+                r = load_extension_release_pairs(i->path, IMAGE_CONFEXT, i->name, /* relax_extension_release_check= */ false, &confext_release);
+                if (r < 0)
+                        log_debug_errno(r, "Failed to read confext-release in image, ignoring: %m");
 
                 free_and_replace(i->hostname, hostname);
                 i->machine_id = machine_id;
                 strv_free_and_replace(i->machine_info, machine_info);
                 strv_free_and_replace(i->os_release, os_release);
-                strv_free_and_replace(i->extension_release, extension_release);
-
+                strv_free_and_replace(i->sysext_release, sysext_release);
+                strv_free_and_replace(i->confext_release, confext_release);
                 break;
         }
 
@@ -1232,8 +1699,25 @@ int image_read_metadata(Image *i, const ImagePolicy *image_policy) {
         case IMAGE_BLOCK: {
                 _cleanup_(loop_device_unrefp) LoopDevice *d = NULL;
                 _cleanup_(dissected_image_unrefp) DissectedImage *m = NULL;
+                DissectImageFlags flags =
+                        DISSECT_IMAGE_GENERIC_ROOT |
+                        DISSECT_IMAGE_REQUIRE_ROOT |
+                        DISSECT_IMAGE_RELAX_VAR_CHECK |
+                        DISSECT_IMAGE_READ_ONLY |
+                        DISSECT_IMAGE_USR_NO_ROOT |
+                        DISSECT_IMAGE_ADD_PARTITION_DEVICES |
+                        DISSECT_IMAGE_PIN_PARTITION_DEVICES |
+                        DISSECT_IMAGE_VALIDATE_OS |
+                        DISSECT_IMAGE_VALIDATE_OS_EXT |
+                        DISSECT_IMAGE_ALLOW_USERSPACE_VERITY;
 
-                r = loop_device_make_by_path(i->path, O_RDONLY, /* sector_size= */ UINT32_MAX, LO_FLAGS_PARTSCAN, LOCK_SH, &d);
+                r = loop_device_make_by_path(
+                                i->path,
+                                O_RDONLY,
+                                /* sector_size= */ UINT32_MAX,
+                                LO_FLAGS_PARTSCAN,
+                                LOCK_SH,
+                                &d);
                 if (r < 0)
                         return r;
 
@@ -1242,20 +1726,16 @@ int image_read_metadata(Image *i, const ImagePolicy *image_policy) {
                                 /* verity= */ NULL,
                                 /* mount_options= */ NULL,
                                 image_policy,
-                                DISSECT_IMAGE_GENERIC_ROOT |
-                                DISSECT_IMAGE_REQUIRE_ROOT |
-                                DISSECT_IMAGE_RELAX_VAR_CHECK |
-                                DISSECT_IMAGE_READ_ONLY |
-                                DISSECT_IMAGE_USR_NO_ROOT |
-                                DISSECT_IMAGE_ADD_PARTITION_DEVICES |
-                                DISSECT_IMAGE_PIN_PARTITION_DEVICES,
+                                /* image_filter= */ NULL,
+                                flags,
                                 &m);
                 if (r < 0)
                         return r;
 
-                r = dissected_image_acquire_metadata(m,
-                                                     DISSECT_IMAGE_VALIDATE_OS |
-                                                     DISSECT_IMAGE_VALIDATE_OS_EXT);
+                r = dissected_image_acquire_metadata(
+                                m,
+                                /* userns_fd= */ -EBADF,
+                                flags);
                 if (r < 0)
                         return r;
 
@@ -1263,7 +1743,8 @@ int image_read_metadata(Image *i, const ImagePolicy *image_policy) {
                 i->machine_id = m->machine_id;
                 strv_free_and_replace(i->machine_info, m->machine_info);
                 strv_free_and_replace(i->os_release, m->os_release);
-                strv_free_and_replace(i->extension_release, m->extension_release);
+                strv_free_and_replace(i->sysext_release, m->sysext_release);
+                strv_free_and_replace(i->confext_release, m->confext_release);
 
                 break;
         }
@@ -1296,31 +1777,42 @@ int image_name_lock(const char *name, int operation, LockFile *ret) {
                 return 0;
         }
 
-        (void) mkdir_p("/run/systemd/nspawn/locks", 0700);
+        make_lock_dir();
 
         p = strjoina("/run/systemd/nspawn/locks/name-", name);
         return make_lock_file(p, operation, ret);
 }
 
 bool image_in_search_path(
+                RuntimeScope scope,
                 ImageClass class,
                 const char *root,
                 const char *image) {
 
+        int r;
+
+        assert(scope < _RUNTIME_SCOPE_MAX && scope != RUNTIME_SCOPE_GLOBAL);
+        assert(class >= 0);
+        assert(class < _IMAGE_CLASS_MAX);
         assert(image);
 
-        NULSTR_FOREACH(path, pick_image_search_path(class)) {
+        _cleanup_strv_free_ char **search = NULL;
+        r = pick_image_search_path(scope, class, &search);
+        if (r < 0)
+                return r;
+
+        STRV_FOREACH(path, search) {
                 const char *p, *q;
                 size_t k;
 
                 if (!empty_or_root(root)) {
-                        q = path_startswith(path, root);
+                        q = path_startswith(*path, root);
                         if (!q)
                                 continue;
                 } else
-                        q = path;
+                        q = *path;
 
-                p = path_startswith(q, path);
+                p = path_startswith(q, *path);
                 if (!p)
                         continue;
 
@@ -1334,17 +1826,52 @@ bool image_in_search_path(
                 /* Accept trailing slashes */
                 if (p[strspn(p, "/")] == 0)
                         return true;
-
         }
 
         return false;
 }
 
+bool image_is_vendor(const struct Image *i) {
+        assert(i);
+
+        return i->path && path_startswith(i->path, "/usr");
+}
+
+bool image_is_host(const struct Image *i) {
+        assert(i);
+
+        if (i->name && streq(i->name, ".host"))
+                return true;
+
+        if (i->path && path_equal(i->path, "/"))
+                return true;
+
+        return false;
+}
+
+int image_to_json(const struct Image *img, sd_json_variant **ret) {
+        assert(img);
+
+        return sd_json_buildo(
+                        ret,
+                        SD_JSON_BUILD_PAIR_STRING("Type", image_type_to_string(img->type)),
+                        SD_JSON_BUILD_PAIR_STRING("Class", image_class_to_string(img->class)),
+                        SD_JSON_BUILD_PAIR_STRING("Name", img->name),
+                        SD_JSON_BUILD_PAIR_CONDITION(!!img->path, "Path", SD_JSON_BUILD_STRING(img->path)),
+                        SD_JSON_BUILD_PAIR_BOOLEAN("ReadOnly", img->read_only),
+                        SD_JSON_BUILD_PAIR_CONDITION(img->crtime != 0, "CreationTimestamp", SD_JSON_BUILD_UNSIGNED(img->crtime)),
+                        SD_JSON_BUILD_PAIR_CONDITION(img->mtime != 0, "ModificationTimestamp", SD_JSON_BUILD_UNSIGNED(img->mtime)),
+                        SD_JSON_BUILD_PAIR_CONDITION(img->usage != UINT64_MAX, "Usage", SD_JSON_BUILD_UNSIGNED(img->usage)),
+                        SD_JSON_BUILD_PAIR_CONDITION(img->usage_exclusive != UINT64_MAX, "UsageExclusive", SD_JSON_BUILD_UNSIGNED(img->usage_exclusive)),
+                        SD_JSON_BUILD_PAIR_CONDITION(img->limit != UINT64_MAX, "Limit", SD_JSON_BUILD_UNSIGNED(img->limit)),
+                        SD_JSON_BUILD_PAIR_CONDITION(img->limit_exclusive != UINT64_MAX, "LimitExclusive", SD_JSON_BUILD_UNSIGNED(img->limit_exclusive)));
+}
+
 static const char* const image_type_table[_IMAGE_TYPE_MAX] = {
         [IMAGE_DIRECTORY] = "directory",
         [IMAGE_SUBVOLUME] = "subvolume",
-        [IMAGE_RAW] = "raw",
-        [IMAGE_BLOCK] = "block",
+        [IMAGE_RAW]       = "raw",
+        [IMAGE_BLOCK]     = "block",
 };
 
 DEFINE_STRING_TABLE_LOOKUP(image_type, ImageType);

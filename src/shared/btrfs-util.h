@@ -1,18 +1,15 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include <stdbool.h>
-#include <stdint.h>
-#include <sys/types.h>
-
 #include "sd-id128.h"
 
-#include "copy.h"
-#include "time-util.h"
+#include "btrfs.h"      /* IWYU pragma: export */
+#include "forward.h"
 
 typedef struct BtrfsSubvolInfo {
         uint64_t subvol_id;
-        usec_t otime;
+        usec_t otime; /* creation time */
+        usec_t ctime; /* change time */
 
         sd_id128_t uuid;
         sd_id128_t parent_uuid;
@@ -36,6 +33,7 @@ typedef enum BtrfsSnapshotFlags {
         BTRFS_SNAPSHOT_FALLBACK_IMMUTABLE = 1 << 5, /* When we can't create a subvolume, use the FS_IMMUTABLE attribute for indicating read-only */
         BTRFS_SNAPSHOT_SIGINT             = 1 << 6, /* Check for SIGINT regularly, and return EINTR if seen */
         BTRFS_SNAPSHOT_SIGTERM            = 1 << 7, /* Ditto, but for SIGTERM */
+        BTRFS_SNAPSHOT_LOCK_BSD           = 1 << 8, /* Return a BSD exclusively locked file descriptor referring to snapshot subvolume/directory. */
 } BtrfsSnapshotFlags;
 
 typedef enum BtrfsRemoveFlags {
@@ -43,8 +41,13 @@ typedef enum BtrfsRemoveFlags {
         BTRFS_REMOVE_QUOTA     = 1 << 1,
 } BtrfsRemoveFlags;
 
-int btrfs_is_subvol_fd(int fd);
-int btrfs_is_subvol(const char *path);
+int btrfs_is_subvol_at(int dir_fd, const char *path);
+static inline int btrfs_is_subvol_fd(int fd) {
+        return btrfs_is_subvol_at(fd, NULL);
+}
+static inline int btrfs_is_subvol(const char *path) {
+        return btrfs_is_subvol_at(AT_FDCWD, path);
+}
 
 int btrfs_get_block_device_at(int dir_fd, const char *path, dev_t *ret);
 static inline int btrfs_get_block_device(const char *path, dev_t *ret) {
@@ -64,26 +67,24 @@ int btrfs_quota_scan_start(int fd);
 int btrfs_quota_scan_wait(int fd);
 int btrfs_quota_scan_ongoing(int fd);
 
-int btrfs_subvol_make(const char *path);
-int btrfs_subvol_make_fd(int fd, const char *subvolume);
-
-int btrfs_subvol_make_fallback(const char *path, mode_t);
-
-int btrfs_subvol_snapshot_fd_full(int old_fd, const char *new_path, BtrfsSnapshotFlags flags, copy_progress_path_t progress_path, copy_progress_bytes_t progress_bytes, void *userdata);
-static inline int btrfs_subvol_snapshot_fd(int old_fd, const char *new_path, BtrfsSnapshotFlags flags) {
-        return btrfs_subvol_snapshot_fd_full(old_fd, new_path, flags, NULL, NULL, NULL);
+int btrfs_subvol_snapshot_at_full(int dir_fdf, const char *from, int dir_fdt, const char *to, BtrfsSnapshotFlags flags, copy_progress_path_t progress_path, copy_progress_bytes_t progress_bytes, void *userdata);
+static inline int btrfs_subvol_snapshot_at(int dir_fdf, const char *from, int dir_fdt, const char *to, BtrfsSnapshotFlags flags) {
+        return btrfs_subvol_snapshot_at_full(dir_fdf, from, dir_fdt, to, flags, NULL, NULL, NULL);
 }
 
-int btrfs_subvol_snapshot_full(const char *old_path, const char *new_path, BtrfsSnapshotFlags flags, copy_progress_path_t progress_path, copy_progress_bytes_t progress_bytes, void *userdata);
-static inline int btrfs_subvol_snapshot(const char *old_path, const char *new_path, BtrfsSnapshotFlags flags) {
-        return btrfs_subvol_snapshot_full(old_path, new_path, flags, NULL, NULL, NULL);
+int btrfs_subvol_remove_at(int dir_fd, const char *path, BtrfsRemoveFlags flags);
+static inline int btrfs_subvol_remove(const char *path, BtrfsRemoveFlags flags) {
+        return btrfs_subvol_remove_at(AT_FDCWD, path, flags);
 }
 
-int btrfs_subvol_remove(const char *path, BtrfsRemoveFlags flags);
-int btrfs_subvol_remove_fd(int fd, const char *subvolume, BtrfsRemoveFlags flags);
+int btrfs_subvol_set_read_only_at(int dir_fd, const char *path, bool b);
+static inline int btrfs_subvol_set_read_only_fd(int fd, bool b) {
+        return btrfs_subvol_set_read_only_at(fd, NULL, b);
+}
+static inline int btrfs_subvol_set_read_only(const char *path, bool b) {
+        return btrfs_subvol_set_read_only_at(AT_FDCWD, path, b);
+}
 
-int btrfs_subvol_set_read_only_fd(int fd, bool b);
-int btrfs_subvol_set_read_only(const char *path, bool b);
 int btrfs_subvol_get_read_only_fd(int fd);
 
 int btrfs_subvol_get_id(int fd, const char *subvolume, uint64_t *ret);
@@ -102,6 +103,8 @@ int btrfs_subvol_set_subtree_quota_limit_fd(int fd, uint64_t subvol_id, uint64_t
 
 int btrfs_subvol_auto_qgroup_fd(int fd, uint64_t subvol_id, bool new_qgroup);
 int btrfs_subvol_auto_qgroup(const char *path, uint64_t subvol_id, bool create_intermediary_qgroup);
+
+int btrfs_subvol_make_default(const char *path);
 
 int btrfs_qgroupid_make(uint64_t level, uint64_t id, uint64_t *ret);
 int btrfs_qgroupid_split(uint64_t qgroupid, uint64_t *level, uint64_t *id);
@@ -123,20 +126,10 @@ int btrfs_qgroup_find_parents(int fd, uint64_t qgroupid, uint64_t **ret);
 int btrfs_qgroup_get_quota_fd(int fd, uint64_t qgroupid, BtrfsQuotaInfo *quota);
 int btrfs_qgroup_get_quota(const char *path, uint64_t qgroupid, BtrfsQuotaInfo *quota);
 
-static inline int btrfs_log_dev_root(int level, int ret, const char *p) {
-        return log_full_errno(level, ret,
-                              "File system behind %s is reported by btrfs to be backed by pseudo-device /dev/root, which is not a valid userspace accessible device node. "
-                              "Cannot determine correct backing block device.", p);
-}
+int btrfs_log_dev_root(int level, int ret, const char *p);
 
-static inline bool btrfs_might_be_subvol(const struct stat *st) {
-        if (!st)
-                return false;
-
-        /* Returns true if this 'struct stat' looks like it could refer to a btrfs subvolume. To make a final
-         * decision, needs to be combined with an fstatfs() check to see if this is actually btrfs. */
-
-        return S_ISDIR(st->st_mode) && st->st_ino == 256;
-}
+bool btrfs_might_be_subvol(const struct stat *st) _pure_;
 
 int btrfs_forget_device(const char *path);
+
+int btrfs_get_file_physical_offset_fd(int fd, uint64_t *ret);

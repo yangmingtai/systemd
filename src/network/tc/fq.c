@@ -3,11 +3,11 @@
 
 #include <linux/pkt_sched.h>
 
-#include "alloc-util.h"
-#include "conf-parser.h"
+#include "sd-netlink.h"
+
 #include "fq.h"
+#include "log.h"
 #include "logarithm.h"
-#include "netlink-util.h"
 #include "parse-util.h"
 #include "string-util.h"
 #include "strv.h"
@@ -103,7 +103,7 @@ static int fair_queueing_fill_message(Link *link, QDisc *qdisc, sd_netlink_messa
         return 0;
 }
 
-int config_parse_fair_queueing_u32(
+int config_parse_fq_u32(
                 const char *unit,
                 const char *filename,
                 unsigned line,
@@ -115,7 +115,7 @@ int config_parse_fair_queueing_u32(
                 void *data,
                 void *userdata) {
 
-        _cleanup_(qdisc_free_or_set_invalidp) QDisc *qdisc = NULL;
+        _cleanup_(qdisc_unref_or_set_invalidp) QDisc *qdisc = NULL;
         FairQueueing *fq;
         Network *network = ASSERT_PTR(data);
         uint32_t *p;
@@ -167,7 +167,7 @@ int config_parse_fair_queueing_u32(
         return 0;
 }
 
-int config_parse_fair_queueing_size(
+int config_parse_fq_size(
                 const char *unit,
                 const char *filename,
                 unsigned line,
@@ -179,7 +179,7 @@ int config_parse_fair_queueing_size(
                 void *data,
                 void *userdata) {
 
-        _cleanup_(qdisc_free_or_set_invalidp) QDisc *qdisc = NULL;
+        _cleanup_(qdisc_unref_or_set_invalidp) QDisc *qdisc = NULL;
         FairQueueing *fq;
         Network *network = ASSERT_PTR(data);
         uint64_t sz;
@@ -235,7 +235,7 @@ int config_parse_fair_queueing_size(
         return 0;
 }
 
-int config_parse_fair_queueing_bool(
+int config_parse_fq_bool(
                 const char *unit,
                 const char *filename,
                 unsigned line,
@@ -247,7 +247,7 @@ int config_parse_fair_queueing_bool(
                 void *data,
                 void *userdata) {
 
-        _cleanup_(qdisc_free_or_set_invalidp) QDisc *qdisc = NULL;
+        _cleanup_(qdisc_unref_or_set_invalidp) QDisc *qdisc = NULL;
         FairQueueing *fq;
         Network *network = ASSERT_PTR(data);
         int r;
@@ -267,14 +267,7 @@ int config_parse_fair_queueing_bool(
 
         fq = FQ(qdisc);
 
-        if (isempty(rvalue)) {
-                fq->pacing = -1;
-
-                qdisc = NULL;
-                return 0;
-        }
-
-        r = parse_boolean(rvalue);
+        r = parse_tristate(rvalue, &fq->pacing);
         if (r < 0) {
                 log_syntax(unit, LOG_WARNING, filename, line, r,
                            "Failed to parse '%s=', ignoring assignment: %s",
@@ -283,12 +276,12 @@ int config_parse_fair_queueing_bool(
         }
 
         fq->pacing = r;
-        qdisc = NULL;
+        TAKE_PTR(qdisc);
 
         return 0;
 }
 
-int config_parse_fair_queueing_usec(
+int config_parse_fq_usec(
                 const char *unit,
                 const char *filename,
                 unsigned line,
@@ -300,7 +293,7 @@ int config_parse_fair_queueing_usec(
                 void *data,
                 void *userdata) {
 
-        _cleanup_(qdisc_free_or_set_invalidp) QDisc *qdisc = NULL;
+        _cleanup_(qdisc_unref_or_set_invalidp) QDisc *qdisc = NULL;
         FairQueueing *fq;
         Network *network = ASSERT_PTR(data);
         usec_t sec;
@@ -348,7 +341,7 @@ int config_parse_fair_queueing_usec(
         return 0;
 }
 
-int config_parse_fair_queueing_max_rate(
+int config_parse_fq_max_rate(
                 const char *unit,
                 const char *filename,
                 unsigned line,
@@ -360,7 +353,7 @@ int config_parse_fair_queueing_max_rate(
                 void *data,
                 void *userdata) {
 
-        _cleanup_(qdisc_free_or_set_invalidp) QDisc *qdisc = NULL;
+        _cleanup_(qdisc_unref_or_set_invalidp) QDisc *qdisc = NULL;
         FairQueueing *fq;
         Network *network = ASSERT_PTR(data);
         uint64_t sz;

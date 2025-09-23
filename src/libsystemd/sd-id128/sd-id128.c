@@ -1,8 +1,8 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <errno.h>
 #include <fcntl.h>
-#include <unistd.h>
+#include <stdlib.h>
+#include <threads.h>
 
 #include "sd-id128.h"
 
@@ -12,16 +12,13 @@
 #include "hexdecoct.h"
 #include "hmac.h"
 #include "id128-util.h"
-#include "io-util.h"
-#include "macro.h"
-#include "missing_syscall.h"
-#include "missing_threads.h"
+#include "keyring-util.h"
 #include "path-util.h"
 #include "random-util.h"
 #include "stat-util.h"
 #include "user-util.h"
 
-_public_ char *sd_id128_to_string(sd_id128_t id, char s[_SD_ARRAY_STATIC SD_ID128_STRING_MAX]) {
+_public_ char *sd_id128_to_string(sd_id128_t id, char s[static SD_ID128_STRING_MAX]) {
         size_t k = 0;
 
         assert_return(s, NULL);
@@ -37,7 +34,7 @@ _public_ char *sd_id128_to_string(sd_id128_t id, char s[_SD_ARRAY_STATIC SD_ID12
         return s;
 }
 
-_public_ char *sd_id128_to_uuid_string(sd_id128_t id, char s[_SD_ARRAY_STATIC SD_ID128_UUID_STRING_MAX]) {
+_public_ char *sd_id128_to_uuid_string(sd_id128_t id, char s[static SD_ID128_UUID_STRING_MAX]) {
         size_t k = 0;
 
         assert_return(s, NULL);
@@ -139,7 +136,6 @@ _public_ int sd_id128_get_machine(sd_id128_t *ret) {
 }
 
 int id128_get_machine_at(int rfd, sd_id128_t *ret) {
-        _cleanup_close_ int fd = -EBADF;
         int r;
 
         assert(rfd >= 0 || rfd == AT_FDCWD);
@@ -150,7 +146,8 @@ int id128_get_machine_at(int rfd, sd_id128_t *ret) {
         if (r > 0)
                 return sd_id128_get_machine(ret);
 
-        fd = chase_and_openat(rfd, "/etc/machine-id", CHASE_AT_RESOLVE_IN_ROOT, O_RDONLY|O_CLOEXEC|O_NOCTTY, NULL);
+        _cleanup_close_ int fd =
+                chase_and_openat(rfd, "/etc/machine-id", CHASE_AT_RESOLVE_IN_ROOT|CHASE_MUST_BE_REGULAR, O_RDONLY|O_CLOEXEC|O_NOCTTY, /* ret_path= */ NULL);
         if (fd < 0)
                 return fd;
 
@@ -158,16 +155,27 @@ int id128_get_machine_at(int rfd, sd_id128_t *ret) {
 }
 
 int id128_get_machine(const char *root, sd_id128_t *ret) {
-        _cleanup_close_ int fd = -EBADF;
-
         if (empty_or_root(root))
                 return sd_id128_get_machine(ret);
 
-        fd = chase_and_open("/etc/machine-id", root, CHASE_PREFIX_ROOT, O_RDONLY|O_CLOEXEC|O_NOCTTY, NULL);
+        _cleanup_close_ int fd =
+                chase_and_open("/etc/machine-id", root, CHASE_PREFIX_ROOT|CHASE_MUST_BE_REGULAR, O_RDONLY|O_CLOEXEC|O_NOCTTY, /* ret_path= */ NULL);
         if (fd < 0)
                 return fd;
 
         return id128_read_fd(fd, ID128_FORMAT_PLAIN | ID128_REFUSE_NULL, ret);
+}
+
+int id128_get_boot(sd_id128_t *ret) {
+        int r;
+
+        assert(ret);
+
+        r = id128_read("/proc/sys/kernel/random/boot_id", ID128_FORMAT_UUID | ID128_REFUSE_NULL, ret);
+        if (r == -ENOENT && proc_mounted() == 0)
+                return -ENOSYS;
+
+        return r;
 }
 
 _public_ int sd_id128_get_boot(sd_id128_t *ret) {
@@ -175,9 +183,7 @@ _public_ int sd_id128_get_boot(sd_id128_t *ret) {
         int r;
 
         if (sd_id128_is_null(saved_boot_id)) {
-                r = id128_read("/proc/sys/kernel/random/boot_id", ID128_FORMAT_UUID | ID128_REFUSE_NULL, &saved_boot_id);
-                if (r == -ENOENT && proc_mounted() == 0)
-                        return -ENOSYS;
+                r = id128_get_boot(&saved_boot_id);
                 if (r < 0)
                         return r;
         }
@@ -192,7 +198,6 @@ static int get_invocation_from_keyring(sd_id128_t *ret) {
         char *d, *p, *g, *u, *e;
         unsigned long perms;
         key_serial_t key;
-        size_t sz = 256;
         uid_t uid;
         gid_t gid;
         int r, c;
@@ -204,31 +209,18 @@ static int get_invocation_from_keyring(sd_id128_t *ret) {
 
         key = request_key("user", "invocation_id", NULL, 0);
         if (key == -1) {
-                /* Keyring support not available? No invocation key stored? */
-                if (IN_SET(errno, ENOSYS, ENOKEY))
+                /* Keyring support not available? Keyring access locked down? No invocation key stored? */
+                if (ERRNO_IS_NOT_SUPPORTED(errno) ||
+                    ERRNO_IS_PRIVILEGE(errno) ||
+                    errno == ENOKEY)
                         return -ENXIO;
 
                 return -errno;
         }
 
-        for (;;) {
-                description = new(char, sz);
-                if (!description)
-                        return -ENOMEM;
-
-                c = keyctl(KEYCTL_DESCRIBE, key, (unsigned long) description, sz, 0);
-                if (c < 0)
-                        return -errno;
-
-                if ((size_t) c <= sz)
-                        break;
-
-                sz = c;
-                free(description);
-        }
-
-        /* The kernel returns a final NUL in the string, verify that. */
-        assert(description[c-1] == 0);
+        r = keyring_describe(key, &description);
+        if (r < 0)
+                return r;
 
         /* Chop off the final description string */
         d = strrchr(description, ';');
@@ -338,18 +330,20 @@ _public_ int sd_id128_randomize(sd_id128_t *ret) {
         return 0;
 }
 
-static int get_app_specific(sd_id128_t base, sd_id128_t app_id, sd_id128_t *ret) {
-        uint8_t hmac[SHA256_DIGEST_SIZE];
-        sd_id128_t result;
+_public_ int sd_id128_get_app_specific(sd_id128_t base, sd_id128_t app_id, sd_id128_t *ret) {
+        assert_cc(sizeof(sd_id128_t) < SHA256_DIGEST_SIZE); /* Check that we don't need to pad with zeros. */
+        union {
+                uint8_t hmac[SHA256_DIGEST_SIZE];
+                sd_id128_t result;
+        } buf;
 
-        assert(ret);
+        assert_return(ret, -EINVAL);
+        assert_return(!sd_id128_is_null(app_id), -ENXIO);
 
-        hmac_sha256(&base, sizeof(base), &app_id, sizeof(app_id), hmac);
+        hmac_sha256(&base, sizeof(base), &app_id, sizeof(app_id), buf.hmac);
 
         /* Take only the first half. */
-        memcpy(&result, hmac, MIN(sizeof(hmac), sizeof(result)));
-
-        *ret = id128_make_v4_uuid(result);
+        *ret = id128_make_v4_uuid(buf.result);
         return 0;
 }
 
@@ -363,7 +357,7 @@ _public_ int sd_id128_get_machine_app_specific(sd_id128_t app_id, sd_id128_t *re
         if (r < 0)
                 return r;
 
-        return get_app_specific(id, app_id, ret);
+        return sd_id128_get_app_specific(id, app_id, ret);
 }
 
 _public_ int sd_id128_get_boot_app_specific(sd_id128_t app_id, sd_id128_t *ret) {
@@ -376,5 +370,18 @@ _public_ int sd_id128_get_boot_app_specific(sd_id128_t app_id, sd_id128_t *ret) 
         if (r < 0)
                 return r;
 
-        return get_app_specific(id, app_id, ret);
+        return sd_id128_get_app_specific(id, app_id, ret);
+}
+
+_public_ int sd_id128_get_invocation_app_specific(sd_id128_t app_id, sd_id128_t *ret) {
+        sd_id128_t id;
+        int r;
+
+        assert_return(ret, -EINVAL);
+
+        r = sd_id128_get_invocation(&id);
+        if (r < 0)
+                return r;
+
+        return sd_id128_get_app_specific(id, app_id, ret);
 }

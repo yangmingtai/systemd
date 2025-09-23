@@ -3,6 +3,7 @@
 #include "alloc-util.h"
 #include "extract-word.h"
 #include "image-policy.h"
+#include "log.h"
 #include "logarithm.h"
 #include "sort-util.h"
 #include "string-util.h"
@@ -22,12 +23,12 @@ static int partition_policy_compare(const PartitionPolicy *a, const PartitionPol
         return CMP(ASSERT_PTR(a)->designator, ASSERT_PTR(b)->designator);
 }
 
-static PartitionPolicy* image_policy_bsearch(const ImagePolicy *policy, PartitionDesignator designator) {
+static const PartitionPolicy* image_policy_bsearch(const ImagePolicy *policy, PartitionDesignator designator) {
         if (!policy)
                 return NULL;
 
         return typesafe_bsearch(
-                        &(PartitionPolicy) { .designator = designator },
+                        &(const PartitionPolicy) { .designator = designator },
                         ASSERT_PTR(policy)->policies,
                         ASSERT_PTR(policy)->n_policies,
                         partition_policy_compare);
@@ -46,6 +47,20 @@ PartitionPolicyFlags partition_policy_flags_extend(PartitionPolicyFlags flags) {
 
         if ((flags & _PARTITION_POLICY_GROWFS_MASK) == 0)
                 flags |= PARTITION_POLICY_GROWFS_ON|PARTITION_POLICY_GROWFS_OFF;
+
+        return flags;
+}
+
+PartitionPolicyFlags partition_policy_flags_reduce(PartitionPolicyFlags flags) {
+        /* The reverse of partition_policy_flags_extend(): if some parts of the flags field allow all
+         * possible options, let's remove it from the flags to make them shorter */
+
+        if (FLAGS_SET(flags, _PARTITION_POLICY_USE_MASK))
+                flags &= ~_PARTITION_POLICY_USE_MASK;
+        if (FLAGS_SET(flags, _PARTITION_POLICY_READ_ONLY_MASK))
+                flags &= ~_PARTITION_POLICY_READ_ONLY_MASK;
+        if (FLAGS_SET(flags, _PARTITION_POLICY_GROWFS_MASK))
+                flags &= ~_PARTITION_POLICY_GROWFS_MASK;
 
         return flags;
 }
@@ -78,7 +93,7 @@ static PartitionPolicyFlags partition_policy_normalized_flags(const PartitionPol
 
 PartitionPolicyFlags image_policy_get(const ImagePolicy *policy, PartitionDesignator designator) {
         PartitionDesignator data_designator = _PARTITION_DESIGNATOR_INVALID;
-        PartitionPolicy *pp;
+        const PartitionPolicy *pp;
 
         /* No policy means: everything may be used in any mode */
         if (!policy)
@@ -362,7 +377,7 @@ int image_policy_from_string(const char *s, ImagePolicy **ret) {
 
 int partition_policy_flags_to_string(PartitionPolicyFlags flags, bool simplify, char **ret) {
         _cleanup_free_ char *buf = NULL;
-        const char *l[CONST_LOG2U(_PARTITION_POLICY_MASK) + 1]; /* one string per known flag at most */
+        const char *l[CONST_LOG2U(_PARTITION_POLICY_MASK + 1) + 1]; /* one string per known flag at most */
         size_t m = 0;
 
         assert(ret);
@@ -423,7 +438,7 @@ int partition_policy_flags_to_string(PartitionPolicyFlags flags, bool simplify, 
         if (m == 0)
                 buf = strdup("-");
         else {
-                assert(m+1 < ELEMENTSOF(l));
+                assert(m < ELEMENTSOF(l));
                 l[m] = NULL;
 
                 buf = strv_join((char**) l, "+");
@@ -676,6 +691,144 @@ int parse_image_policy_argument(const char *s, ImagePolicy **policy) {
         return free_and_replace_full(*policy, np, image_policy_free);
 }
 
+static bool partition_policy_flags_has_unspecified(PartitionPolicyFlags flags) {
+
+        if ((flags & _PARTITION_POLICY_USE_MASK) == 0)
+                return true;
+        if ((flags & _PARTITION_POLICY_READ_ONLY_MASK) == 0)
+                return true;
+        if ((flags & _PARTITION_POLICY_GROWFS_MASK) == 0)
+                return true;
+
+        return false;
+}
+
+int image_policy_intersect(const ImagePolicy *a, const ImagePolicy *b, ImagePolicy **ret) {
+        _cleanup_(image_policy_freep) ImagePolicy *p = NULL;
+
+        /* Calculates the intersection of the specified policies, i.e. only what is permitted in both. This
+         * might fail with -ENAVAIL if the intersection is an "impossible policy". For example, if a root
+         * partition my neither be used, nor be absent, nor be unused then this is considered
+         * "impossible".  */
+
+        p = image_policy_new(_PARTITION_DESIGNATOR_MAX);
+        if (!p)
+                return -ENOMEM;
+
+        p->default_flags =
+                partition_policy_flags_extend(image_policy_default(a)) &
+                partition_policy_flags_extend(image_policy_default(b));
+
+        if (partition_policy_flags_has_unspecified(p->default_flags)) /* Intersection empty? */
+                return -ENAVAIL;
+
+        p->default_flags = partition_policy_flags_reduce(p->default_flags);
+
+        for (PartitionDesignator d = 0; d < _PARTITION_DESIGNATOR_MAX; d++) {
+                PartitionPolicyFlags x, y, z, df;
+
+                /* If this designator has no entry in either policy we don't need to include it in the intersection either. */
+                if (!image_policy_bsearch(a, d) && !image_policy_bsearch(b, d))
+                        continue;
+
+                /* Expand this policy flags field to the "long" form, i.e. for each part of the flags that
+                 * are left unspcified add in all possible options */
+                x = image_policy_get_exhaustively(a, d);
+                if (x < 0)
+                        return x;
+
+                y = image_policy_get_exhaustively(b, d);
+                if (y < 0)
+                        return y;
+
+                /* Mask it */
+                z = x & y;
+
+                /* Check if the intersection is empty for this partition. If so, generate a clear error */
+                if (partition_policy_flags_has_unspecified(z))
+                        return -ENAVAIL;
+
+                df = partition_policy_normalized_flags(
+                                &(const PartitionPolicy) {
+                                        .flags = image_policy_default(p),
+                                        .designator = d,
+                                });
+                if (df < 0)
+                        return df;
+                if (df == z) /* Same as default? then let's skip this */
+                        continue;
+
+                /* image_policy_get_exhaustively() may have extended the flags mask to include all
+                 * read-only/growfs flags if not set. Let's remove them again, if they are both set to
+                 * minimize the policy again. */
+                z = partition_policy_flags_reduce(z);
+
+                p->policies[p->n_policies++] = (struct PartitionPolicy) {
+                        .designator = d,
+                        .flags = z,
+                };
+        }
+
+        if (ret)
+                *ret = TAKE_PTR(p);
+
+        return 0;
+}
+
+ImagePolicy* image_policy_free(ImagePolicy *p) {
+        return mfree(p);
+}
+
+int image_policy_ignore_designators(const ImagePolicy *p, const PartitionDesignator table[], size_t n_table, ImagePolicy **ret) {
+        assert(p);
+        assert(table || n_table == 0);
+        assert(ret);
+
+        /* Patches the specified image policy, replacing the policy for the specified designators by an
+         * "ignore" policy. Returns a patched copy. This is useful in context where only some of the
+         * available partitions shall be mounted, and hence the policy for the others really doesn't
+         * matter. */
+
+        _cleanup_(image_policy_freep) ImagePolicy *np = image_policy_new(_PARTITION_DESIGNATOR_MAX);
+        if (!np)
+                return -ENOMEM;
+
+        FOREACH_ARRAY(t, table, n_table) {
+                assert(*t >= 0);
+                assert(*t < _PARTITION_DESIGNATOR_MAX);
+
+                if (image_policy_bsearch(np, *t))
+                        continue;
+
+                /* Insert an ignore policy for this entry, and sort it to the right place, so that image_policy_bsearch() can work */
+                np->policies[np->n_policies++] = (PartitionPolicy) {
+                        .designator = *t,
+                        .flags = PARTITION_POLICY_IGNORE,
+                };
+                typesafe_qsort(np->policies, np->n_policies, partition_policy_compare);
+        }
+
+        FOREACH_ARRAY(i, p->policies, p->n_policies) {
+
+                if (image_policy_bsearch(np, i->designator))
+                        continue;
+
+                /* Copy the policy entry from the old image policy, and sort it to the right place, so that image_policy_bsearch() can work */
+                np->policies[np->n_policies++] = *i;
+                typesafe_qsort(np->policies, np->n_policies, partition_policy_compare);
+        }
+
+        np->default_flags = p->default_flags;
+
+        /* Return unused space to libc */
+        ImagePolicy *t = realloc(np, offsetof(ImagePolicy, policies) + sizeof(PartitionPolicy) * np->n_policies);
+        if (t)
+                np = t;
+
+        *ret = TAKE_PTR(np);
+        return 0;
+}
+
 const ImagePolicy image_policy_allow = {
         /* Allow policy */
         .n_policies = 0,
@@ -722,6 +875,14 @@ const ImagePolicy image_policy_confext = {
         .n_policies = 1,
         .policies = {
                 { PARTITION_ROOT,     PARTITION_POLICY_VERITY|PARTITION_POLICY_SIGNED|PARTITION_POLICY_ENCRYPTED|PARTITION_POLICY_UNPROTECTED|PARTITION_POLICY_ABSENT },
+        },
+        .default_flags = PARTITION_POLICY_IGNORE,
+};
+
+const ImagePolicy image_policy_confext_strict = {
+        .n_policies = 1,
+        .policies = {
+                { PARTITION_ROOT,     PARTITION_POLICY_SIGNED|PARTITION_POLICY_ABSENT },
         },
         .default_flags = PARTITION_POLICY_IGNORE,
 };

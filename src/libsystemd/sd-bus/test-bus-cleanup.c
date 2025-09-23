@@ -1,6 +1,5 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <stdio.h>
 #include <unistd.h>
 
 #include "sd-bus.h"
@@ -30,7 +29,7 @@ static void test_bus_fork(void) {
         r = safe_fork("(bus-fork-test)", FORK_WAIT|FORK_LOG, NULL);
         if (r == 0) {
                 assert_se(bus);
-                assert_se(sd_bus_is_ready(bus) == -ECHILD);
+                ASSERT_RETURN_EXPECTED_SE(sd_bus_is_ready(bus) == -ECHILD);
                 assert_se(sd_bus_flush_close_unref(bus) == NULL);
                 assert_se(sd_bus_close_unref(bus) == NULL);
                 assert_se(sd_bus_unref(bus) == NULL);

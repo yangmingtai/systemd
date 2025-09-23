@@ -3,7 +3,6 @@
 #include <sys/utsname.h>
 
 #include "architecture.h"
-#include "macro.h"
 #include "string-table.h"
 #include "string-util.h"
 
@@ -70,7 +69,7 @@ Architecture uname_architecture(void) {
                 { "parisc64",   ARCHITECTURE_PARISC64 },
                 { "parisc",     ARCHITECTURE_PARISC   },
 
-#elif defined(__loongarch64)
+#elif defined(__loongarch_lp64)
                 { "loongarch64", ARCHITECTURE_LOONGARCH64 },
 
 #elif defined(__m68k__)
@@ -130,9 +129,9 @@ Architecture uname_architecture(void) {
 
         assert_se(uname(&u) >= 0);
 
-        for (size_t i = 0; i < ELEMENTSOF(arch_map); i++)
-                if (streq(arch_map[i].machine, u.machine))
-                        return cached = arch_map[i].arch;
+        FOREACH_ELEMENT(entry, arch_map)
+                if (streq(entry->machine, u.machine))
+                        return cached = entry->arch;
 
         assert_not_reached();
         return _ARCHITECTURE_INVALID;

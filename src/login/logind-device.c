@@ -3,8 +3,12 @@
 #include <string.h>
 
 #include "alloc-util.h"
+#include "hashmap.h"
+#include "logind.h"
 #include "logind-device.h"
+#include "logind-seat.h"
 #include "logind-seat-dbus.h"
+#include "logind-session-device.h"
 
 Device* device_new(Manager *m, const char *sysfs, bool master) {
         Device *d;
@@ -27,7 +31,7 @@ Device* device_new(Manager *m, const char *sysfs, bool master) {
 
         d->manager = m;
         d->master = master;
-        dual_timestamp_get(&d->timestamp);
+        dual_timestamp_now(&d->timestamp);
 
         return d;
 }
@@ -50,7 +54,7 @@ static void device_detach(Device *d) {
 
         if (!seat_has_master_device(s)) {
                 seat_add_to_gc_queue(s);
-                seat_send_changed(s, "CanGraphical", NULL);
+                seat_send_changed(s, "CanGraphical");
         }
 }
 
@@ -99,6 +103,6 @@ void device_attach(Device *d, Seat *s) {
 
         if (!had_master && d->master && s->started) {
                 seat_save(s);
-                seat_send_changed(s, "CanGraphical", NULL);
+                seat_send_changed(s, "CanGraphical");
         }
 }

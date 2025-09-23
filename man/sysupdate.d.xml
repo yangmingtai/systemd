@@ -1,6 +1,6 @@
 <?xml version='1.0'?>
 <!DOCTYPE refentry PUBLIC "-//OASIS//DTD DocBook XML V4.5//EN"
-  "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd">
+  "http://www.oasis-open.org/docbook/xml/4.5/docbookx.dtd">
 <!-- SPDX-License-Identifier: LGPL-2.1-or-later -->
 
 <refentry id="sysupdate.d" conditional='ENABLE_SYSUPDATE'
@@ -22,20 +22,24 @@
   </refnamediv>
 
   <refsynopsisdiv>
-    <para><literallayout><filename>/etc/sysupdate.d/*.conf</filename>
-<filename>/run/sysupdate.d/*.conf</filename>
-<filename>/usr/lib/sysupdate.d/*.conf</filename>
-    </literallayout></para>
+    <para><simplelist>
+      <member><filename>/etc/sysupdate.d/*.transfer</filename></member>
+      <member><filename>/run/sysupdate.d/*.transfer</filename></member>
+      <member><filename>/usr/local/lib/sysupdate.d/*.transfer</filename></member>
+      <member><filename>/usr/lib/sysupdate.d/*.transfer</filename></member>
+    </simplelist></para>
   </refsynopsisdiv>
 
   <refsect1>
     <title>Description</title>
 
-    <para><filename>sysupdate.d/*.conf</filename> files describe how specific resources on the local system
-    shall be updated from a remote source. Each such file defines one such transfer: typically a remote
-    HTTP/HTTPS resource as source; and a local file, directory or partition as target. This may be used as a
-    simple, automatic, atomic update mechanism for the OS itself, for containers, portable services or system
-    extension images — but in fact may be used to update any kind of file from a remote source.</para>
+    <para>These files describe how specific resources on the local system shall be updated from a remote
+    source.
+    Each such file defines one such transfer: typically a remote HTTP/HTTPS resource as source; and a local
+    file, directory or partition as target.
+    This may be used as a simple, automatic, atomic update mechanism for the OS itself, for containers,
+    portable services or system extension images — but in fact may be used to update any kind of file from a
+    remote source.</para>
 
     <para>The
     <citerefentry><refentrytitle>systemd-sysupdate</refentrytitle><manvolnum>8</manvolnum></citerefentry>
@@ -46,14 +50,23 @@
     versions, in order to implement flexible update schemes, e.g. A/B updating (or a superset thereof,
     e.g. A/B/C, A/B/C/D, …).</para>
 
-    <para>Each <filename>*.conf</filename> file defines one transfer, i.e. describes one resource to
-    update. Typically, multiple of these files (i.e. multiple of such transfers) are defined together, and
+    <para>Each <filename>*.transfer</filename> file defines one transfer, i.e. describes one resource to
+    update.
+    Typically, multiple of these files (i.e. multiple of such transfers) are defined together, and
     are bound together by a common version identifier in order to update multiple resources at once on each
     update operation, for example to update a kernel, a root file system and a Verity partition in a single,
     combined, synchronized operation, so that only a combined update of all three together constitutes a
-    complete update.</para>
+    complete update.
+    We'll call such a collection of transfers a target.
+    <citerefentry><refentrytitle>systemd-sysupdate</refentrytitle><manvolnum>8</manvolnum></citerefentry>
+    always operates on a single target.</para>
 
-    <para>Each <filename>*.conf</filename> file contains three sections: [Transfer], [Source] and [Target].</para>
+    <para>Transfers may be grouped together into sets that can be individually enabled or disabled by the
+    system administrator, called "Optional Features":
+    <citerefentry><refentrytitle>sysupdate.features</refentrytitle><manvolnum>5</manvolnum></citerefentry>.
+    </para>
+
+    <para>Each <filename>*.transfer</filename> file contains three sections: [Transfer], [Source] and [Target].</para>
   </refsect1>
 
   <refsect1>
@@ -79,10 +92,10 @@
       UUID of 2c7357ed-ebd2-46d9-aec1-23d437ec2bf5 (i.e. the partition type for Verity integrity information
       for x86-64 root file systems).</para></listitem>
 
-      <listitem><para>Finally, a file <literal>https://download.example.com/foobarOS_47.efi.xz</literal> (a
+      <listitem><para>Finally, a file <literal>https://download.example.com/foobarOS_47.efi</literal> (a
       unified kernel, as per <ulink url="https://uapi-group.org/specifications/specs/boot_loader_specification">Boot Loader
-      Specification</ulink> Type #2) should be downloaded, decompressed and written to the ESP file system,
-      i.e. to <filename>EFI/Linux/foobarOS_47.efi</filename> in the ESP.</para></listitem>
+      Specification</ulink> Type #2) should be downloaded, decompressed and written to the $BOOT file system,
+      i.e. to <filename>EFI/Linux/foobarOS_47.efi</filename> in the ESP or XBOOTLDR partition.</para></listitem>
     </orderedlist>
 
     <para>The version-independent generalization of this would be (using the special marker
@@ -97,15 +110,15 @@
       → a local, previously empty GPT partition of type 2c7357ed-ebd2-46d9-aec1-23d437ec2bf5, with the label to be
       set to <literal>foobarOS_@v_verity</literal>.</para></listitem>
 
-      <listitem><para>A transfer of a file <literal>https://download.example.com/foobarOS_@v.efi.xz</literal>
-      → a local file <filename>/efi/EFI/Linux/foobarOS_@v.efi</filename>.</para></listitem>
+      <listitem><para>A transfer of a file <literal>https://download.example.com/foobarOS_@v.efi</literal>
+      → a local file <filename>$BOOT/EFI/Linux/foobarOS_@v.efi</filename>.</para></listitem>
     </orderedlist>
 
     <para>An update can only complete if the relevant URLs provide their resources for the same version,
     i.e. for the same value of <literal>@v</literal>.</para>
 
-    <para>The above may be translated into three <filename>*.conf</filename> files in
-    <filename>sysupdate.d/</filename>, one for each resource to transfer. The <filename>*.conf</filename>
+    <para>The above may be translated into three <filename>*.transfer</filename> files in
+    <filename>sysupdate.d/</filename>, one for each resource to transfer. The <filename>*.transfer</filename>
     files configure the type of download, and what place to write the download to (i.e. whether to a
     partition or a file in the file system). Most importantly these files contain the URL, partition name and
     filename patterns shown above that describe how these resources are called on the source and how they
@@ -128,11 +141,11 @@
       lists file names and their SHA256 hashes.</para></listitem>
     </itemizedlist>
 
-    <para>Transfers are done in the alphabetical order of the <filename>.conf</filename> file names they are
+    <para>Transfers are done in the alphabetical order of the <filename>.transfer</filename> file names they are
     defined in. First, the resource data is downloaded directly into a target file/directory/partition. Once
     this is completed for all defined transfers, in a second step the files/directories/partitions are
     renamed to their final names as defined by the target <varname>MatchPattern=</varname>, again in the
-    order the <filename>.conf</filename> transfer file names dictate. This step is not atomic, however it is
+    order the <filename>.transfer</filename> transfer file names dictate. This step is not atomic, however it is
     guaranteed to be executed strictly in order with suitable disk synchronization in place. Typically, when
     updating an OS one of the transfers defines the entry point when booting. Thus it is generally a good idea
     to order the resources via the transfer configuration file names so that the entry point is written
@@ -375,7 +388,7 @@
           <row>
             <entry><literal>@t</literal></entry>
             <entry>File modification time</entry>
-            <entry>Formatted decimal integer, µs since UNIX epoch Jan 1st 1970</entry>
+            <entry>Formatted decimal integer, μs since UNIX epoch Jan 1st 1970</entry>
             <entry>Only relevant if target resource type chosen as <constant>regular-file</constant></entry>
           </row>
 
@@ -440,7 +453,9 @@
 
         <listitem><para>Specifies the minimum version to require for this transfer to take place. If the
         source or target patterns in this transfer definition match files older than this version they will
-        be considered obsolete, and never be considered for the update operation.</para></listitem>
+        be considered obsolete, and never be considered for the update operation.</para>
+
+        <xi:include href="version-info.xml" xpointer="v251"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -454,7 +469,9 @@
         <para>Like many of the settings in these configuration files this setting supports specifier
         expansion. It's particularly useful to set this setting to one of the <literal>%A</literal>,
         <literal>%B</literal> or <literal>%w</literal> specifiers to automatically refer to the current OS
-        version of the running system. See below for details on supported specifiers.</para></listitem>
+        version of the running system. See below for details on supported specifiers.</para>
+
+        <xi:include href="version-info.xml" xpointer="v251"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -464,8 +481,8 @@
         downloaded resources (specifically: validate the GPG signatures for downloaded
         <filename>SHA256SUMS</filename> manifest files, via their detached signature files
         <filename>SHA256SUMS.gpg</filename> in combination with the system keyring
-        <filename>/usr/lib/systemd/import-pubring.gpg</filename> or
-        <filename>/etc/systemd/import-pubring.gpg</filename>).</para>
+        <filename>/usr/lib/systemd/import-pubring.pgp</filename> or
+        <filename>/etc/systemd/import-pubring.pgp</filename>).</para>
 
         <para>This option is essential to provide integrity guarantees for downloaded resources and thus
         should be left enabled, outside of test environments.</para>
@@ -476,9 +493,78 @@
 
         <para>This option only has an effect if the source resource type is selected as
         <constant>url-file</constant> or <constant>url-tar</constant>, as integrity and authentication
-        checking is only available for transfers from remote sources.</para></listitem>
+        checking is only available for transfers from remote sources.</para>
+
+        <xi:include href="version-info.xml" xpointer="v251"/></listitem>
       </varlistentry>
 
+      <varlistentry>
+        <term><varname>ChangeLog=</varname></term>
+
+        <listitem><para>Optionally takes a human-presentable URL to a website containing a change-log of
+        the resource being updated.</para>
+
+        <para>This may be set multiple times in a single transfer definition. If set multiple times, the
+        values are gathered into a list of URLs. Adding a value of the empty string will clear the existing
+        list of all values.</para>
+
+        <para>This setting supports specifier expansion. See below for details on supported
+        specifiers. This setting will also expand the <literal>@v</literal> wildcard pattern. See above
+        for details.</para>
+
+        <xi:include href="version-info.xml" xpointer="v257"/></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><varname>AppStream=</varname></term>
+
+        <listitem><para>Optionally takes a URL to an
+        <ulink url="https://www.freedesktop.org/software/appstream/docs/chap-CatalogData.html">AppStream catalog</ulink>
+        XML file. This may be used by software centers (such as GNOME Software or KDE Discover) to present
+        rich metadata about the resources being updated. This includes display names, changelogs, icons,
+        and more. The specified catalog must include <ulink url="https://systemd.io/APPSTREAM_BUNDLE">special metadata</ulink>
+        to be correctly associated with
+        <citerefentry><refentrytitle>systemd-sysupdate</refentrytitle><manvolnum>8</manvolnum></citerefentry>
+        by the software centers.</para>
+
+        <para>This setting supports specifier expansion. See below for details on supported
+        specifiers.</para>
+
+        <xi:include href="version-info.xml" xpointer="v257"/></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><varname>Features=</varname></term>
+
+        <listitem><para>A space-separated list of
+        <citerefentry><refentrytitle>sysupdate.features</refentrytitle><manvolnum>5</manvolnum></citerefentry>
+        that this transfer belongs to, by name.
+        This option may be specified more than once, in which case the specified list of features is merged.
+        If the empty string is assigned to this option, the list is reset and all prior assignments will have
+        no effect.
+        For example: <literal>Features=foo bar</literal> specifies that the transfer belongs to
+        <literal>foo.feature</literal> and <literal>bar.feature</literal>.</para>
+
+        <para>If the list of features is empty, then this transfer is always used.
+        If this transfer belongs to more than one feature, then it will be used if <emphasis>any</emphasis>
+        one of the listed features is enabled.
+        A name that does not correspond to a defined feature will resolve to an implicit feature that is
+        always disabled.</para>
+
+        <xi:include href="version-info.xml" xpointer="v257"/></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><varname>RequisiteFeatures=</varname></term>
+
+        <listitem><para>This is like <varname>Features=</varname>, except that <emphasis>all</emphasis>
+        features listed here must be enabled for this transfer to be enabled.
+        If both options are specified, then they both apply: the transfer will be enabled only if all
+        features specified here are enabled, and at least one feature listed in <varname>Features=</varname>
+        is enabled.</para>
+
+        <xi:include href="version-info.xml" xpointer="v257"/></listitem>
+      </varlistentry>
     </variablelist>
   </refsect1>
 
@@ -498,7 +584,9 @@
         mandatory.</para>
 
         <para>Note that only certain combinations of source and target resource types are supported, see
-        above.</para></listitem>
+        above.</para>
+
+        <xi:include href="version-info.xml" xpointer="v251"/></listitem>
       </varlistentry>
     </variablelist>
 
@@ -516,7 +604,9 @@
         downloaded.</para>
 
         <para>For all other source resource types this must be a local path in the file system, referring to
-        a local directory to find the versions of this resource in.</para></listitem>
+        a local directory to find the versions of this resource in.</para>
+
+        <xi:include href="version-info.xml" xpointer="v251"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -527,7 +617,14 @@
 
         <para>This option is mandatory. Any pattern listed must contain at least the <literal>@v</literal>
         wildcard, so that a version identifier may be extracted from the filename. All other wildcards are
-        optional.</para></listitem>
+        optional.</para>
+
+        <para>If the source type is <constant>regular-file</constant> or <constant>directory</constant>, the
+        pattern may contain slash characters. In this case, it will match the file or directory in
+        corresponding subdirectory. For example <literal>MatchPattern=foo_@v/bar.efi</literal> will match
+        <literal>bar.efi</literal> in directory <literal>foo_1</literal>. </para>
+
+        <xi:include href="version-info.xml" xpointer="v251"/></listitem>
       </varlistentry>
     </variablelist>
   </refsect1>
@@ -547,7 +644,9 @@
         mandatory.</para>
 
         <para>Note that only certain combinations of source and target resource types are supported, see
-        above.</para></listitem>
+        above.</para>
+
+        <xi:include href="version-info.xml" xpointer="v251"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -566,7 +665,40 @@
         <varname>Type=</varname> is set to <constant>partition</constant>. Partitions must exist already, and
         a special partition label <literal>_empty</literal> is used to indicate empty partitions. To
         automatically generate suitable partitions on first boot, use a tool such as
-        <citerefentry><refentrytitle>systemd-repart</refentrytitle><manvolnum>8</manvolnum></citerefentry>.</para></listitem>
+        <citerefentry><refentrytitle>systemd-repart</refentrytitle><manvolnum>8</manvolnum></citerefentry>.</para>
+
+        <xi:include href="version-info.xml" xpointer="v251"/></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><varname>PathRelativeTo=</varname></term>
+
+        <listitem><para>Specifies what anchor point <varname>Path=</varname> should be relative to. Takes one
+        of <constant>root</constant>, <constant>esp</constant>, <constant>xbootldr</constant>,
+        <constant>boot</constant> or <constant>explicit</constant>. If unspecified, defaults to
+        <constant>root</constant>.</para>
+
+        <para>If set to <constant>root</constant>, <constant>esp</constant>, <constant>xbootldr</constant>,
+        the specified <varname>Path=</varname> will be resolved relative to the mount point of the
+        corresponding partition, as defined by the
+        <ulink url="https://uapi-group.org/specifications/specs/boot_loader_specification">Boot Loader
+        Specification</ulink>.</para>
+
+        <para>If set to <constant>boot</constant>, the specified <varname>Path=</varname> will be resolved
+        relative to the mount point of the $BOOT partition (i.e. the ESP or XBOOTLDR), as defined by the
+        <ulink url="https://uapi-group.org/specifications/specs/boot_loader_specification">Boot Loader
+        Specification</ulink>.</para>
+
+        <para>If set to <constant>explicit</constant>, the specified <varname>Path=</varname> will be
+        resolved relative to the directory specified with <option>--transfer-source=</option> when invoking
+        <citerefentry><refentrytitle>systemd-sysupdate</refentrytitle><manvolnum>8</manvolnum></citerefentry>.
+        </para>
+
+        <para>The values <constant>esp</constant>, <constant>xbootldr</constant>, and
+        <constant>boot</constant> are only supported when <varname>Type=</varname> is set to
+        <constant>regular-file</constant> or <constant>directory</constant>.</para>
+
+        <xi:include href="version-info.xml" xpointer="v254"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -582,7 +714,15 @@
 
         <para>This pattern is both used for matching existing installed versions and for determining the name
         of new versions to install. If multiple patterns are specified, the first specified is used for
-        naming newly installed versions.</para></listitem>
+        naming newly installed versions.</para>
+
+        <para>If the target type is <constant>regular-file</constant> or <constant>directory</constant>, the
+        pattern may contain slash characters. In this case, it will match the file or directory in
+        corresponding subdirectory. For example <literal>MatchPattern=foo_@v/bar.efi</literal> will match
+        <literal>bar.efi</literal> in directory <literal>foo_1</literal>. Directories in the path will be
+        created when file is installed. Empty directories will be removed when file is removed.</para>
+
+        <xi:include href="version-info.xml" xpointer="v251"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -593,7 +733,9 @@
         partitions are ignored. If not specified, the GPT partition type <constant>linux-generic</constant>
         is used. Accepts either a literal type UUID or a symbolic type identifier. For a list of supported
         type identifiers, see the <varname>Type=</varname> setting in
-        <citerefentry><refentrytitle>repart.d</refentrytitle><manvolnum>5</manvolnum></citerefentry>.</para></listitem>
+        <citerefentry><refentrytitle>repart.d</refentrytitle><manvolnum>5</manvolnum></citerefentry>.</para>
+
+        <xi:include href="version-info.xml" xpointer="v251"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -615,7 +757,9 @@
         Partitions Specification</ulink> for details about these flags.</para>
 
         <para>Note that these settings are not used for matching, they only have effect on newly written
-        partitions in case a transfer takes place.</para></listitem>
+        partitions in case a transfer takes place.</para>
+
+        <xi:include href="version-info.xml" xpointer="v251"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -631,7 +775,9 @@
         whole. Finally, if the target <varname>Type=</varname> is selected as <constant>directory</constant>,
         the "immutable" file attribute is set, see <citerefentry
         project='man-pages'><refentrytitle>chattr</refentrytitle><manvolnum>1</manvolnum></citerefentry> for
-        details.</para></listitem>
+        details.</para>
+
+        <xi:include href="version-info.xml" xpointer="v251"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -643,7 +789,9 @@
         (i.e. <literal>@t</literal>), the value from the pattern is used.</para>
 
         <para>Note that this setting is not used for matching, it only has an effect on newly written
-        files when a transfer takes place.</para></listitem>
+        files when a transfer takes place.</para>
+
+        <xi:include href="version-info.xml" xpointer="v251"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -654,7 +802,9 @@
         done and left for this file. These settings are useful for managing kernel images, following the
         scheme defined in <ulink url="https://systemd.io/AUTOMATIC_BOOT_ASSESSMENT">Automatic Boot
         Assessment</ulink>, and only have an effect if the target pattern includes the <literal>@d</literal>
-        or <literal>@l</literal> wildcards.</para></listitem>
+        or <literal>@l</literal> wildcards.</para>
+
+        <xi:include href="version-info.xml" xpointer="v251"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -678,7 +828,9 @@
         of concurrent versions to keep is additionally restricted by the number of partition slots of the
         right type in the partition table. I.e. if there are only 2 partition slots for the selected
         partition type, setting this value larger than 2 is without effect, since no more than 2 concurrent
-        versions could be stored in the image anyway.</para></listitem>
+        versions could be stored in the image anyway.</para>
+
+        <xi:include href="version-info.xml" xpointer="v251"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -688,7 +840,9 @@
         initiating an update, all left-over, incomplete updates from a previous attempt are removed from the
         target directory. This only has an effect if the target resource <varname>Type=</varname> is selected
         as <constant>regular-file</constant>, <constant>directory</constant> or
-        <constant>subvolume</constant>.</para></listitem>
+        <constant>subvolume</constant>.</para>
+
+        <xi:include href="version-info.xml" xpointer="v251"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -699,7 +853,9 @@
         is useful in to provide a stable name always pointing to the newest version of the resource. This is
         only supported if the target resource <varname>Type=</varname> is selected as
         <constant>regular-file</constant>, <constant>directory</constant> or
-        <constant>subvolume</constant>.</para></listitem>
+        <constant>subvolume</constant>.</para>
+
+        <xi:include href="version-info.xml" xpointer="v251"/></listitem>
       </varlistentry>
 
     </variablelist>
@@ -760,7 +916,7 @@
       partition, and a unified kernel image to update as one. This example is an extension of the example
       discussed earlier in this man page.</para>
 
-      <para><programlisting># /usr/lib/sysupdate.d/50-verity.conf
+      <para><programlisting># /usr/lib/sysupdate.d/50-verity.transfer
 [Transfer]
 ProtectVersion=%A
 
@@ -775,7 +931,7 @@ Path=auto
 MatchPattern=foobarOS_@v_verity
 MatchPartitionType=root-verity
 PartitionFlags=0
-PartitionReadOnly=1</programlisting></para>
+ReadOnly=1</programlisting></para>
 
       <para>The above defines the update mechanism for the Verity partition of the root file system. Verity
       partition images are downloaded from
@@ -790,7 +946,7 @@ PartitionReadOnly=1</programlisting></para>
       <citerefentry><refentrytitle>systemd-gpt-auto-generator</refentrytitle><manvolnum>8</manvolnum></citerefentry>
       suggests).</para>
 
-      <para><programlisting># /usr/lib/sysupdate.d/60-root.conf
+      <para><programlisting># /usr/lib/sysupdate.d/60-root.transfer
 [Transfer]
 ProtectVersion=%A
 
@@ -805,36 +961,37 @@ Path=auto
 MatchPattern=foobarOS_@v
 MatchPartitionType=root
 PartitionFlags=0
-PartitionReadOnly=1</programlisting></para>
+ReadOnly=1</programlisting></para>
 
       <para>The above defines a matching transfer definition for the root file system.</para>
 
-      <para><programlisting># /usr/lib/sysupdate.d/70-kernel.conf
+      <para><programlisting># /usr/lib/sysupdate.d/70-kernel.transfer
 [Transfer]
 ProtectVersion=%A
 
 [Source]
 Type=url-file
 Path=https://download.example.com/
-MatchPattern=foobarOS_@v.efi.xz
+MatchPattern=foobarOS_@v.efi
 
 [Target]
 Type=regular-file
-Path=/efi/EFI/Linux
+Path=/EFI/Linux
+PathRelativeTo=boot
 MatchPattern=foobarOS_@v+@l-@d.efi \
              foobarOS_@v+@l.efi \
              foobarOS_@v.efi
-Mode=0444
+Mode=0644
 TriesLeft=3
 TriesDone=0
 InstancesMax=2</programlisting></para>
 
-        <para>The above installs a unified kernel image into the ESP (which is mounted to
-        <filename>/efi/</filename>), as per <ulink url="https://uapi-group.org/specifications/specs/boot_loader_specification">Boot
-        Loader Specification</ulink> Type #2. This defines three possible patterns for the names of the
-        kernel images, as per <ulink url="https://systemd.io/AUTOMATIC_BOOT_ASSESSMENT">Automatic Boot
-        Assessment</ulink>, and ensures when installing new kernels, they are set up with 3 tries left. No
-        more than two parallel kernels are kept.</para>
+        <para>The above installs a unified kernel image into the $BOOT partition, as per
+        <ulink url="https://uapi-group.org/specifications/specs/boot_loader_specification">Boot Loader
+        Specification</ulink> Type #2. This defines three possible patterns for the names of the kernel
+        images, as per <ulink url="https://systemd.io/AUTOMATIC_BOOT_ASSESSMENT">Automatic Boot Assessment</ulink>,
+        and ensures when installing new kernels, they are set up with 3 tries left. No more than two parallel
+        kernels are kept.</para>
 
         <para>With this setup the web server would serve the following files, for a hypothetical version 7 of
         the OS:</para>
@@ -844,7 +1001,7 @@ InstancesMax=2</programlisting></para>
           <listitem><para><filename>SHA256SUMS.gpg</filename> – The detached cryptographic signature for the manifest file</para></listitem>
           <listitem><para><filename>foobarOS_7_8b8186b1-2b4e-4eb6-ad39-8d4d18d2a8fb.verity.xz</filename> – The Verity image for version 7</para></listitem>
           <listitem><para><filename>foobarOS_7_f4d1234f-3ebf-47c4-b31d-4052982f9a2f.root.xz</filename> – The root file system image for version 7</para></listitem>
-          <listitem><para><filename>foobarOS_7_efi.xz</filename> – The unified kernel image for version 7</para></listitem>
+          <listitem><para><filename>foobarOS_7.efi</filename> – The unified kernel image for version 7</para></listitem>
         </itemizedlist>
 
         <para>For each new OS release a new set of the latter three files would be added, each time with an
@@ -876,11 +1033,11 @@ CurrentSymlink=myContainer</programlisting></para>
 
   <refsect1>
     <title>See Also</title>
-    <para>
-      <citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>systemd-sysupdate</refentrytitle><manvolnum>8</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>systemd-repart</refentrytitle><manvolnum>8</manvolnum></citerefentry>
-    </para>
+    <para><simplelist type="inline">
+      <member><citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>systemd-sysupdate</refentrytitle><manvolnum>8</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>systemd-repart</refentrytitle><manvolnum>8</manvolnum></citerefentry></member>
+    </simplelist></para>
   </refsect1>
 
 </refentry>

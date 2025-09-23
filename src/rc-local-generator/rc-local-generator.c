@@ -1,10 +1,9 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <errno.h>
-#include <stdio.h>
 #include <unistd.h>
 
 #include "generator.h"
+#include "initrd-util.h"
 #include "log.h"
 #include "mkdir-label.h"
 #include "string-util.h"
@@ -58,7 +57,12 @@ static int run(const char *dest, const char *dest_early, const char *dest_late) 
 
         assert_se(arg_dest = dest);
 
-        if (check_executable(RC_LOCAL_PATH) >= 0) {
+        if (in_initrd()) {
+                log_debug("Skipping generator, running in the initrd.");
+                return EXIT_SUCCESS;
+        }
+
+        if (check_executable(SYSTEM_SYSVRCLOCAL_PATH) >= 0) {
                 log_debug("Automatically adding rc-local.service.");
 
                 r = add_symlink("rc-local.service", "multi-user.target");

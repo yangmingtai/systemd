@@ -1,35 +1,31 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <fcntl.h>
-#include <stddef.h>
 #include <stdio.h>
 #include <unistd.h>
 
+#include "sd-daemon.h"
 #include "sd-id128.h"
 
 #include "all-units.h"
 #include "alloc-util.h"
 #include "capability-util.h"
 #include "conf-parser.h"
-#include "fd-util.h"
 #include "fileio.h"
 #include "format-util.h"
-#include "fs-util.h"
 #include "hashmap.h"
-#include "hostname-util.h"
-#include "install-printf.h"
+#include "hostname-setup.h"
 #include "install.h"
+#include "install-printf.h"
 #include "load-fragment.h"
-#include "macro.h"
-#include "memory-util.h"
+#include "manager.h"
 #include "open-file.h"
 #include "pcre2-util.h"
 #include "rm-rf.h"
+#include "set.h"
 #include "specifier.h"
 #include "string-util.h"
 #include "strv.h"
 #include "tests.h"
-#include "tmpfile-util.h"
 #include "user-util.h"
 
 /* Nontrivial value serves as a placeholder to check that parsing function (didn't) change it */
@@ -39,15 +35,15 @@ static char *runtime_dir = NULL;
 
 STATIC_DESTRUCTOR_REGISTER(runtime_dir, rm_rf_physical_and_freep);
 
-TEST_RET(unit_file_get_set) {
+/* For testing type compatibility. */
+_unused_ ConfigPerfItemLookup unused_lookup = load_fragment_gperf_lookup;
+
+TEST_RET(unit_file_get_list) {
         int r;
-        _cleanup_(hashmap_freep) Hashmap *h = NULL;
+        _cleanup_hashmap_free_ Hashmap *h = NULL;
         UnitFileList *p;
 
-        h = hashmap_new(&unit_file_list_hash_ops_free);
-        assert_se(h);
-
-        r = unit_file_get_list(RUNTIME_SCOPE_SYSTEM, NULL, h, NULL, NULL);
+        r = unit_file_get_list(RUNTIME_SCOPE_SYSTEM, NULL, NULL, NULL, &h);
         if (IN_SET(r, -EPERM, -EACCES))
                 return log_tests_skipped_errno(r, "unit_file_get_list");
 
@@ -76,12 +72,12 @@ static void check_execcommand(ExecCommand *c,
         n = strv_length(c->argv);
         log_info("actual: \"%s\" [\"%s\" \"%s\" \"%s\"]",
                  c->path, c->argv[0], n > 0 ? c->argv[1] : "(null)", n > 1 ? c->argv[2] : "(null)");
-        assert_se(streq(c->path, path));
-        assert_se(streq(c->argv[0], argv0 ?: path));
+        ASSERT_STREQ(c->path, path);
+        ASSERT_STREQ(c->argv[0], argv0 ?: path);
         if (n > 0)
-                assert_se(streq_ptr(c->argv[1], argv1));
+                ASSERT_STREQ(c->argv[1], argv1);
         if (n > 1)
-                assert_se(streq_ptr(c->argv[2], argv2));
+                ASSERT_STREQ(c->argv[2], argv2);
         assert_se(!!(c->flags & EXEC_COMMAND_IGNORE_FAILURE) == ignore);
 }
 
@@ -136,7 +132,7 @@ TEST(config_parse_exec) {
                               "LValue", 0, "/RValue/ argv0 r1",
                               &c, u);
         assert_se(r == -ENOEXEC);
-        assert_se(c1->command_next == NULL);
+        ASSERT_NULL(c1->command_next);
 
         log_info("/* honour_argv0 */");
         r = config_parse_exec(NULL, "fake", 3, "section", 1,
@@ -151,14 +147,14 @@ TEST(config_parse_exec) {
                               "LValue", 0, "@/RValue",
                               &c, u);
         assert_se(r == -ENOEXEC);
-        assert_se(c1->command_next == NULL);
+        ASSERT_NULL(c1->command_next);
 
         log_info("/* no command, whitespace only, reset */");
         r = config_parse_exec(NULL, "fake", 3, "section", 1,
                               "LValue", 0, "",
                               &c, u);
         assert_se(r == 0);
-        assert_se(c == NULL);
+        ASSERT_NULL(c);
 
         log_info("/* ignore && honour_argv0 */");
         r = config_parse_exec(NULL, "fake", 4, "section", 1,
@@ -181,14 +177,14 @@ TEST(config_parse_exec) {
                               "LValue", 0, "--/RValue argv0 r1",
                               &c, u);
         assert_se(r == 0);
-        assert_se(c1->command_next == NULL);
+        ASSERT_NULL(c1->command_next);
 
         log_info("/* ignore && ignore (2) */");
         r = config_parse_exec(NULL, "fake", 4, "section", 1,
                               "LValue", 0, "-@-/RValue argv0 r1",
                               &c, u);
         assert_se(r == 0);
-        assert_se(c1->command_next == NULL);
+        ASSERT_NULL(c1->command_next);
 
         log_info("/* semicolon */");
         r = config_parse_exec(NULL, "fake", 5, "section", 1,
@@ -224,7 +220,7 @@ TEST(config_parse_exec) {
         c1 = c1->command_next;
         check_execcommand(c1, "/RValue", "argv0", "r1", NULL, true);
 
-        assert_se(c1->command_next == NULL);
+        ASSERT_NULL(c1->command_next);
 
         log_info("/* trailing semicolon, no whitespace */");
         r = config_parse_exec(NULL, "fake", 5, "section", 1,
@@ -235,7 +231,7 @@ TEST(config_parse_exec) {
         c1 = c1->command_next;
         check_execcommand(c1, "/RValue", "argv0", "r1", NULL, true);
 
-        assert_se(c1->command_next == NULL);
+        ASSERT_NULL(c1->command_next);
 
         log_info("/* trailing semicolon in single quotes */");
         r = config_parse_exec(NULL, "fake", 5, "section", 1,
@@ -363,7 +359,7 @@ TEST(config_parse_exec) {
                                       "LValue", 0, path,
                                       &c, u);
                 assert_se(r == -ENOEXEC);
-                assert_se(c1->command_next == NULL);
+                ASSERT_NULL(c1->command_next);
         }
 
         log_info("/* valid character: \\s */");
@@ -389,35 +385,35 @@ TEST(config_parse_exec) {
                               "LValue", 0, "/path\\",
                               &c, u);
         assert_se(r == -ENOEXEC);
-        assert_se(c1->command_next == NULL);
+        ASSERT_NULL(c1->command_next);
 
         log_info("/* missing ending ' */");
         r = config_parse_exec(NULL, "fake", 4, "section", 1,
                               "LValue", 0, "/path 'foo",
                               &c, u);
         assert_se(r == -ENOEXEC);
-        assert_se(c1->command_next == NULL);
+        ASSERT_NULL(c1->command_next);
 
         log_info("/* missing ending ' with trailing backslash */");
         r = config_parse_exec(NULL, "fake", 4, "section", 1,
                               "LValue", 0, "/path 'foo\\",
                               &c, u);
         assert_se(r == -ENOEXEC);
-        assert_se(c1->command_next == NULL);
+        ASSERT_NULL(c1->command_next);
 
         log_info("/* invalid space between modifiers */");
         r = config_parse_exec(NULL, "fake", 4, "section", 1,
                               "LValue", 0, "- /path",
                               &c, u);
         assert_se(r == 0);
-        assert_se(c1->command_next == NULL);
+        ASSERT_NULL(c1->command_next);
 
         log_info("/* only modifiers, no path */");
         r = config_parse_exec(NULL, "fake", 4, "section", 1,
                               "LValue", 0, "-",
                               &c, u);
         assert_se(r == 0);
-        assert_se(c1->command_next == NULL);
+        ASSERT_NULL(c1->command_next);
 
         log_info("/* long arg */"); /* See issue #22957. */
 
@@ -439,7 +435,7 @@ TEST(config_parse_exec) {
                               "LValue", 0, "",
                               &c, u);
         assert_se(r == 0);
-        assert_se(c == NULL);
+        ASSERT_NULL(c);
 
         exec_command_free_list(c);
 }
@@ -541,7 +537,7 @@ TEST(install_printf, .sd_booted = true) {
                 memzero(i.path, strlen(i.path));                        \
                 if (result) {                                           \
                         printf("%s\n", t);                              \
-                        assert_se(streq(t, result));                    \
+                        ASSERT_STREQ(t, result);                    \
                 } else                                                  \
                         assert_se(!t);                                  \
                 strcpy(i.name, d1);                                     \
@@ -791,8 +787,8 @@ TEST(config_parse_pass_environ) {
                                       &passenv, NULL);
         assert_se(r >= 0);
         assert_se(strv_length(passenv) == 2);
-        assert_se(streq(passenv[0], "A"));
-        assert_se(streq(passenv[1], "B"));
+        ASSERT_STREQ(passenv[0], "A");
+        ASSERT_STREQ(passenv[1], "B");
 
         r = config_parse_pass_environ(NULL, "fake", 1, "section", 1,
                                       "PassEnvironment", 0, "",
@@ -805,7 +801,7 @@ TEST(config_parse_pass_environ) {
                                       &passenv, NULL);
         assert_se(r >= 0);
         assert_se(strv_length(passenv) == 1);
-        assert_se(streq(passenv[0], "normal_name"));
+        ASSERT_STREQ(passenv[0], "normal_name");
 }
 
 TEST(config_parse_unit_env_file) {
@@ -855,8 +851,8 @@ TEST(config_parse_unit_env_file) {
                                        &files, u);
         assert_se(r == 0);
         assert_se(strv_length(files) == 2);
-        assert_se(streq(files[0], "/absolute1"));
-        assert_se(streq(files[1], "/absolute2"));
+        ASSERT_STREQ(files[0], "/absolute1");
+        ASSERT_STREQ(files[1], "/absolute2");
 
         r = config_parse_unit_env_file(u->id, "fake", 1, "section", 1,
                                        "EnvironmentFile", 0, "",
@@ -869,7 +865,7 @@ TEST(config_parse_unit_env_file) {
                                        &files, u);
         assert_se(r == 0);
         assert_se(strv_length(files) == 1);
-        assert_se(streq(files[0], "/path/foobar.service.conf"));
+        ASSERT_STREQ(files[0], "/path/foobar.service.conf");
 }
 
 TEST(unit_dump_config_items) {
@@ -912,24 +908,22 @@ TEST(config_parse_memory_limit) {
                 { "MemoryMax",  "10",           &c.memory_max,  10 },
                 { "MemoryMax",  "infinity",     &c.memory_max,  CGROUP_LIMIT_MAX },
         };
-        size_t i;
         int r;
 
-        for (i = 0; i < ELEMENTSOF(limit_tests); i++) {
+        FOREACH_ELEMENT(test, limit_tests) {
                 c.memory_min = CGROUP_LIMIT_DUMMY;
                 c.memory_low = CGROUP_LIMIT_DUMMY;
                 c.memory_high = CGROUP_LIMIT_DUMMY;
                 c.memory_max = CGROUP_LIMIT_DUMMY;
                 r = config_parse_memory_limit(NULL, "fake", 1, "section", 1,
-                                              limit_tests[i].limit, 1,
-                                              limit_tests[i].value, &c, NULL);
-                log_info("%s=%s\t%"PRIu64"==%"PRIu64"\n",
-                         limit_tests[i].limit, limit_tests[i].value,
-                         *limit_tests[i].result, limit_tests[i].expected);
+                                              test->limit, 1,
+                                              test->value, &c, NULL);
+                log_info("%s=%s\t%"PRIu64"==%"PRIu64,
+                         test->limit, test->value,
+                         *test->result, test->expected);
                 assert_se(r >= 0);
-                assert_se(*limit_tests[i].result == limit_tests[i].expected);
+                assert_se(*test->result == test->expected);
         }
-
 }
 
 TEST(contains_instance_specifier_superset) {
@@ -1029,12 +1023,12 @@ TEST(config_parse_log_filter_patterns) {
         if (ERRNO_IS_NOT_SUPPORTED(dlopen_pcre2()))
                 return (void) log_tests_skipped("PCRE2 support is not available");
 
-        for (size_t i = 0; i < ELEMENTSOF(regex_tests); i++) {
+        FOREACH_ELEMENT(test, regex_tests) {
                 assert_se(config_parse_log_filter_patterns(NULL, "fake", 1, "section", 1, "LogFilterPatterns", 1,
-                                                           regex_tests[i].regex, &c, NULL) >= 0);
+                                                           test->regex, &c, NULL) >= 0);
 
-                assert_se(set_size(c.log_filter_allowed_patterns) == regex_tests[i].allowed_patterns_count);
-                assert_se(set_size(c.log_filter_denied_patterns) == regex_tests[i].denied_patterns_count);
+                assert_se(set_size(c.log_filter_allowed_patterns) == test->allowed_patterns_count);
+                assert_se(set_size(c.log_filter_denied_patterns) == test->denied_patterns_count);
 
                 /* Ensure `~` is properly removed */
                 const char *p;
@@ -1070,8 +1064,8 @@ TEST(config_parse_open_file) {
                                    &of, u);
         assert_se(r >= 0);
         assert_se(of);
-        assert_se(streq(of->path, "/proc/1/ns/mnt"));
-        assert_se(streq(of->fdname, "host-mount-namespace"));
+        ASSERT_STREQ(of->path, "/proc/1/ns/mnt");
+        ASSERT_STREQ(of->fdname, "host-mount-namespace");
         assert_se(of->flags == OPENFILE_READ_ONLY);
 
         of = open_file_free(of);
@@ -1080,8 +1074,8 @@ TEST(config_parse_open_file) {
                                    &of, u);
         assert_se(r >= 0);
         assert_se(of);
-        assert_se(streq(of->path, "/proc/1/ns/mnt"));
-        assert_se(streq(of->fdname, "mnt"));
+        ASSERT_STREQ(of->path, "/proc/1/ns/mnt");
+        ASSERT_STREQ(of->fdname, "mnt");
         assert_se(of->flags == OPENFILE_READ_ONLY);
 
         r = config_parse_open_file(NULL, "fake", 1, "section", 1,

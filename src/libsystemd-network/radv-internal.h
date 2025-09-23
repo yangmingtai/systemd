@@ -5,11 +5,10 @@
   Copyright © 2017 Intel Corporation. All rights reserved.
 ***/
 
-#include "sd-radv.h"
+#include <netinet/in.h>
 
-#include "list.h"
+#include "forward.h"
 #include "network-common.h"
-#include "sparse-endian.h"
 #include "time-util.h"
 
 /* RFC 4861 section 6.2.1.
@@ -39,6 +38,12 @@
 #define RADV_MIN_ROUTER_LIFETIME_USEC             RADV_MIN_MAX_TIMEOUT_USEC
 #define RADV_MAX_ROUTER_LIFETIME_USEC             (9000 * USEC_PER_SEC)
 #define RADV_DEFAULT_ROUTER_LIFETIME_USEC         (3 * RADV_DEFAULT_MAX_TIMEOUT_USEC)
+/* RFC 4861 section 4.2.
+ * Reachable Time and Retrans Timer
+ * 32-bit unsigned integer. The time, in milliseconds. */
+#define RADV_MAX_UINT32_MSEC_USEC                 (UINT32_MAX * USEC_PER_MSEC)
+#define RADV_MAX_REACHABLE_TIME_USEC              RADV_MAX_UINT32_MSEC_USEC
+#define RADV_MAX_RETRANSMIT_USEC                  RADV_MAX_UINT32_MSEC_USEC
 /* draft-ietf-6man-slaac-renum-02 section 4.1.1.
  * AdvPreferredLifetime: max(AdvDefaultLifetime, 3 * MaxRtrAdvInterval)
  * AdvValidLifetime: 2 * AdvPreferredLifetime */
@@ -55,23 +60,21 @@
 #define RADV_MAX_FINAL_RTR_ADVERTISEMENTS         3
 #define RADV_MIN_DELAY_BETWEEN_RAS                3
 #define RADV_MAX_RA_DELAY_TIME_USEC               (500 * USEC_PER_MSEC)
+/* From RFC 8781 section 4.1
+ * By default, the value of the Scaled Lifetime field SHOULD be set to the lesser of 3 x MaxRtrAdvInterval */
+#define RADV_PREF64_DEFAULT_LIFETIME_USEC         (3 * RADV_DEFAULT_MAX_TIMEOUT_USEC)
 
-#define RADV_OPT_ROUTE_INFORMATION                24
-#define RADV_OPT_RDNSS                            25
-#define RADV_OPT_DNSSL                            31
+#define RADV_RDNSS_MAX_LIFETIME_USEC              (UINT32_MAX * USEC_PER_SEC)
+#define RADV_DNSSL_MAX_LIFETIME_USEC              (UINT32_MAX * USEC_PER_SEC)
+/* rfc6275 7.4 Neighbor Discovery Home Agent Lifetime.
+ * The default value is the same as the Router Lifetime.
+ * The maximum value corresponds to 18.2 hours. 0 MUST NOT be used. */
+#define RADV_HOME_AGENT_MAX_LIFETIME_USEC         (UINT16_MAX * USEC_PER_SEC)
 
-enum RAdvState {
+typedef enum RAdvState {
         RADV_STATE_IDLE                      = 0,
         RADV_STATE_ADVERTISING               = 1,
-};
-typedef enum RAdvState RAdvState;
-
-struct sd_radv_opt_dns {
-        uint8_t type;
-        uint8_t length;
-        uint16_t reserved;
-        be32_t lifetime;
-} _packed_;
+} RAdvState;
 
 struct sd_radv {
         unsigned n_ref;
@@ -79,96 +82,24 @@ struct sd_radv {
 
         int ifindex;
         char *ifname;
+        struct in6_addr ipv6ll;
 
         sd_event *event;
         int event_priority;
 
-        struct ether_addr mac_addr;
         uint8_t hop_limit;
         uint8_t flags;
-        uint32_t mtu;
+        uint8_t preference;
+        usec_t reachable_usec;
+        usec_t retransmit_usec;
         usec_t lifetime_usec; /* timespan */
+
+        Set *options;
 
         int fd;
         unsigned ra_sent;
         sd_event_source *recv_event_source;
         sd_event_source *timeout_event_source;
-
-        unsigned n_prefixes;
-        LIST_HEAD(sd_radv_prefix, prefixes);
-
-        unsigned n_route_prefixes;
-        LIST_HEAD(sd_radv_route_prefix, route_prefixes);
-
-        size_t n_rdnss;
-        struct sd_radv_opt_dns *rdnss;
-        struct sd_radv_opt_dns *dnssl;
-};
-
-#define radv_prefix_opt__contents {             \
-        uint8_t type;                           \
-        uint8_t length;                         \
-        uint8_t prefixlen;                      \
-        uint8_t flags;                          \
-        be32_t lifetime_valid;                  \
-        be32_t lifetime_preferred;              \
-        uint32_t reserved;                      \
-        struct in6_addr in6_addr;               \
-}
-
-struct radv_prefix_opt radv_prefix_opt__contents;
-
-/* We need the opt substructure to be packed, because we use it in send(). But
- * if we use _packed_, this means that the structure cannot be used directly in
- * normal code in general, because the fields might not be properly aligned.
- * But in this particular case, the structure is defined in a way that gives
- * proper alignment, even without the explicit _packed_ attribute. To appease
- * the compiler we use the "unpacked" structure, but we also verify that
- * structure contains no holes, so offsets are the same when _packed_ is used.
- */
-struct radv_prefix_opt__packed radv_prefix_opt__contents _packed_;
-assert_cc(sizeof(struct radv_prefix_opt) == sizeof(struct radv_prefix_opt__packed));
-
-struct sd_radv_prefix {
-        unsigned n_ref;
-
-        struct radv_prefix_opt opt;
-
-        LIST_FIELDS(struct sd_radv_prefix, prefix);
-
-        /* These are timespans, NOT points in time. */
-        usec_t lifetime_valid_usec;
-        usec_t lifetime_preferred_usec;
-        /* These are points in time specified with clock_boottime_or_monotonic(), NOT timespans. */
-        usec_t valid_until;
-        usec_t preferred_until;
-};
-
-#define radv_route_prefix_opt__contents {       \
-        uint8_t type;                           \
-        uint8_t length;                         \
-        uint8_t prefixlen;                      \
-        uint8_t flags_reserved;                 \
-        be32_t  lifetime;                       \
-        struct in6_addr in6_addr;               \
-}
-
-struct radv_route_prefix_opt radv_route_prefix_opt__contents;
-
-struct radv_route_prefix_opt__packed radv_route_prefix_opt__contents _packed_;
-assert_cc(sizeof(struct radv_route_prefix_opt) == sizeof(struct radv_route_prefix_opt__packed));
-
-struct sd_radv_route_prefix {
-        unsigned n_ref;
-
-        struct radv_route_prefix_opt opt;
-
-        LIST_FIELDS(struct sd_radv_route_prefix, prefix);
-
-        /* This is a timespan, NOT a point in time. */
-        usec_t lifetime_usec;
-        /* This is a point in time specified with clock_boottime_or_monotonic(), NOT a timespan. */
-        usec_t valid_until;
 };
 
 #define log_radv_errno(radv, error, fmt, ...)           \

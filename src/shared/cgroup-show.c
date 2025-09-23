@@ -1,12 +1,12 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <dirent.h>
-#include <errno.h>
-#include <stddef.h>
 #include <stdio.h>
-#include <stdlib.h>
+
+#include "sd-bus.h"
 
 #include "alloc-util.h"
+#include "ansi-color.h"
 #include "bus-error.h"
 #include "bus-util.h"
 #include "cgroup-show.h"
@@ -15,30 +15,30 @@
 #include "escape.h"
 #include "fd-util.h"
 #include "format-util.h"
+#include "glyph-util.h"
 #include "hostname-util.h"
-#include "locale-util.h"
-#include "macro.h"
+#include "log.h"
 #include "nulstr-util.h"
 #include "output-mode.h"
-#include "parse-util.h"
 #include "path-util.h"
 #include "process-util.h"
+#include "runtime-scope.h"
 #include "sort-util.h"
 #include "string-util.h"
 #include "terminal-util.h"
-#include "unit-name.h"
+#include "unit-def.h"
 #include "xattr-util.h"
 
 static void show_pid_array(
                 pid_t pids[],
-                unsigned n_pids,
+                size_t n_pids,
                 const char *prefix,
                 size_t n_columns,
                 bool extra,
                 bool more,
                 OutputFlags flags) {
 
-        unsigned i, j, pid_width;
+        size_t i, j, pid_width;
 
         if (n_pids == 0)
                 return;
@@ -65,14 +65,14 @@ static void show_pid_array(
         for (i = 0; i < n_pids; i++) {
                 _cleanup_free_ char *t = NULL;
 
-                (void) get_process_cmdline(pids[i], n_columns,
-                                           PROCESS_CMDLINE_COMM_FALLBACK | PROCESS_CMDLINE_USE_LOCALE,
-                                           &t);
+                (void) pid_get_cmdline(pids[i], n_columns,
+                                       PROCESS_CMDLINE_COMM_FALLBACK | PROCESS_CMDLINE_USE_LOCALE,
+                                       &t);
 
                 if (extra)
-                        printf("%s%s ", prefix, special_glyph(SPECIAL_GLYPH_TRIANGULAR_BULLET));
+                        printf("%s%s ", prefix, glyph(GLYPH_TRIANGULAR_BULLET));
                 else
-                        printf("%s%s", prefix, special_glyph(((more || i < n_pids-1) ? SPECIAL_GLYPH_TREE_BRANCH : SPECIAL_GLYPH_TREE_RIGHT)));
+                        printf("%s%s", prefix, glyph(((more || i < n_pids-1) ? GLYPH_TREE_BRANCH : GLYPH_TREE_RIGHT)));
 
                 printf("%s%*"PID_PRI" %s%s\n", ansi_grey(), (int) pid_width, pids[i], strna(t), ansi_normal());
         }
@@ -107,14 +107,17 @@ static int show_cgroup_one_by_path(
                 /* libvirt / qemu uses threaded mode and cgroup.procs cannot be read at the lower levels.
                  * From https://docs.kernel.org/admin-guide/cgroup-v2.html#threads,
                  * “cgroup.procs” in a threaded domain cgroup contains the PIDs of all processes in
-                 * the subtree and is not readable in the subtree proper. */
-                r = cg_read_pid(f, &pid);
-                if (IN_SET(r, 0, -EOPNOTSUPP))
+                 * the subtree and is not readable in the subtree proper.
+                 *
+                 * ENODEV is generated when we enumerate processes from a cgroup and the cgroup is removed
+                 * concurrently. */
+                r = cg_read_pid(f, &pid, /* flags = */ 0);
+                if (IN_SET(r, 0, -EOPNOTSUPP, -ENODEV))
                         break;
                 if (r < 0)
                         return r;
 
-                if (!(flags & OUTPUT_KERNEL_THREADS) && is_kernel_thread(pid) > 0)
+                if (!(flags & OUTPUT_KERNEL_THREADS) && pid_is_kernel_thread(pid) > 0)
                         continue;
 
                 if (!GREEDY_REALLOC(pids, n + 1))
@@ -128,35 +131,10 @@ static int show_cgroup_one_by_path(
         return 0;
 }
 
-static int is_delegated(int cgfd, const char *path) {
-        _cleanup_free_ char *b = NULL;
-        int r;
-
-        assert(cgfd >= 0 || path);
-
-        r = getxattr_malloc(cgfd < 0 ? path : FORMAT_PROC_FD_PATH(cgfd), "trusted.delegate", &b);
-        if (r < 0 && ERRNO_IS_XATTR_ABSENT(r)) {
-                /* If the trusted xattr isn't set (preferred), then check the untrusted one. Under the
-                 * assumption that whoever is trusted enough to own the cgroup, is also trusted enough to
-                 * decide if it is delegated or not this should be safe. */
-                r = getxattr_malloc(cgfd < 0 ? path : FORMAT_PROC_FD_PATH(cgfd), "user.delegate", &b);
-                if (r < 0 && ERRNO_IS_XATTR_ABSENT(r))
-                        return false;
-        }
-        if (r < 0)
-                return log_debug_errno(r, "Failed to read delegate xattr, ignoring: %m");
-
-        r = parse_boolean(b);
-        if (r < 0)
-                return log_debug_errno(r, "Failed to parse delegate xattr boolean value, ignoring: %m");
-
-        return r;
-}
-
 static int show_cgroup_name(
                 const char *path,
                 const char *prefix,
-                SpecialGlyph glyph,
+                Glyph tree,
                 OutputFlags flags) {
 
         uint64_t cgroupid = UINT64_MAX;
@@ -165,27 +143,19 @@ static int show_cgroup_name(
         bool delegate;
         int r;
 
-        if (FLAGS_SET(flags, OUTPUT_CGROUP_XATTRS) || FLAGS_SET(flags, OUTPUT_CGROUP_ID)) {
-                fd = open(path, O_PATH|O_CLOEXEC|O_NOFOLLOW|O_DIRECTORY, 0);
-                if (fd < 0)
-                        log_debug_errno(errno, "Failed to open cgroup '%s', ignoring: %m", path);
-        }
+        fd = open(path, O_PATH|O_CLOEXEC|O_NOFOLLOW|O_DIRECTORY, 0);
+        if (fd < 0)
+                return log_debug_errno(errno, "Failed to open cgroup '%s', ignoring: %m", path);
 
-        delegate = is_delegated(fd, path) > 0;
+        r = cg_is_delegated_fd(fd);
+        if (r < 0)
+                log_debug_errno(r, "Failed to check if cgroup is delegated, ignoring: %m");
+        delegate = r > 0;
 
         if (FLAGS_SET(flags, OUTPUT_CGROUP_ID)) {
-                cg_file_handle fh = CG_FILE_HANDLE_INIT;
-                int mnt_id = -1;
-
-                if (name_to_handle_at(
-                                    fd < 0 ? AT_FDCWD : fd,
-                                    fd < 0 ? path : "",
-                                    &fh.file_handle,
-                                    &mnt_id,
-                                    fd < 0 ? 0 : AT_EMPTY_PATH) < 0)
-                        log_debug_errno(errno, "Failed to determine cgroup ID of %s, ignoring: %m", path);
-                else
-                        cgroupid = CG_FILE_HANDLE_CGROUPID(fh);
+                r = cg_fd_get_cgroupid(fd, &cgroupid);
+                if (r < 0)
+                        log_debug_errno(r, "Failed to determine cgroup ID of %s, ignoring: %m", path);
         }
 
         r = path_extract_filename(path, &b);
@@ -193,7 +163,7 @@ static int show_cgroup_name(
                 return log_error_errno(r, "Failed to extract filename from cgroup path: %m");
 
         printf("%s%s%s%s%s",
-               prefix, special_glyph(glyph),
+               prefix, glyph(tree),
                delegate ? ansi_underline() : "",
                cg_unescape(b),
                delegate ? ansi_normal() : "");
@@ -201,7 +171,7 @@ static int show_cgroup_name(
         if (delegate)
                 printf(" %s%s%s",
                        ansi_highlight(),
-                       special_glyph(SPECIAL_GLYPH_ELLIPSIS),
+                       glyph(GLYPH_ELLIPSIS),
                        ansi_normal());
 
         if (cgroupid != UINT64_MAX)
@@ -209,7 +179,7 @@ static int show_cgroup_name(
 
         printf("\n");
 
-        if (FLAGS_SET(flags, OUTPUT_CGROUP_XATTRS) && fd >= 0) {
+        if (FLAGS_SET(flags, OUTPUT_CGROUP_XATTRS)) {
                 _cleanup_free_ char *nl = NULL;
 
                 r = flistxattr_malloc(fd, &nl);
@@ -218,13 +188,13 @@ static int show_cgroup_name(
 
                 NULSTR_FOREACH(xa, nl) {
                         _cleanup_free_ char *x = NULL, *y = NULL, *buf = NULL;
-                        int n;
 
                         if (!STARTSWITH_SET(xa, "user.", "trusted."))
                                 continue;
 
-                        n = fgetxattr_malloc(fd, xa, &buf);
-                        if (n < 0) {
+                        size_t buf_size;
+                        r = fgetxattr_malloc(fd, xa, &buf, &buf_size);
+                        if (r < 0) {
                                 log_debug_errno(r, "Failed to read xattr '%s' off '%s', ignoring: %m", xa, path);
                                 continue;
                         }
@@ -233,14 +203,14 @@ static int show_cgroup_name(
                         if (!x)
                                 return -ENOMEM;
 
-                        y = cescape_length(buf, n);
+                        y = cescape_length(buf, buf_size);
                         if (!y)
                                 return -ENOMEM;
 
                         printf("%s%s%s %s%s%s: %s\n",
                                prefix,
-                               glyph == SPECIAL_GLYPH_TREE_BRANCH ? special_glyph(SPECIAL_GLYPH_TREE_VERTICAL) : "  ",
-                               special_glyph(SPECIAL_GLYPH_ARROW_RIGHT),
+                               tree == GLYPH_TREE_BRANCH ? glyph(GLYPH_TREE_VERTICAL) : "  ",
+                               glyph(GLYPH_ARROW_RIGHT),
                                ansi_blue(), x, ansi_normal(),
                                y);
                 }
@@ -284,21 +254,21 @@ int show_cgroup_by_path(
                 if (!k)
                         return -ENOMEM;
 
-                if (!(flags & OUTPUT_SHOW_ALL) && cg_is_empty_recursive(NULL, k) > 0)
+                if (!(flags & OUTPUT_SHOW_ALL) && cg_is_empty(NULL, k) > 0)
                         continue;
 
                 if (!shown_pids) {
-                        show_cgroup_one_by_path(path, prefix, n_columns, true, flags);
+                        (void) show_cgroup_one_by_path(path, prefix, n_columns, true, flags);
                         shown_pids = true;
                 }
 
                 if (last) {
-                        r = show_cgroup_name(last, prefix, SPECIAL_GLYPH_TREE_BRANCH, flags);
+                        r = show_cgroup_name(last, prefix, GLYPH_TREE_BRANCH, flags);
                         if (r < 0)
                                 return r;
 
                         if (!p1) {
-                                p1 = strjoin(prefix, special_glyph(SPECIAL_GLYPH_TREE_VERTICAL));
+                                p1 = strjoin(prefix, glyph(GLYPH_TREE_VERTICAL));
                                 if (!p1)
                                         return -ENOMEM;
                         }
@@ -314,10 +284,10 @@ int show_cgroup_by_path(
                 return r;
 
         if (!shown_pids)
-                show_cgroup_one_by_path(path, prefix, n_columns, !!last, flags);
+                (void) show_cgroup_one_by_path(path, prefix, n_columns, !!last, flags);
 
         if (last) {
-                r = show_cgroup_name(last, prefix, SPECIAL_GLYPH_TREE_RIGHT, flags);
+                r = show_cgroup_name(last, prefix, GLYPH_TREE_RIGHT, flags);
                 if (r < 0)
                         return r;
 
@@ -356,11 +326,11 @@ static int show_extra_pids(
                 const char *prefix,
                 size_t n_columns,
                 const pid_t pids[],
-                unsigned n_pids,
+                size_t n_pids,
                 OutputFlags flags) {
 
         _cleanup_free_ pid_t *copy = NULL;
-        unsigned i, j;
+        size_t i, j;
         int r;
 
         assert(path);
@@ -401,7 +371,7 @@ int show_cgroup_and_extra(
                 const char *prefix,
                 size_t n_columns,
                 const pid_t extra_pids[],
-                unsigned n_extra_pids,
+                size_t n_extra_pids,
                 OutputFlags flags) {
 
         int r;
@@ -466,7 +436,7 @@ int show_cgroup_get_path_and_warn(
 
                 r = bus_connect_transport_systemd(BUS_TRANSPORT_LOCAL, NULL, RUNTIME_SCOPE_SYSTEM, &bus);
                 if (r < 0)
-                        return bus_log_connect_error(r, BUS_TRANSPORT_LOCAL);
+                        return bus_log_connect_error(r, BUS_TRANSPORT_LOCAL, RUNTIME_SCOPE_SYSTEM);
 
                 r = show_cgroup_get_unit_path_and_warn(bus, unit, &root);
                 if (r < 0)

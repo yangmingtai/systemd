@@ -1,17 +1,16 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <linux/btrfs.h>
+#include <linux/fs.h>
 #include <linux/magic.h>
+#include <linux/xfs.h>
 #include <sys/ioctl.h>
 #include <sys/vfs.h>
 
-#include "blockdev-util.h"
-#include "fs-util.h"
-#include "missing_fs.h"
-#include "missing_magic.h"
-#include "missing_xfs.h"
 #include "resize-fs.h"
 #include "stat-util.h"
+#include "stdio-util.h"
+#include "string-util-fundamental.h"
 
 int resize_fs(int fd, uint64_t sz, uint64_t *ret_size) {
         struct statfs sfs;
@@ -61,7 +60,7 @@ int resize_fs(int fd, uint64_t sz, uint64_t *ret_size) {
                 if (ret_size)
                         *ret_size = sz;
 
-        } else if (is_fs_type(&sfs, XFS_SB_MAGIC)) {
+        } else if (is_fs_type(&sfs, XFS_SUPER_MAGIC)) {
                 xfs_fsop_geom_t geo;
                 xfs_growfs_data_t d;
 
@@ -95,7 +94,7 @@ uint64_t minimal_size_by_fs_magic(statfs_f_type_t magic) {
         case (statfs_f_type_t) EXT4_SUPER_MAGIC:
                 return EXT4_MINIMAL_SIZE;
 
-        case (statfs_f_type_t) XFS_SB_MAGIC:
+        case (statfs_f_type_t) XFS_SUPER_MAGIC:
                 return XFS_MINIMAL_SIZE;
 
         case (statfs_f_type_t) BTRFS_SUPER_MAGIC:

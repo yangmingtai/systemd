@@ -1,12 +1,13 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include "macro.h"
+#include "forward.h"
 
 /* Bit index (0-based) to mask of specified type. Assertion failure if index is out of range. */
 #define _INDEX_TO_MASK(type, i, uniq)                                   \
         ({                                                              \
                 int UNIQ_T(_i, uniq) = (i);                             \
+                assert(UNIQ_T(_i, uniq) >= 0);                          \
                 assert(UNIQ_T(_i, uniq) < (int)sizeof(type) * 8);       \
                 ((type)1) << UNIQ_T(_i, uniq);                          \
         })
@@ -27,7 +28,7 @@
         ({                                                              \
                 typeof(type) UNIQ_T(_mask, uniq) = (type)0;             \
                 int UNIQ_T(_i, uniq);                                   \
-                VA_ARGS_FOREACH(UNIQ_T(_i, uniq), ##__VA_ARGS__)        \
+                FOREACH_ARGUMENT(UNIQ_T(_i, uniq), ##__VA_ARGS__)       \
                         UNIQ_T(_mask, uniq) |= INDEX_TO_MASK(type, UNIQ_T(_i, uniq)); \
                 UNIQ_T(_mask, uniq);                                    \
         })

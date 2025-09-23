@@ -2,8 +2,10 @@
 
 #include "alloc-util.h"
 #include "bus-get-properties.h"
+#include "calendarspec.h"
 #include "dbus-timer.h"
 #include "dbus-util.h"
+#include "string-util.h"
 #include "strv.h"
 #include "timer.h"
 #include "unit.h"
@@ -30,26 +32,16 @@ static int property_get_monotonic_timers(
                 return r;
 
         LIST_FOREACH(value, v, t->values) {
-                _cleanup_free_ char *buf = NULL;
-                const char *s;
-                size_t l;
+                _cleanup_free_ char *usec = NULL;
 
                 if (v->base == TIMER_CALENDAR)
                         continue;
 
-                s = timer_base_to_string(v->base);
-                assert(endswith(s, "Sec"));
-
-                /* s/Sec/USec/ */
-                l = strlen(s);
-                buf = new(char, l+2);
-                if (!buf)
+                usec = timer_base_to_usec_string(v->base);
+                if (!usec)
                         return -ENOMEM;
 
-                memcpy(buf, s, l-3);
-                memcpy(buf+l-3, "USec", 5);
-
-                r = sd_bus_message_append(reply, "(stt)", buf, v->value, v->next_elapse);
+                r = sd_bus_message_append(reply, "(stt)", usec, v->value, v->next_elapse);
                 if (r < 0)
                         return r;
         }
@@ -108,9 +100,7 @@ static int property_get_next_elapse_monotonic(
         assert(bus);
         assert(reply);
 
-        return sd_bus_message_append(reply, "t",
-                                     (uint64_t) usec_shift_clock(t->next_elapse_monotonic_or_boottime,
-                                                                 TIMER_MONOTONIC_CLOCK(t), CLOCK_MONOTONIC));
+        return sd_bus_message_append(reply, "t", timer_next_elapse_monotonic(t));
 }
 
 const sd_bus_vtable bus_timer_vtable[] = {
@@ -125,11 +115,13 @@ const sd_bus_vtable bus_timer_vtable[] = {
         BUS_PROPERTY_DUAL_TIMESTAMP("LastTriggerUSec", offsetof(Timer, last_trigger), SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
         SD_BUS_PROPERTY("Result", "s", property_get_result, offsetof(Timer, result), SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
         SD_BUS_PROPERTY("AccuracyUSec", "t", bus_property_get_usec, offsetof(Timer, accuracy_usec), SD_BUS_VTABLE_PROPERTY_CONST),
-        SD_BUS_PROPERTY("RandomizedDelayUSec", "t", bus_property_get_usec, offsetof(Timer, random_usec), SD_BUS_VTABLE_PROPERTY_CONST),
+        SD_BUS_PROPERTY("RandomizedDelayUSec", "t", bus_property_get_usec, offsetof(Timer, random_delay_usec), SD_BUS_VTABLE_PROPERTY_CONST),
+        SD_BUS_PROPERTY("RandomizedOffsetUSec", "t", bus_property_get_usec, offsetof(Timer, random_offset_usec), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("FixedRandomDelay", "b", bus_property_get_bool, offsetof(Timer, fixed_random_delay), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("Persistent", "b", bus_property_get_bool, offsetof(Timer, persistent), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("WakeSystem", "b", bus_property_get_bool, offsetof(Timer, wake_system), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("RemainAfterElapse", "b", bus_property_get_bool, offsetof(Timer, remain_after_elapse), SD_BUS_VTABLE_PROPERTY_CONST),
+        SD_BUS_PROPERTY("DeferReactivation", "b", bus_property_get_bool, offsetof(Timer, defer_reactivation), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_VTABLE_END
 };
 
@@ -225,7 +217,10 @@ static int bus_timer_set_transient_property(
         }
 
         if (streq(name, "RandomizedDelayUSec"))
-                return bus_set_transient_usec(u, name, &t->random_usec, message, flags, error);
+                return bus_set_transient_usec(u, name, &t->random_delay_usec, message, flags, error);
+
+        if (streq(name, "RandomizedOffsetUSec"))
+                return bus_set_transient_usec(u, name, &t->random_offset_usec, message, flags, error);
 
         if (streq(name, "FixedRandomDelay"))
                 return bus_set_transient_bool(u, name, &t->fixed_random_delay, message, flags, error);
@@ -244,6 +239,9 @@ static int bus_timer_set_transient_property(
 
         if (streq(name, "OnClockChange"))
                 return bus_set_transient_bool(u, name, &t->on_clock_change, message, flags, error);
+
+        if (streq(name, "DeferReactivation"))
+                return bus_set_transient_bool(u, name, &t->defer_reactivation, message, flags, error);
 
         if (streq(name, "TimersMonotonic")) {
                 const char *base_name;

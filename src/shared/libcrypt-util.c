@@ -1,30 +1,12 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#if HAVE_CRYPT_H
-/* libxcrypt is a replacement for glibc's libcrypt, and libcrypt might be
- * removed from glibc at some point. As part of the removal, defines for
- * crypt(3) are dropped from unistd.h, and we must include crypt.h instead.
- *
- * Newer versions of glibc (v2.0+) already ship crypt.h with a definition
- * of crypt(3) as well, so we simply include it if it is present.  MariaDB,
- * MySQL, PostgreSQL, Perl and some other wide-spread packages do it the
- * same way since ages without any problems.
- */
-#  include <crypt.h>
-#else
-#  include <unistd.h>
-#endif
-
-#include <errno.h>
+#include <crypt.h>
 #include <stdlib.h>
 
 #include "alloc-util.h"
 #include "errno-util.h"
 #include "libcrypt-util.h"
 #include "log.h"
-#include "macro.h"
-#include "memory-util.h"
-#include "missing_stdlib.h"
 #include "random-util.h"
 #include "string-util.h"
 #include "strv.h"
@@ -114,7 +96,7 @@ static char* systemd_crypt_ra(const char *phrase, const char *setting, void **da
         if (!*data) {
                 *data = new0(struct crypt_data, 1);
                 if (!*data) {
-                        errno = -ENOMEM;
+                        errno = ENOMEM;
                         return NULL;
                 }
 
@@ -140,7 +122,7 @@ static char* systemd_crypt_ra(const char *phrase, const char *setting, void **da
 int hash_password_full(const char *password, void **cd_data, int *cd_size, char **ret) {
         _cleanup_free_ char *salt = NULL;
         _cleanup_(erase_and_freep) void *_cd_data = NULL;
-        char *p;
+        const char *p;
         int r, _cd_size = 0;
 
         assert(!!cd_data == !!cd_size);
@@ -155,12 +137,7 @@ int hash_password_full(const char *password, void **cd_data, int *cd_size, char 
                 return log_debug_errno(errno_or_else(SYNTHETIC_ERRNO(EINVAL)),
                                        CRYPT_RA_NAME "() failed: %m");
 
-        p = strdup(p);
-        if (!p)
-                return -ENOMEM;
-
-        *ret = p;
-        return 0;
+        return strdup_to(ret, p);
 }
 
 bool looks_like_hashed_password(const char *s) {

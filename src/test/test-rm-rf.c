@@ -1,8 +1,8 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
+#include <sys/stat.h>
 #include <unistd.h>
 
-#include "alloc-util.h"
 #include "process-util.h"
 #include "rm-rf.h"
 #include "string-util.h"
@@ -89,11 +89,14 @@ static void test_rm_rf_chmod_inner(void) {
 TEST(rm_rf_chmod) {
         int r;
 
+        if (getuid() == 0 && userns_has_single_user())
+                return (void) log_tests_skipped("running as root or in userns with single user");
+
         if (getuid() == 0) {
                 /* This test only works unpriv (as only then the access mask for the owning user matters),
                  * hence drop privs here */
 
-                r = safe_fork("(setresuid)", FORK_DEATHSIG|FORK_WAIT, NULL);
+                r = safe_fork("(setresuid)", FORK_DEATHSIG_SIGTERM|FORK_WAIT, NULL);
                 assert_se(r >= 0);
 
                 if (r == 0) {

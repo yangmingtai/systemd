@@ -1,9 +1,18 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
+#if HAVE_P11KIT
+
+#include "alloc-util.h"
 #include "hexdecoct.h"
 #include "homework-pkcs11.h"
+#include "log.h"
 #include "pkcs11-util.h"
 #include "strv.h"
+#include "user-record.h"
+
+void pkcs11_callback_data_release(struct pkcs11_callback_data *data) {
+        erase_and_free(data->decrypted_password);
+}
 
 int pkcs11_callback(
                 CK_FUNCTION_LIST *m,
@@ -49,7 +58,7 @@ int pkcs11_callback(
 
                 rv = m->C_Login(session, CKU_USER, NULL, 0);
                 if (rv != CKR_OK)
-                        return log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to log into security token '%s': %s", token_label, p11_kit_strerror(rv));
+                        return log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to log into security token '%s': %s", token_label, sym_p11_kit_strerror(rv));
 
                 log_info("Successfully logged into security token '%s' via protected authentication path.", token_label);
                 goto decrypt;
@@ -72,12 +81,12 @@ int pkcs11_callback(
                 if (rv == CKR_PIN_LOCKED)
                         return log_error_errno(SYNTHETIC_ERRNO(EOWNERDEAD), "PIN of security token is blocked. Please unblock it first.");
                 if (!IN_SET(rv, CKR_PIN_INCORRECT, CKR_PIN_LEN_RANGE))
-                        return log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to log into security token '%s': %s", token_label, p11_kit_strerror(rv));
+                        return log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to log into security token '%s': %s", token_label, sym_p11_kit_strerror(rv));
         }
 
         rv = m->C_GetTokenInfo(slot_id, &updated_token_info);
         if (rv != CKR_OK)
-                return log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to acquire updated security token information for slot %lu: %s", slot_id, p11_kit_strerror(rv));
+                return log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to acquire updated security token information for slot %lu: %s", slot_id, sym_p11_kit_strerror(rv));
 
         if (FLAGS_SET(updated_token_info.flags, CKF_USER_PIN_FINAL_TRY))
                 return log_error_errno(SYNTHETIC_ERRNO(EUCLEAN), "PIN of security token incorrect, only a single try left.");
@@ -100,3 +109,5 @@ decrypt:
 
         return 1;
 }
+
+#endif

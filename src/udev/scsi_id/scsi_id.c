@@ -5,15 +5,9 @@
  */
 
 #include <ctype.h>
-#include <errno.h>
-#include <fcntl.h>
 #include <getopt.h>
-#include <signal.h>
-#include <stdarg.h>
-#include <stdbool.h>
 #include <stdio.h>
-#include <sys/stat.h>
-#include <unistd.h>
+#include <stdlib.h>
 
 #include "alloc-util.h"
 #include "build.h"
@@ -21,7 +15,6 @@
 #include "extract-word.h"
 #include "fd-util.h"
 #include "fileio.h"
-#include "parse-util.h"
 #include "scsi_id.h"
 #include "string-util.h"
 #include "strv.h"
@@ -84,9 +77,15 @@ static void set_type(unsigned type_num, char *to, size_t len) {
         case 0xf:
                 type = "optical";
                 break;
+        case 0x14:
+                /*
+                 * Use "zbc" here to be brief and consistent with "lsscsi" command.
+                 * Other tools, e.g., "sg3_utils" would say "host managed zoned block".
+                 */
+                type = "zbc";
+                break;
         default:
                 type = "generic";
-                break;
         }
         strscpy(to, len, type);
 }
@@ -144,7 +143,7 @@ static int get_file_options(const char *vendor, const char *model,
                 if (*buf == '#')
                         continue;
 
-                r = extract_many_words(&buf, "=\",\n", 0, &key, &value, NULL);
+                r = extract_many_words(&buf, "=\",\n", 0, &key, &value);
                 if (r < 2)
                         return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Error parsing config file line %d '%s'", lineno, buffer);
 
@@ -152,7 +151,7 @@ static int get_file_options(const char *vendor, const char *model,
                         vendor_in = TAKE_PTR(value);
 
                         key = mfree(key);
-                        r = extract_many_words(&buf, "=\",\n", 0, &key, &value, NULL);
+                        r = extract_many_words(&buf, "=\",\n", 0, &key, &value);
                         if (r < 2)
                                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Error parsing config file line %d '%s'", lineno, buffer);
 
@@ -160,7 +159,7 @@ static int get_file_options(const char *vendor, const char *model,
                                 model_in = TAKE_PTR(value);
 
                                 key = mfree(key);
-                                r = extract_many_words(&buf, "=\",\n", 0, &key, &value, NULL);
+                                r = extract_many_words(&buf, "=\",\n", 0, &key, &value);
                                 if (r < 2)
                                         return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Error parsing config file line %d '%s'", lineno, buffer);
                         }
@@ -361,7 +360,6 @@ static int per_dev_options(struct scsi_id_device *dev_scsi, int *good_bad, int *
                 default:
                         log_error("Unknown or bad option '%c' (0x%x)", option, (unsigned) option);
                         retval = -1;
-                        break;
                 }
         }
 
@@ -473,10 +471,8 @@ int main(int argc, char **argv) {
         char maj_min_dev[MAX_PATH_LEN];
         int newargc;
 
-        log_set_target(LOG_TARGET_AUTO);
-        udev_parse_config();
-        log_parse_environment();
-        log_open();
+        (void) udev_parse_config();
+        log_setup();
 
         /*
          * Get config file options.

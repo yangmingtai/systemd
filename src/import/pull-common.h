@@ -1,28 +1,13 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include <stdbool.h>
-
+#include "forward.h"
+#include "import-common.h"
 #include "import-util.h"
 #include "pull-job.h"
 
-typedef enum PullFlags {
-        PULL_FORCE              = 1 << 0, /* replace existing image */
-        PULL_READ_ONLY          = 1 << 1, /* make generated image read-only */
-        PULL_SETTINGS           = 1 << 2, /* download .nspawn settings file */
-        PULL_ROOTHASH           = 1 << 3, /* only for raw: download .roothash file for verity */
-        PULL_ROOTHASH_SIGNATURE = 1 << 4, /* only for raw: download .roothash.p7s file for verity */
-        PULL_VERITY             = 1 << 5, /* only for raw: download .verity file for verity */
-        PULL_BTRFS_SUBVOL       = 1 << 6, /* tar: preferably create images as btrfs subvols */
-        PULL_BTRFS_QUOTA        = 1 << 7, /* tar: set up btrfs quota for new subvolume as child of parent subvolume */
-        PULL_CONVERT_QCOW2      = 1 << 8, /* raw: if we detect a qcow2 image, unpack it */
-        PULL_DIRECT             = 1 << 9, /* download without rename games */
-        PULL_SYNC               = 1 << 10, /* fsync() right before we are done */
-
-        /* The supported flags for the tar and the raw pulling */
-        PULL_FLAGS_MASK_TAR     = PULL_FORCE|PULL_READ_ONLY|PULL_SETTINGS|PULL_BTRFS_SUBVOL|PULL_BTRFS_QUOTA|PULL_DIRECT|PULL_SYNC,
-        PULL_FLAGS_MASK_RAW     = PULL_FORCE|PULL_READ_ONLY|PULL_SETTINGS|PULL_ROOTHASH|PULL_ROOTHASH_SIGNATURE|PULL_VERITY|PULL_CONVERT_QCOW2|PULL_DIRECT|PULL_SYNC,
-} PullFlags;
+typedef struct CurlGlue CurlGlue;
+typedef struct PullJob PullJob;
 
 int pull_find_old_etags(const char *url, const char *root, int dt, const char *prefix, const char *suffix, char ***etags);
 
@@ -34,7 +19,7 @@ int pull_make_verification_jobs(PullJob **ret_checksum_job, PullJob **ret_signat
 int pull_verify(ImportVerify verify, const char *checksum, PullJob *main_job, PullJob *checksum_job, PullJob *signature_job, PullJob *settings_job, PullJob *roothash_job, PullJob *roothash_signature_job, PullJob *verity_job);
 
 typedef enum VerificationStyle {
-        VERIFICATION_PER_FILE,      /* SuSE-style ".sha256" files with inline gpg signature */
+        VERIFICATION_PER_FILE,      /* SUSE-style ".sha256" files with detached gpg signature */
         VERIFICATION_PER_DIRECTORY, /* Ubuntu-style SHA256SUM files with detached SHA256SUM.gpg signatures */
         _VERIFICATION_STYLE_MAX,
         _VERIFICATION_STYLE_INVALID = -EINVAL,
@@ -42,8 +27,20 @@ typedef enum VerificationStyle {
 
 int verification_style_from_url(const char *url, VerificationStyle *style);
 
-int pull_job_restart_with_sha256sum(PullJob *job, char **ret);
+typedef enum SignatureStyle {
+        SIGNATURE_GPG_PER_FILE,      /* ".sha256" files with detached .gpg signature */
+        SIGNATURE_ASC_PER_FILE,      /* SUSE-style ".sha256" files with detached .asc signature */
+        SIGNATURE_GPG_PER_DIRECTORY, /* Ubuntu-style SHA256SUM files with detached SHA256SUM.gpg signatures */
+        SIGNATURE_ASC_PER_DIRECTORY, /* SUSE-style SHA256SUM files with detached SHA256SUM.asc signatures */
+        _SIGNATURE_STYLE_MAX,
+        _SIGNATURE_STYLE_INVALID = -EINVAL,
+} SignatureStyle;
 
-bool pull_validate_local(const char *name, PullFlags flags);
+int signature_style_from_url(const char *url, SignatureStyle *style, char **ret_filename);
+
+int pull_job_restart_with_sha256sum(PullJob *job, char **ret);
+int pull_job_restart_with_signature(PullJob *job, char **ret);
+
+bool pull_validate_local(const char *name, ImportFlags flags);
 
 int pull_url_needs_checksum(const char *url);

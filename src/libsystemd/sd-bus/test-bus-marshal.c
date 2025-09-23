@@ -1,10 +1,15 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <math.h>
-#include <stdlib.h>
+
+/* We make an exception here to our usual "include system headers first" rule because we need one of these
+ * macros to disable a warning triggered by the glib headers. */
+#include "macro-fundamental.h"
 
 #if HAVE_GLIB
-#include <gio/gio.h>
+DISABLE_WARNING_FORMAT_NONLITERAL
+#include <gio/gio.h> /* NOLINT */
+REENABLE_WARNING
 #endif
 
 #if HAVE_DBUS
@@ -14,14 +19,12 @@
 #include "sd-bus.h"
 
 #include "alloc-util.h"
-#include "bus-dump.h"
 #include "bus-label.h"
 #include "bus-message.h"
 #include "bus-util.h"
 #include "escape.h"
-#include "fd-util.h"
-#include "fileio.h"
 #include "log.h"
+#include "memstream-util.h"
 #include "tests.h"
 
 static void test_bus_path_encode_unique(void) {
@@ -41,8 +44,8 @@ static void test_bus_path_encode(void) {
         assert_se(sd_bus_path_decode(a, "/waldo", &b) == 0 && b == NULL);
         assert_se(sd_bus_path_decode(a, "/foo/bar", &b) > 0 && streq(b, "waldo"));
 
-        assert_se(sd_bus_path_encode("xxxx", "waldo", &c) < 0);
-        assert_se(sd_bus_path_encode("/foo/", "waldo", &c) < 0);
+        ASSERT_RETURN_EXPECTED_SE(sd_bus_path_encode("xxxx", "waldo", &c) < 0);
+        ASSERT_RETURN_EXPECTED_SE(sd_bus_path_encode("/foo/", "waldo", &c) < 0);
 
         assert_se(sd_bus_path_encode("/foo/bar", "", &c) >= 0 && streq(c, "/foo/bar/_"));
         assert_se(sd_bus_path_decode(c, "/foo/bar", &d) > 0 && streq(d, ""));
@@ -108,20 +111,19 @@ static void test_bus_label_escape(void) {
 
 int main(int argc, char *argv[]) {
         _cleanup_(sd_bus_message_unrefp) sd_bus_message *m = NULL, *copy = NULL;
-        int r, boolean;
-        const char *x, *x2, *y, *z, *a, *b, *c, *d, *a_signature;
-        uint8_t u, v;
-        void *buffer = NULL;
-        size_t sz;
-        _cleanup_free_ char *h = NULL;
+        _cleanup_free_ char *h = NULL, *first = NULL, *second = NULL, *third = NULL;
         const int32_t integer_array[] = { -1, -2, 0, 1, 2 }, *return_array;
-        char *s;
-        _cleanup_free_ char *first = NULL, *second = NULL, *third = NULL;
-        _cleanup_fclose_ FILE *ms = NULL;
-        size_t first_size = 0, second_size = 0, third_size = 0;
+        const char *x, *x2, *y, *z, *a, *b, *c, *d, *a_signature;
+        size_t sz, first_size, second_size = 0, third_size = 0;
         _cleanup_(sd_bus_unrefp) sd_bus *bus = NULL;
-        double dbl;
+        _cleanup_(memstream_done) MemStream ms = {};
+        void *buffer = NULL;
+        int r, boolean;
         uint64_t u64;
+        uint8_t u, v;
+        double dbl;
+        FILE *mf;
+        char *s;
 
         test_setup_logging(LOG_INFO);
 
@@ -191,10 +193,9 @@ int main(int argc, char *argv[]) {
 
         sd_bus_message_dump(m, stdout, SD_BUS_MESSAGE_DUMP_WITH_HEADER);
 
-        ms = open_memstream_unlocked(&first, &first_size);
-        sd_bus_message_dump(m, ms, 0);
-        fflush(ms);
-        assert_se(!ferror(ms));
+        assert_se(mf = memstream_init(&ms));
+        sd_bus_message_dump(m, mf, 0);
+        assert_se(memstream_finalize(&ms, &first, &first_size) >= 0);
 
         r = bus_message_get_blob(m, &buffer, &sz);
         assert_se(r >= 0);
@@ -247,11 +248,9 @@ int main(int argc, char *argv[]) {
 
         sd_bus_message_dump(m, stdout, SD_BUS_MESSAGE_DUMP_WITH_HEADER);
 
-        fclose(ms);
-        ms = open_memstream_unlocked(&second, &second_size);
-        sd_bus_message_dump(m, ms, 0);
-        fflush(ms);
-        assert_se(!ferror(ms));
+        assert_se(mf = memstream_init(&ms));
+        sd_bus_message_dump(m, mf, 0);
+        assert_se(memstream_finalize(&ms, &second, &second_size) >= 0);
         assert_se(first_size == second_size);
         assert_se(memcmp(first, second, first_size) == 0);
 
@@ -353,11 +352,9 @@ int main(int argc, char *argv[]) {
         r = sd_bus_message_seal(copy, 4712, 0);
         assert_se(r >= 0);
 
-        fclose(ms);
-        ms = open_memstream_unlocked(&third, &third_size);
-        sd_bus_message_dump(copy, ms, 0);
-        fflush(ms);
-        assert_se(!ferror(ms));
+        assert_se(mf = memstream_init(&ms));
+        sd_bus_message_dump(copy, mf, 0);
+        assert_se(memstream_finalize(&ms, &third, &third_size) >= 0);
 
         printf("<%.*s>\n", (int) first_size, first);
         printf("<%.*s>\n", (int) third_size, third);

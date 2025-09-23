@@ -54,18 +54,6 @@
   </a>
 </xsl:template>
 
-<xsl:template match="citerefentry[@project='wireguard']">
-  <a>
-    <xsl:attribute name="href">
-      <xsl:text>https://git.zx2c4.com/WireGuard/about/src/tools/</xsl:text>
-      <xsl:value-of select="refentrytitle"/>
-      <xsl:text>.</xsl:text>
-      <xsl:value-of select="manvolnum"/>
-    </xsl:attribute>
-    <xsl:call-template name="inline.charseq"/>
-  </a>
-</xsl:template>
-
 <xsl:template match="citerefentry[@project='mankier']">
   <a>
     <xsl:attribute name="href">
@@ -78,16 +66,26 @@
   </a>
 </xsl:template>
 
+<xsl:template match="citerefentry[@project='openssl']">
+  <a>
+    <xsl:attribute name="href">
+      <xsl:text>https://docs.openssl.org/master/man</xsl:text>
+      <xsl:value-of select="manvolnum"/>
+      <xsl:text>/</xsl:text>
+      <xsl:value-of select="refentrytitle"/>
+    </xsl:attribute>
+    <xsl:call-template name="inline.charseq"/>
+  </a>
+</xsl:template>
+
 <xsl:template match="citerefentry[@project='archlinux']">
   <a>
     <xsl:attribute name="href">
-      <xsl:text>https://www.archlinux.org/</xsl:text>
-      <xsl:value-of select="refentrytitle"/>
-      <xsl:text>/</xsl:text>
+      <xsl:text>https://man.archlinux.org/man/</xsl:text>
       <xsl:value-of select="refentrytitle"/>
       <xsl:text>.</xsl:text>
       <xsl:value-of select="manvolnum"/>
-      <xsl:text>.html</xsl:text>
+      <xsl:text>.en.html</xsl:text>
     </xsl:attribute>
     <xsl:call-template name="inline.charseq"/>
   </a>

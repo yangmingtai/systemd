@@ -1,10 +1,11 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include "fd-util.h"
-#include "fileio.h"
+
+#include "alloc-util.h"
+#include "extract-word.h"
 #include "hostname-util.h"
 #include "log.h"
-#include "macro.h"
+#include "memstream-util.h"
 #include "netif-naming-scheme.h"
 #include "network-generator.h"
 #include "parse-util.h"
@@ -13,20 +14,21 @@
 #include "string-table.h"
 #include "string-util.h"
 #include "strv.h"
+#include "vlan-util.h"
 
 /*
   # .network
-  ip={dhcp|on|any|dhcp6|auto6|either6|link6}
-  ip=<interface>:{dhcp|on|any|dhcp6|auto6|link6}[:[<mtu>][:<macaddr>]]
-  ip=<client-IP>:[<peer>]:<gateway-IP>:<netmask>:<client_hostname>:<interface>:{none|off|dhcp|on|any|dhcp6|auto6|link6|ibft}[:[<mtu>][:<macaddr>]]
-  ip=<client-IP>:[<peer>]:<gateway-IP>:<netmask>:<client_hostname>:<interface>:{none|off|dhcp|on|any|dhcp6|auto6|link6|ibft}[:[<dns1>][:<dns2>]]
+  ip={dhcp|on|any|dhcp6|auto6|either6|link6|link-local}
+  ip=<interface>:{dhcp|on|any|dhcp6|auto6|link6|link-local}[:[<mtu>][:<macaddr>]]
+  ip=<client-IP>:[<peer>]:<gateway-IP>:<netmask>:<client_hostname>:<interface>:{none|off|dhcp|on|any|dhcp6|auto6|link6|ibft|link-local}[:[<mtu>][:<macaddr>]]
+  ip=<client-IP>:[<peer>]:<gateway-IP>:<netmask>:<client_hostname>:<interface>:{none|off|dhcp|on|any|dhcp6|auto6|link6|ibft|link-local}[:[<dns1>][:<dns2>]]
   rd.route=<net>/<netmask>:<gateway>[:<interface>]
   nameserver=<IP> [nameserver=<IP> ...]
   rd.peerdns=0
 
   # .link
   ifname=<interface>:<MAC>
-  net.ifname-policy=policy1[,policy2,...][,<MAC>] # This is an original rule, not supported by other tools.
+  net.ifname_policy=policy1[,policy2,...][,<MAC>] # This is an original rule, not supported by other tools.
 
   # .netdev
   vlan=<vlanname>:<phydevice>
@@ -43,36 +45,58 @@
 */
 
 static const char * const dracut_dhcp_type_table[_DHCP_TYPE_MAX] = {
-        [DHCP_TYPE_NONE]    = "none",
-        [DHCP_TYPE_OFF]     = "off",
-        [DHCP_TYPE_ON]      = "on",
-        [DHCP_TYPE_ANY]     = "any",
-        [DHCP_TYPE_DHCP4]   = "dhcp",
-        [DHCP_TYPE_DHCP6]   = "dhcp6",
-        [DHCP_TYPE_AUTO6]   = "auto6",
-        [DHCP_TYPE_EITHER6] = "either6",
-        [DHCP_TYPE_IBFT]    = "ibft",
-        [DHCP_TYPE_LINK6]   = "link6",
+        [DHCP_TYPE_NONE]       = "none",
+        [DHCP_TYPE_OFF]        = "off",
+        [DHCP_TYPE_ON]         = "on",
+        [DHCP_TYPE_ANY]        = "any",
+        [DHCP_TYPE_DHCP]       = "dhcp",
+        [DHCP_TYPE_DHCP6]      = "dhcp6",
+        [DHCP_TYPE_AUTO6]      = "auto6",
+        [DHCP_TYPE_EITHER6]    = "either6",
+        [DHCP_TYPE_IBFT]       = "ibft",
+        [DHCP_TYPE_LINK6]      = "link6",
+        [DHCP_TYPE_LINK_LOCAL] = "link-local",
 };
 
 DEFINE_PRIVATE_STRING_TABLE_LOOKUP_FROM_STRING(dracut_dhcp_type, DHCPType);
 
 static const char * const networkd_dhcp_type_table[_DHCP_TYPE_MAX] = {
-        [DHCP_TYPE_NONE]    = "no",
-        [DHCP_TYPE_OFF]     = "no",
-        [DHCP_TYPE_ON]      = "yes",
-        [DHCP_TYPE_ANY]     = "yes",
-        [DHCP_TYPE_DHCP4]   = "ipv4",
-        [DHCP_TYPE_DHCP6]   = "ipv6",
-        [DHCP_TYPE_AUTO6]   = "no",   /* TODO: enable other setting? */
-        [DHCP_TYPE_EITHER6] = "ipv6", /* TODO: enable other setting? */
-        [DHCP_TYPE_IBFT]    = "no",
-        [DHCP_TYPE_LINK6]   = "no",
+        [DHCP_TYPE_NONE]       = "no",
+        [DHCP_TYPE_OFF]        = "no",
+        [DHCP_TYPE_ON]         = "yes",
+        [DHCP_TYPE_ANY]        = "yes",
+        [DHCP_TYPE_DHCP]       = "ipv4",
+        [DHCP_TYPE_DHCP6]      = "ipv6",
+        [DHCP_TYPE_AUTO6]      = "no",   /* TODO: enable other setting? */
+        [DHCP_TYPE_EITHER6]    = "ipv6", /* TODO: enable other setting? */
+        [DHCP_TYPE_IBFT]       = "no",
+        [DHCP_TYPE_LINK6]      = "no",
+        [DHCP_TYPE_LINK_LOCAL] = "no",
 };
 
 DEFINE_PRIVATE_STRING_TABLE_LOOKUP_TO_STRING(networkd_dhcp_type, DHCPType);
 
-static Address *address_free(Address *address) {
+static const char * const networkd_ipv6ra_type_table[_DHCP_TYPE_MAX] = {
+        [DHCP_TYPE_NONE]       = "no",
+        [DHCP_TYPE_OFF]        = "no",
+        [DHCP_TYPE_LINK6]      = "no",
+        [DHCP_TYPE_LINK_LOCAL] = "no",
+        /* We omit the other entries, to leave the default in effect */
+};
+
+DEFINE_PRIVATE_STRING_TABLE_LOOKUP_TO_STRING(networkd_ipv6ra_type, DHCPType);
+
+static const char * const networkd_link_local_type_table[_DHCP_TYPE_MAX] = {
+        [DHCP_TYPE_NONE]       = "no",
+        [DHCP_TYPE_OFF]        = "no",
+        [DHCP_TYPE_LINK6]      = "ipv6",
+        [DHCP_TYPE_LINK_LOCAL] = "yes",
+        /* We omit the other entries, to leave the default in effect */
+};
+
+DEFINE_PRIVATE_STRING_TABLE_LOOKUP_TO_STRING(networkd_link_local_type, DHCPType);
+
+static Address* address_free(Address *address) {
         if (!address)
                 return NULL;
 
@@ -82,11 +106,19 @@ static Address *address_free(Address *address) {
         return mfree(address);
 }
 
-static int address_new(Network *network, int family, unsigned char prefixlen,
-                       union in_addr_union *addr, union in_addr_union *peer, Address **ret) {
+static int address_new(
+                Network *network,
+                int family,
+                unsigned char prefixlen,
+                union in_addr_union *addr,
+                union in_addr_union *peer,
+                Address **ret) {
+
         Address *address;
 
         assert(network);
+        assert(IN_SET(family, AF_INET, AF_INET6));
+        assert(addr);
 
         address = new(Address, 1);
         if (!address)
@@ -96,7 +128,7 @@ static int address_new(Network *network, int family, unsigned char prefixlen,
                 .family = family,
                 .prefixlen = prefixlen,
                 .address = *addr,
-                .peer = *peer,
+                .peer = peer ? *peer : IN_ADDR_NULL,
         };
 
         LIST_PREPEND(addresses, network->addresses, address);
@@ -108,7 +140,7 @@ static int address_new(Network *network, int family, unsigned char prefixlen,
         return 0;
 }
 
-static Route *route_free(Route *route) {
+static Route* route_free(Route *route) {
         if (!route)
                 return NULL;
 
@@ -118,11 +150,19 @@ static Route *route_free(Route *route) {
         return mfree(route);
 }
 
-static int route_new(Network *network, int family, unsigned char prefixlen,
-                     union in_addr_union *dest, union in_addr_union *gateway, Route **ret) {
+static int route_new(
+                Network *network,
+                int family,
+                unsigned char prefixlen,
+                union in_addr_union *dest,
+                union in_addr_union *gateway,
+                Route **ret) {
+
         Route *route;
 
         assert(network);
+        assert(IN_SET(family, AF_INET, AF_INET6));
+        assert(dest || gateway);
 
         route = new(Route, 1);
         if (!route)
@@ -132,7 +172,7 @@ static int route_new(Network *network, int family, unsigned char prefixlen,
                 .family = family,
                 .prefixlen = prefixlen,
                 .dest = dest ? *dest : IN_ADDR_NULL,
-                .gateway = *gateway,
+                .gateway = gateway ? *gateway : IN_ADDR_NULL,
         };
 
         LIST_PREPEND(routes, network->routes, route);
@@ -144,7 +184,7 @@ static int route_new(Network *network, int family, unsigned char prefixlen,
         return 0;
 }
 
-static Network *network_free(Network *network) {
+static Network* network_free(Network *network) {
         Address *address;
         Route *route;
 
@@ -154,7 +194,7 @@ static Network *network_free(Network *network) {
         free(network->ifname);
         free(network->hostname);
         strv_free(network->dns);
-        free(network->vlan);
+        strv_free(network->vlan);
         free(network->bridge);
         free(network->bond);
 
@@ -169,12 +209,18 @@ static Network *network_free(Network *network) {
 
 DEFINE_TRIVIAL_CLEANUP_FUNC(Network*, network_free);
 
+DEFINE_PRIVATE_HASH_OPS_WITH_VALUE_DESTRUCTOR(
+                network_hash_ops,
+                char, string_hash_func, string_compare_func,
+                Network, network_free);
+
 static int network_new(Context *context, const char *name, Network **ret) {
         _cleanup_(network_freep) Network *network = NULL;
         _cleanup_free_ char *ifname = NULL;
         int r;
 
         assert(context);
+        assert(name);
 
         if (!isempty(name) && !ifname_valid(name))
                 return -EINVAL;
@@ -193,7 +239,7 @@ static int network_new(Context *context, const char *name, Network **ret) {
                 .dhcp_use_dns = -1,
         };
 
-        r = hashmap_ensure_put(&context->networks_by_name, &string_hash_ops, network->ifname, network);
+        r = hashmap_ensure_put(&context->networks_by_name, &network_hash_ops, network->ifname, network);
         if (r < 0)
                 return r;
 
@@ -204,11 +250,28 @@ static int network_new(Context *context, const char *name, Network **ret) {
         return 0;
 }
 
-Network *network_get(Context *context, const char *ifname) {
+Network* network_get(Context *context, const char *ifname) {
+        assert(context);
+        assert(ifname);
         return hashmap_get(context->networks_by_name, ifname);
 }
 
-static NetDev *netdev_free(NetDev *netdev) {
+static int network_acquire(Context *context, const char *ifname, Network **ret) {
+        Network *network;
+
+        assert(context);
+        assert(ifname);
+
+        network = network_get(context, ifname);
+        if (!network)
+                return network_new(context, ifname, ret);
+
+        if (ret)
+                *ret = network;
+        return 0;
+}
+
+static NetDev* netdev_free(NetDev *netdev) {
         if (!netdev)
                 return NULL;
 
@@ -219,12 +282,19 @@ static NetDev *netdev_free(NetDev *netdev) {
 
 DEFINE_TRIVIAL_CLEANUP_FUNC(NetDev*, netdev_free);
 
+DEFINE_PRIVATE_HASH_OPS_WITH_VALUE_DESTRUCTOR(
+                netdev_hash_ops,
+                char, string_hash_func, string_compare_func,
+                NetDev, netdev_free);
+
 static int netdev_new(Context *context, const char *_kind, const char *_ifname, NetDev **ret) {
         _cleanup_(netdev_freep) NetDev *netdev = NULL;
         _cleanup_free_ char *kind = NULL, *ifname = NULL;
         int r;
 
         assert(context);
+        assert(_kind);
+        assert(_ifname);
 
         if (!ifname_valid(_ifname))
                 return -EINVAL;
@@ -246,7 +316,7 @@ static int netdev_new(Context *context, const char *_kind, const char *_ifname, 
                 .ifname = TAKE_PTR(ifname),
         };
 
-        r = hashmap_ensure_put(&context->netdevs_by_name, &string_hash_ops, netdev->ifname, netdev);
+        r = hashmap_ensure_put(&context->netdevs_by_name, &netdev_hash_ops, netdev->ifname, netdev);
         if (r < 0)
                 return r;
 
@@ -257,11 +327,32 @@ static int netdev_new(Context *context, const char *_kind, const char *_ifname, 
         return 0;
 }
 
-NetDev *netdev_get(Context *context, const char *ifname) {
+NetDev* netdev_get(Context *context, const char *ifname) {
+        assert(context);
+        assert(ifname);
         return hashmap_get(context->netdevs_by_name, ifname);
 }
 
-static Link *link_free(Link *link) {
+static int netdev_acquire(Context *context, const char *kind, const char *name, NetDev **ret) {
+        NetDev *netdev;
+
+        assert(context);
+        assert(kind);
+        assert(name);
+
+        netdev = netdev_get(context, name);
+        if (!netdev)
+                return netdev_new(context, kind, name, ret);
+
+        if (!streq_ptr(netdev->kind, kind))
+                return -EEXIST; /* conflicting netdev already exists. */
+
+        if (ret)
+                *ret = netdev;
+        return 0;
+}
+
+static Link* link_free(Link *link) {
         if (!link)
                 return NULL;
 
@@ -273,6 +364,11 @@ static Link *link_free(Link *link) {
 }
 
 DEFINE_TRIVIAL_CLEANUP_FUNC(Link*, link_free);
+
+DEFINE_PRIVATE_HASH_OPS_WITH_VALUE_DESTRUCTOR(
+                link_hash_ops,
+                char, string_hash_func, string_compare_func,
+                Link, link_free);
 
 static int link_new(
                 Context *context,
@@ -317,7 +413,7 @@ static int link_new(
                 .mac = *mac,
         };
 
-        r = hashmap_ensure_put(&context->links_by_filename, &string_hash_ops, link->filename, link);
+        r = hashmap_ensure_put(&context->links_by_filename, &link_hash_ops, link->filename, link);
         if (r < 0)
                 return r;
 
@@ -328,7 +424,7 @@ static int link_new(
         return 0;
 }
 
-Link *link_get(Context *context, const char *filename) {
+Link* link_get(Context *context, const char *filename) {
         assert(context);
         assert(filename);
         return hashmap_get(context->links_by_filename, filename);
@@ -339,16 +435,17 @@ static int network_set_dhcp_type(Context *context, const char *ifname, const cha
         DHCPType t;
         int r;
 
+        assert(context);
+        assert(ifname);
+        assert(dhcp_type);
+
         t = dracut_dhcp_type_from_string(dhcp_type);
         if (t < 0)
-                return t;
+                return log_debug_errno(t, "Invalid DHCP type '%s'", dhcp_type);
 
-        network = network_get(context, ifname);
-        if (!network) {
-                r = network_new(context, ifname, &network);
-                if (r < 0)
-                        return r;
-        }
+        r = network_acquire(context, ifname, &network);
+        if (r < 0)
+                return log_debug_errno(r, "Failed to acquire network for '%s': %m", ifname);
 
         network->dhcp_type = t;
         return 0;
@@ -356,81 +453,135 @@ static int network_set_dhcp_type(Context *context, const char *ifname, const cha
 
 static int network_set_hostname(Context *context, const char *ifname, const char *hostname) {
         Network *network;
+        int r;
 
-        network = network_get(context, ifname);
-        if (!network)
-                return -ENODEV;
+        assert(context);
+        assert(ifname);
+
+        if (isempty(hostname))
+                return 0;
+
+        if (!hostname_is_valid(hostname, 0))
+                return log_debug_errno(SYNTHETIC_ERRNO(EINVAL), "Invalid hostname '%s'.", hostname);
+
+        r = network_acquire(context, ifname, &network);
+        if (r < 0)
+                return log_debug_errno(r, "Failed to acquire network for '%s': %m", ifname);
 
         return free_and_strdup(&network->hostname, hostname);
 }
 
-static int network_set_mtu(Context *context, const char *ifname, int family, const char *mtu) {
+static int network_set_mtu(Context *context, const char *ifname, const char *mtu) {
         Network *network;
+        int r;
 
-        network = network_get(context, ifname);
-        if (!network)
-                return -ENODEV;
+        assert(context);
+        assert(ifname);
 
-        return parse_mtu(family, mtu, &network->mtu);
+        if (isempty(mtu))
+                return 0;
+
+        r = network_acquire(context, ifname, &network);
+        if (r < 0)
+                return log_debug_errno(r, "Failed to acquire network for '%s': %m", ifname);
+
+        r = parse_mtu(AF_UNSPEC, mtu, &network->mtu);
+        if (r < 0)
+                return log_debug_errno(r, "Invalid MTU '%s' for '%s': %m", mtu, ifname);
+
+        return r;
 }
 
 static int network_set_mac_address(Context *context, const char *ifname, const char *mac) {
         Network *network;
+        int r;
 
-        network = network_get(context, ifname);
-        if (!network)
-                return -ENODEV;
+        assert(context);
+        assert(ifname);
 
-        return parse_ether_addr(mac, &network->mac);
+        if (isempty(mac))
+                return 0;
+
+        r = network_acquire(context, ifname, &network);
+        if (r < 0)
+                return log_debug_errno(r, "Failed to acquire network for '%s': %m", ifname);
+
+        r = parse_ether_addr(mac, &network->mac);
+        if (r < 0)
+                return log_debug_errno(r, "Invalid MAC address '%s' for '%s'", mac, ifname);
+
+        return 0;
 }
 
-static int network_set_address(Context *context, const char *ifname, int family, unsigned char prefixlen,
-                               union in_addr_union *addr, union in_addr_union *peer) {
+static int network_set_address(
+                Context *context,
+                const char *ifname,
+                int family,
+                unsigned char prefixlen,
+                union in_addr_union *addr,
+                union in_addr_union *peer) {
+
         Network *network;
+        int r;
+
+        assert(context);
+        assert(ifname);
+        assert(IN_SET(family, AF_INET, AF_INET6));
+        assert(addr);
 
         if (!in_addr_is_set(family, addr))
                 return 0;
 
-        network = network_get(context, ifname);
-        if (!network)
-                return -ENODEV;
+        r = network_acquire(context, ifname, &network);
+        if (r < 0)
+                return log_debug_errno(r, "Failed to acquire network for '%s': %m", ifname);
 
         return address_new(network, family, prefixlen, addr, peer, NULL);
 }
 
-static int network_set_route(Context *context, const char *ifname, int family, unsigned char prefixlen,
-                             union in_addr_union *dest, union in_addr_union *gateway) {
+static int network_set_route(
+                Context *context,
+                const char *ifname,
+                int family,
+                unsigned char prefixlen,
+                union in_addr_union *dest,
+                union in_addr_union *gateway) {
+
         Network *network;
         int r;
 
-        if (!in_addr_is_set(family, gateway))
+        assert(context);
+        assert(ifname);
+        assert(IN_SET(family, AF_INET, AF_INET6));
+
+        if (!(dest && in_addr_is_set(family, dest)) &&
+            !(gateway && in_addr_is_set(family, gateway)))
                 return 0;
 
-        network = network_get(context, ifname);
-        if (!network) {
-                r = network_new(context, ifname, &network);
-                if (r < 0)
-                        return r;
-        }
+        r = network_acquire(context, ifname, &network);
+        if (r < 0)
+                return log_debug_errno(r, "Failed to acquire network for '%s': %m", ifname);
 
         return route_new(network, family, prefixlen, dest, gateway, NULL);
 }
 
 static int network_set_dns(Context *context, const char *ifname, const char *dns) {
-        union in_addr_union a;
         Network *network;
-        int family, r;
+        int r;
 
-        r = in_addr_from_string_auto(dns, &family, &a);
+        assert(context);
+        assert(ifname);
+
+        if (isempty(dns))
+                return 0;
+
+        r = in_addr_from_string_auto(dns, NULL, NULL);
         if (r < 0)
-                return r;
+                return log_debug_errno(r, "Invalid DNS address '%s' for '%s'", dns, ifname);
 
-        network = network_get(context, ifname);
-        if (!network) {
-                r = network_new(context, ifname, &network);
-                if (r < 0)
-                        return r;
-        }
+        r = network_acquire(context, ifname, &network);
+        if (r < 0)
+                return log_debug_errno(r, "Failed to acquire network for '%s': %m", ifname);
 
         return strv_extend(&network->dns, dns);
 }
@@ -439,12 +590,12 @@ static int network_set_dhcp_use_dns(Context *context, const char *ifname, bool v
         Network *network;
         int r;
 
-        network = network_get(context, ifname);
-        if (!network) {
-                r = network_new(context, ifname, &network);
-                if (r < 0)
-                        return r;
-        }
+        assert(context);
+        assert(ifname);
+
+        r = network_acquire(context, ifname, &network);
+        if (r < 0)
+                return log_debug_errno(r, "Failed to create network for '%s': %m", ifname);
 
         network->dhcp_use_dns = value;
 
@@ -455,26 +606,30 @@ static int network_set_vlan(Context *context, const char *ifname, const char *va
         Network *network;
         int r;
 
-        network = network_get(context, ifname);
-        if (!network) {
-                r = network_new(context, ifname, &network);
-                if (r < 0)
-                        return r;
-        }
+        assert(context);
 
-        return free_and_strdup(&network->vlan, value);
+        if (isempty(ifname))
+                return 0;
+
+        r = network_acquire(context, ifname, &network);
+        if (r < 0)
+                return log_debug_errno(r, "Failed to acquire network for '%s': %m", ifname);
+
+        return strv_extend(&network->vlan, value);
 }
 
 static int network_set_bridge(Context *context, const char *ifname, const char *value) {
         Network *network;
         int r;
 
-        network = network_get(context, ifname);
-        if (!network) {
-                r = network_new(context, ifname, &network);
-                if (r < 0)
-                        return r;
-        }
+        assert(context);
+
+        if (isempty(ifname))
+                return 0;
+
+        r = network_acquire(context, ifname, &network);
+        if (r < 0)
+                return log_debug_errno(r, "Failed to acquire network for '%s': %m", ifname);
 
         return free_and_strdup(&network->bridge, value);
 }
@@ -483,171 +638,190 @@ static int network_set_bond(Context *context, const char *ifname, const char *va
         Network *network;
         int r;
 
-        network = network_get(context, ifname);
-        if (!network) {
-                r = network_new(context, ifname, &network);
-                if (r < 0)
-                        return r;
-        }
+        assert(context);
+
+        if (isempty(ifname))
+                return 0;
+
+        r = network_acquire(context, ifname, &network);
+        if (r < 0)
+                return log_debug_errno(r, "Failed to acquire network for '%s': %m", ifname);
 
         return free_and_strdup(&network->bond, value);
 }
 
-static int parse_cmdline_ip_mtu_mac(Context *context, const char *ifname, int family, const char *value) {
-        const char *mtu, *p;
+static int parse_cmdline_ip_mtu_mac(Context *context, const char *ifname, const char *value) {
+        _cleanup_free_ char *mtu = NULL;
         int r;
+
+        assert(context);
+        assert(ifname);
 
         /* [<mtu>][:<macaddr>] */
 
-        p = strchr(value, ':');
-        if (!p)
-                mtu = value;
-        else
-                mtu = strndupa_safe(value, p - value);
+        const char *p = value;
+        r = extract_first_word(&p, &mtu, ":", EXTRACT_DONT_COALESCE_SEPARATORS);
+        if (r <= 0)
+                return r;
 
-        r = network_set_mtu(context, ifname, family, mtu);
+        r = network_set_mtu(context, ifname, mtu);
         if (r < 0)
                 return r;
 
-        if (!p)
-                return 0;
-
-        r = network_set_mac_address(context, ifname, p + 1);
-        if (r < 0)
-                return r;
-
-        return 0;
+        return network_set_mac_address(context, ifname, p);
 }
 
-static int parse_ip_address_one(int family, const char **value, union in_addr_union *ret) {
-        const char *p = *value, *q, *buf;
+static int extract_ip_address_str(int family, const char **ptr, char **ret) {
+        _cleanup_free_ char *buf = NULL;
+        const char *p;
         int r;
 
-        if (p[0] == ':') {
-                *value = p + 1;
+        assert(IN_SET(family, AF_UNSPEC, AF_INET, AF_INET6));
+        assert(ptr);
+        assert(ret);
+
+        if (isempty(*ptr)) {
+                *ptr = NULL;
+                *ret = NULL;
                 return 0;
         }
 
-        if (family == AF_INET6) {
-                if (p[0] != '[')
-                        return -EINVAL;
+        if (**ptr != '[')
+                return extract_first_word(ptr, ret, ":", EXTRACT_DONT_COALESCE_SEPARATORS);
 
-                q = strchr(p + 1, ']');
-                if (!q)
-                        return -EINVAL;
+        if (family == AF_INET)
+                return -EINVAL;
 
-                if (q[1] != ':')
-                        return -EINVAL;
-
-                buf = strndupa_safe(p + 1, q - p - 1);
-                p = q + 2;
-        } else {
-                q = strchr(p, ':');
-                if (!q)
-                        return -EINVAL;
-
-                buf = strndupa_safe(p, q - p);
-                p = q + 1;
-        }
-
-        r = in_addr_from_string(family, buf, ret);
+        p = *ptr + 1;
+        r = extract_first_word(&p, &buf, "]", EXTRACT_DONT_COALESCE_SEPARATORS);
         if (r < 0)
                 return r;
+        if (r == 0)
+                return -EINVAL; /* Missing "]". */
 
-        *value = p;
+        if (!isempty(p)) {
+                if (p[0] != ':')
+                        return -EINVAL; /* Missing ":" after "]". */
+                p++;
+        }
+
+        *ptr = p;
+        *ret = TAKE_PTR(buf);
         return 1;
 }
 
-static int parse_netmask_or_prefixlen(int family, const char **value, unsigned char *ret) {
-        union in_addr_union netmask;
-        const char *p, *q;
-        int r;
+static int extract_ip_address(int family, const char **ptr, union in_addr_union *ret) {
+        _cleanup_free_ char *buf = NULL;
+        const char *p;
+        int r, k;
 
-        r = parse_ip_address_one(family, value, &netmask);
-        if (r > 0) {
-                if (family == AF_INET6)
-                        /* TODO: Not supported yet. */
-                        return -EINVAL;
+        assert(IN_SET(family, AF_INET, AF_INET6));
+        assert(ptr);
+        assert(ret);
 
-                *ret = in4_addr_netmask_to_prefixlen(&netmask.in);
-        } else if (r == 0)
-                *ret = family == AF_INET6 ? 128 : 32;
-        else {
-                p = strchr(*value, ':');
-                if (!p)
-                        return -EINVAL;
+        p = *ptr;
+        r = extract_ip_address_str(family, &p, &buf);
+        if (r < 0)
+                return r;
 
-                q = strndupa_safe(*value, p - *value);
-                r = safe_atou8(q, ret);
-                if (r < 0)
-                        return r;
-
-                *value = p + 1;
+        if (isempty(buf)) {
+                *ret = IN_ADDR_NULL;
+                r = 0;
+        } else {
+                assert(r > 0);
+                k = in_addr_from_string(family, buf, ret);
+                if (k < 0)
+                        return k;
         }
 
+        *ptr = p;
+        return r;
+}
+
+static int extract_netmask_or_prefixlen(int family, const char **ptr, unsigned char *ret) {
+        _cleanup_free_ char *buf = NULL;
+        const char *p;
+        int r;
+
+        assert(IN_SET(family, AF_INET, AF_INET6));
+        assert(ptr);
+        assert(ret);
+
+        if (family == AF_INET) {
+                union in_addr_union netmask;
+
+                p = *ptr;
+                r = extract_ip_address(family, &p, &netmask);
+                if (r > 0) {
+                        *ptr = p;
+                        *ret = in4_addr_netmask_to_prefixlen(&netmask.in);
+                        return 0;
+                }
+        }
+
+        p = *ptr;
+        r = extract_first_word(&p, &buf, ":", EXTRACT_DONT_COALESCE_SEPARATORS);
+        if (r < 0)
+                return r;
+        if (isempty(buf))
+                *ret = family == AF_INET6 ? 128 : 32;
+        else {
+                r = safe_atou8(buf, ret);
+                if (r < 0)
+                        return r;
+        }
+
+        *ptr = p;
         return 0;
 }
 
 static int parse_cmdline_ip_address(Context *context, int family, const char *value) {
-        union in_addr_union addr = {}, peer = {}, gateway = {};
-        const char *hostname = NULL, *ifname, *dhcp_type, *dns, *p;
+        union in_addr_union addr, peer = {}, gateway = {};
         unsigned char prefixlen;
         int r;
 
-        /* ip=<client-IP>:[<peer>]:<gateway-IP>:<netmask>:<client_hostname>:<interface>:{none|off|dhcp|on|any|dhcp6|auto6|ibft|link6}[:[<mtu>][:<macaddr>]]
-         * ip=<client-IP>:[<peer>]:<gateway-IP>:<netmask>:<client_hostname>:<interface>:{none|off|dhcp|on|any|dhcp6|auto6|ibft|link6}[:[<dns1>][:<dns2>]] */
+        assert(context);
+        assert(IN_SET(family, AF_INET, AF_INET6));
+        assert(value);
 
-        r = parse_ip_address_one(family, &value, &addr);
+        /* ip=<client-IP>:[<peer>]:<gateway-IP>:<netmask>:<client_hostname>:<interface>:{none|off|dhcp|on|any|dhcp6|auto6|ibft|link6}[:[<mtu>][:<macaddr>]]
+         * ip=<client-IP>:[<peer>]:<gateway-IP>:<netmask>:<client_hostname>:<interface>:{none|off|dhcp|on|any|dhcp6|auto6|ibft|link6}[:[<dns1>][:<dns2>]]
+         *
+         * Here, only DHCP type is mandatory. */
+
+        const char *p = value;
+        r = extract_ip_address(family, &p, &addr);
         if (r < 0)
-                return r;
-        r = parse_ip_address_one(family, &value, &peer);
+                return log_debug_errno(r, "Failed to parse IP address in ip=%s: %m", value);
+        r = extract_ip_address(family, &p, &peer);
         if (r < 0)
-                return r;
-        r = parse_ip_address_one(family, &value, &gateway);
+                return log_debug_errno(r, "Failed to parse peer address in ip=%s: %m", value);
+        r = extract_ip_address(family, &p, &gateway);
         if (r < 0)
-                return r;
-        r = parse_netmask_or_prefixlen(family, &value, &prefixlen);
+                return log_debug_errno(r, "Failed to parse gateway address in ip=%s: %m", value);
+        r = extract_netmask_or_prefixlen(family, &p, &prefixlen);
         if (r < 0)
-                return r;
+                return log_debug_errno(r, "Failed to parse netmask in ip=%s: %m", value);
 
         /* hostname */
-        p = strchr(value, ':');
-        if (!p)
-                return -EINVAL;
-
-        if (p != value) {
-                hostname = strndupa_safe(value, p - value);
-                if (!hostname_is_valid(hostname, 0))
-                        return -EINVAL;
-        }
-
-        value = p + 1;
+        _cleanup_free_ char *hostname = NULL;
+        r = extract_first_word(&p, &hostname, ":", EXTRACT_DONT_COALESCE_SEPARATORS);
+        if (r < 0)
+                return log_debug_errno(r, "Failed to parse hostname in ip=%s: %m", value);
 
         /* ifname */
-        p = strchr(value, ':');
-        if (!p)
-                return -EINVAL;
-
-        ifname = strndupa_safe(value, p - value);
-
-        value = p + 1;
+        _cleanup_free_ char *ifname = NULL;
+        r = extract_first_word(&p, &ifname, ":", EXTRACT_DONT_COALESCE_SEPARATORS);
+        if (r <= 0)
+                return log_debug_errno(r < 0 ? r : SYNTHETIC_ERRNO(EINVAL), "Failed to parse interface name in ip=%s: %m", value);
 
         /* dhcp_type */
-        p = strchr(value, ':');
-        if (!p)
-                dhcp_type = value;
-        else
-                dhcp_type = strndupa_safe(value, p - value);
-
-        r = network_set_dhcp_type(context, ifname, dhcp_type);
-        if (r < 0)
-                return r;
+        _cleanup_free_ char *dhcp_type = NULL;
+        r = extract_first_word(&p, &dhcp_type, ":", EXTRACT_DONT_COALESCE_SEPARATORS);
+        if (r <= 0)
+                return log_debug_errno(r < 0 ? r : SYNTHETIC_ERRNO(EINVAL), "Failed to parse DHCP type name in ip=%s: %m", value);
 
         /* set values */
-        r = network_set_hostname(context, ifname, hostname);
-        if (r < 0)
-                return r;
-
         r = network_set_address(context, ifname, family, prefixlen, &addr, &peer);
         if (r < 0)
                 return r;
@@ -656,74 +830,94 @@ static int parse_cmdline_ip_address(Context *context, int family, const char *va
         if (r < 0)
                 return r;
 
-        if (!p)
-                return 0;
-
-        /* First, try [<mtu>][:<macaddr>] */
-        r = parse_cmdline_ip_mtu_mac(context, ifname, AF_UNSPEC, p + 1);
-        if (r >= 0)
-                return 0;
-
-        /* Next, try [<dns1>][:<dns2>] */
-        value = p + 1;
-        p = strchr(value, ':');
-        if (!p) {
-                r = network_set_dns(context, ifname, value);
-                if (r < 0)
-                        return r;
-        } else {
-                dns = strndupa_safe(value, p - value);
-                r = network_set_dns(context, ifname, dns);
-                if (r < 0)
-                        return r;
-                r = network_set_dns(context, ifname, p + 1);
-                if (r < 0)
-                        return r;
-        }
-
-        return 0;
-}
-
-static int parse_cmdline_ip_interface(Context *context, const char *value) {
-        const char *ifname, *dhcp_type, *p;
-        int r;
-
-        /* ip=<interface>:{dhcp|on|any|dhcp6|auto6|link6}[:[<mtu>][:<macaddr>]] */
-
-        p = strchr(value, ':');
-        if (!p)
-                return -EINVAL;
-
-        ifname = strndupa_safe(value, p - value);
-
-        value = p + 1;
-        p = strchr(value, ':');
-        if (!p)
-                dhcp_type = value;
-        else
-                dhcp_type = strndupa_safe(value, p - value);
+        r = network_set_hostname(context, ifname, hostname);
+        if (r < 0)
+                return r;
 
         r = network_set_dhcp_type(context, ifname, dhcp_type);
         if (r < 0)
                 return r;
 
-        if (!p)
+        /* First, try [<mtu>][:<macaddr>] if an interface name is specified. */
+        if (!isempty(ifname) && parse_cmdline_ip_mtu_mac(context, ifname, p) >= 0)
                 return 0;
 
-        return parse_cmdline_ip_mtu_mac(context, ifname, AF_UNSPEC, p + 1);
+        /* Next, try [<dns1>][:<dns2>] */
+        _cleanup_free_ char *dns = NULL;
+        r = extract_ip_address_str(AF_UNSPEC, &p, &dns);
+        if (r < 0)
+                return log_debug_errno(r, "Failed to parse DNS address in ip=%s: %m", value);
+        if (r == 0)
+                return 0;
+
+        r = network_set_dns(context, ifname, dns);
+        if (r < 0)
+                return r;
+
+        dns = mfree(dns);
+        r = extract_ip_address_str(AF_UNSPEC, &p, &dns);
+        if (r < 0)
+                return log_debug_errno(r, "Failed to parse DNS address in ip=%s: %m", value);
+        if (r == 0)
+                return 0;
+
+        r = network_set_dns(context, ifname, dns);
+        if (r < 0)
+                return r;
+
+        /* refuse unexpected trailing strings */
+        if (!isempty(p))
+                return log_debug_errno(SYNTHETIC_ERRNO(EINVAL), "Unexpected trailing string in 'ip=%s'.", value);
+
+        return 0;
+}
+
+static int parse_cmdline_ip_interface(Context *context, const char *value) {
+        _cleanup_free_ char *ifname = NULL, *dhcp_type = NULL;
+        int r;
+
+        assert(context);
+        assert(value);
+
+        /* ip=<interface>:{dhcp|on|any|dhcp6|auto6|link6}[:[<mtu>][:<macaddr>]] */
+
+        const char *p = value;
+        r = extract_first_word(&p, &ifname, ":", EXTRACT_DONT_COALESCE_SEPARATORS);
+        if (r <= 0)
+                return log_debug_errno(r < 0 ? r : SYNTHETIC_ERRNO(EINVAL), "Failed to parse interface name in ip=%s: %m", value);
+
+        if (isempty(ifname))
+                return log_debug_errno(SYNTHETIC_ERRNO(EINVAL), "Missing interface name in ip=%s.", value);
+
+        r = extract_first_word(&p, &dhcp_type, ":", EXTRACT_DONT_COALESCE_SEPARATORS);
+        if (r <= 0)
+                return log_debug_errno(r < 0 ? r : SYNTHETIC_ERRNO(EINVAL), "Failed to parse DHCP type in ip=%s: %m", value);
+
+        r = network_set_dhcp_type(context, ifname, dhcp_type);
+        if (r < 0)
+                return r;
+
+        return parse_cmdline_ip_mtu_mac(context, ifname, p);
 }
 
 static int parse_cmdline_ip(Context *context, const char *key, const char *value) {
         const char *p;
         int r;
 
+        assert(context);
+        assert(key);
+
         if (proc_cmdline_value_missing(key, value))
-                return -EINVAL;
+                return 0;
 
         p = strchr(value, ':');
         if (!p)
                 /* ip={dhcp|on|any|dhcp6|auto6|either6|link6} */
                 return network_set_dhcp_type(context, "", value);
+
+        /* extract_first_word() eats the trailing separator, so check this earlier. */
+        if (endswith(value, ":"))
+                return log_debug_errno(SYNTHETIC_ERRNO(EINVAL), "Unexpected trailing colon in 'ip=%s'.", value);
 
         if (value[0] == '[')
                 return parse_cmdline_ip_address(context, AF_INET6, value);
@@ -736,55 +930,42 @@ static int parse_cmdline_ip(Context *context, const char *key, const char *value
 }
 
 static int parse_cmdline_rd_route(Context *context, const char *key, const char *value) {
-        union in_addr_union addr = {}, gateway = {};
+        _cleanup_free_ char *buf = NULL;
+        union in_addr_union dest, gateway;
         unsigned char prefixlen;
-        const char *buf, *p;
         int family, r;
+
+        assert(context);
+        assert(key);
 
         /* rd.route=<net>/<netmask>:<gateway>[:<interface>] */
 
         if (proc_cmdline_value_missing(key, value))
-                return -EINVAL;
+                return 0;
 
-        if (value[0] == '[') {
-                p = strchr(value, ']');
-                if (!p)
-                        return -EINVAL;
+        const char *p = value;
+        r = extract_ip_address_str(AF_UNSPEC, &p, &buf);
+        if (r <= 0)
+                return log_debug_errno(r < 0 ? r : SYNTHETIC_ERRNO(EINVAL), "Failed to parse destination address in %s=%s: %m", key, value);
 
-                if (p[1] != ':')
-                        return -EINVAL;
-
-                buf = strndupa_safe(value + 1, p - value - 1);
-                value = p + 2;
-                family = AF_INET6;
-        } else {
-                p = strchr(value, ':');
-                if (!p)
-                        return -EINVAL;
-
-                buf = strndupa_safe(value, p - value);
-                value = p + 1;
-                family = AF_INET;
-        }
-
-        r = in_addr_prefix_from_string(buf, family, &addr, &prefixlen);
+        r = in_addr_prefix_from_string_auto(buf, &family, &dest, &prefixlen);
         if (r < 0)
-                return r;
+                return log_debug_errno(r, "Failed to parse route destination '%s': %m", buf);
 
-        p = strchr(value, ':');
-        if (!p)
-                value = strjoina(value, ":");
+        buf = mfree(buf);
+        r = extract_ip_address(family, &p, &gateway);
+        if (r <= 0)
+                return log_debug_errno(r < 0 ? r : SYNTHETIC_ERRNO(EINVAL), "Failed to parse gateway address in %s=%s: %m", key, value);
 
-        r = parse_ip_address_one(family, &value, &gateway);
-        if (r < 0)
-                return r;
-
-        return network_set_route(context, value, family, prefixlen, &addr, &gateway);
+        return network_set_route(context, strempty(p), family, prefixlen, &dest, &gateway);
 }
 
 static int parse_cmdline_nameserver(Context *context, const char *key, const char *value) {
+        assert(context);
+        assert(key);
+
         if (proc_cmdline_value_missing(key, value))
-                return -EINVAL;
+                return 0;
 
         return network_set_dns(context, "", value);
 }
@@ -792,71 +973,93 @@ static int parse_cmdline_nameserver(Context *context, const char *key, const cha
 static int parse_cmdline_rd_peerdns(Context *context, const char *key, const char *value) {
         int r;
 
-        if (proc_cmdline_value_missing(key, value))
-                return network_set_dhcp_use_dns(context, "", true);
+        assert(context);
+        assert(key);
 
-        r = parse_boolean(value);
+        r = value ? parse_boolean(value) : true;
         if (r < 0)
-                return r;
+                return log_debug_errno(r, "Invalid boolean value '%s'", value);
 
         return network_set_dhcp_use_dns(context, "", r);
 }
 
+static int extract_vlan_id(const char *vlan_name, uint16_t *ret) {
+        assert(!isempty(vlan_name));
+        assert(ret);
+
+        /* From dracut.cmdline(7):
+         * We support the four styles of vlan names:
+         *   VLAN_PLUS_VID (vlan0005),
+         *   VLAN_PLUS_VID_NO_PAD (vlan5),
+         *   DEV_PLUS_VID (eth0.0005), and
+         *   DEV_PLUS_VID_NO_PAD (eth0.5). */
+
+        for (const char *p = vlan_name + strlen(vlan_name) - 1; p > vlan_name; p--)
+                if (!ascii_isdigit(*p))
+                        return parse_vlanid(p+1, ret);
+
+        return -EINVAL;
+}
+
 static int parse_cmdline_vlan(Context *context, const char *key, const char *value) {
-        const char *name, *p;
+        _cleanup_free_ char *name = NULL;
         NetDev *netdev;
         int r;
 
+        assert(context);
+        assert(key);
+
+        /* vlan=<vlanname>:<phydevice> */
+
         if (proc_cmdline_value_missing(key, value))
-                return -EINVAL;
+                return 0;
 
-        p = strchr(value, ':');
-        if (!p)
-                return -EINVAL;
+        const char *p = value;
+        r = extract_first_word(&p, &name, ":", EXTRACT_DONT_COALESCE_SEPARATORS);
+        if (r <= 0)
+                return log_debug_errno(r < 0 ? r : SYNTHETIC_ERRNO(EINVAL), "Failed to parse %s=%s: %m", key, value);
 
-        name = strndupa_safe(value, p - value);
+        r = netdev_acquire(context, "vlan", name, &netdev);
+        if (r < 0)
+                return log_debug_errno(r, "Failed to acquire VLAN device for '%s': %m", name);
 
-        netdev = netdev_get(context, name);
-        if (!netdev) {
-                r = netdev_new(context, "vlan", name, &netdev);
-                if (r < 0)
-                        return r;
-        }
+        r = extract_vlan_id(name, &netdev->vlan_id);
+        if (r < 0)
+                return log_debug_errno(r, "Failed to parse VLAN ID from VLAN device name '%s': %m", name);
 
-        return network_set_vlan(context, p + 1, name);
+        return network_set_vlan(context, p, name);
 }
 
 static int parse_cmdline_bridge(Context *context, const char *key, const char *value) {
-        const char *name, *p;
+        _cleanup_free_ char *name = NULL;
         NetDev *netdev;
         int r;
 
+        assert(context);
+        assert(key);
+
+        /* bridge=<bridgename>:<ethnames> */
+
         if (proc_cmdline_value_missing(key, value))
-                return -EINVAL;
+                return 0;
 
-        p = strchr(value, ':');
-        if (!p)
-                return -EINVAL;
+        const char *p = value;
+        r = extract_first_word(&p, &name, ":", EXTRACT_DONT_COALESCE_SEPARATORS);
+        if (r <= 0)
+                return log_debug_errno(r < 0 ? r : SYNTHETIC_ERRNO(EINVAL), "Failed to parse %s=%s: %m", key, value);
 
-        name = strndupa_safe(value, p - value);
-
-        netdev = netdev_get(context, name);
-        if (!netdev) {
-                r = netdev_new(context, "bridge", name, &netdev);
-                if (r < 0)
-                        return r;
-        }
-
-        p++;
-        if (isempty(p))
-                return -EINVAL;
+        r = netdev_acquire(context, "bridge", name, &netdev);
+        if (r < 0)
+                return log_debug_errno(r, "Failed to acquire bridge device for '%s': %m", name);
 
         for (;;) {
                 _cleanup_free_ char *word = NULL;
 
                 r = extract_first_word(&p, &word, ",", 0);
-                if (r <= 0)
-                        return r;
+                if (r < 0)
+                        return log_debug_errno(r, "Failed to parse slave interfaces for bridge '%s'", name);
+                if (r == 0)
+                        return 0;
 
                 r = network_set_bridge(context, word, name);
                 if (r < 0)
@@ -865,35 +1068,30 @@ static int parse_cmdline_bridge(Context *context, const char *key, const char *v
 }
 
 static int parse_cmdline_bond(Context *context, const char *key, const char *value) {
-        const char *name, *slaves, *p;
+        _cleanup_free_ char *name = NULL, *slaves = NULL, *options = NULL;
         NetDev *netdev;
         int r;
 
+        assert(context);
+        assert(key);
+
+        /* bond=<bondname>[:<bondslaves>:[:<options>[:<mtu>]]] */
+
         if (proc_cmdline_value_missing(key, value))
-                return -EINVAL;
+                return 0;
 
-        p = strchr(value, ':');
-        if (!p)
-                return -EINVAL;
+        const char *p = value;
+        r = extract_first_word(&p, &name, ":", EXTRACT_DONT_COALESCE_SEPARATORS);
+        if (r <= 0)
+                return log_debug_errno(r < 0 ? r : SYNTHETIC_ERRNO(EINVAL), "Failed to parse %s=%s: %m", key, value);
 
-        name = strndupa_safe(value, p - value);
+        r = netdev_acquire(context, "bond", name, &netdev);
+        if (r < 0)
+                return log_debug_errno(r, "Failed to acquire bond device for '%s': %m", name);
 
-        netdev = netdev_get(context, name);
-        if (!netdev) {
-                r = netdev_new(context, "bond", name, &netdev);
-                if (r < 0)
-                        return r;
-        }
-
-        value = p + 1;
-        p = strchr(value, ':');
-        if (!p)
-                slaves = value;
-        else
-                slaves = strndupa_safe(value, p - value);
-
-        if (isempty(slaves))
-                return -EINVAL;
+        r = extract_first_word(&p, &slaves, ":", EXTRACT_DONT_COALESCE_SEPARATORS);
+        if (r < 0)
+                return log_debug_errno(r, "Failed to parse %s=%s: %m", key, value);
 
         for (const char *q = slaves; ; ) {
                 _cleanup_free_ char *word = NULL;
@@ -902,46 +1100,58 @@ static int parse_cmdline_bond(Context *context, const char *key, const char *val
                 if (r == 0)
                         break;
                 if (r < 0)
-                        return r;
+                        return log_debug_errno(r, "Failed to parse slave interfaces for bond '%s'", name);
 
                 r = network_set_bond(context, word, name);
                 if (r < 0)
                         return r;
         }
 
-        if (!p)
-                return 0;
+        r = extract_first_word(&p, &options, ":", EXTRACT_DONT_COALESCE_SEPARATORS);
+        if (r < 0)
+                return log_debug_errno(r, "Failed to parse %s=%s: %m", key, value);
 
-        value = p + 1;
-        p = strchr(value, ':');
-        if (!p)
-                /* TODO: set bonding options */
-                return 0;
+        /* TODO: set bonding options */
 
-        return parse_mtu(AF_UNSPEC, p + 1, &netdev->mtu);
+        if (!isempty(p)) {
+                r = parse_mtu(AF_UNSPEC, p, &netdev->mtu);
+                if (r < 0)
+                        return log_debug_errno(r, "Invalid MTU '%s' for '%s': %m", p, name);
+        }
+
+        return 0;
 }
 
 static int parse_cmdline_ifname(Context *context, const char *key, const char *value) {
+        _cleanup_free_ char *name = NULL;
         struct hw_addr_data mac;
-        const char *name, *p;
         int r;
+
+        assert(context);
+        assert(key);
 
         /* ifname=<interface>:<MAC> */
 
         if (proc_cmdline_value_missing(key, value))
-                return -EINVAL;
+                return 0;
 
-        p = strchr(value, ':');
-        if (!p)
-                return -EINVAL;
+        const char *p = value;
+        r = extract_first_word(&p, &name, ":", EXTRACT_DONT_COALESCE_SEPARATORS);
+        if (r <= 0)
+                return log_debug_errno(r < 0 ? r : SYNTHETIC_ERRNO(EINVAL), "Failed to parse %s=%s: %m", key, value);
 
-        name = strndupa_safe(value, p - value);
+        if (isempty(p))
+                return log_debug_errno(SYNTHETIC_ERRNO(EINVAL), "Missing MAC address for '%s'", name);
 
-        r = parse_hw_addr(p + 1, &mac);
+        r = parse_hw_addr(p, &mac);
         if (r < 0)
-                return r;
+                return log_debug_errno(r, "Invalid MAC address '%s' for '%s'", p, name);
 
-        return link_new(context, name, &mac, NULL);
+        r = link_new(context, name, &mac, NULL);
+        if (r < 0)
+                return log_debug_errno(r, "Failed to create link for '%s': %m", name);
+
+        return 0;
 }
 
 static int parse_cmdline_ifname_policy(Context *context, const char *key, const char *value) {
@@ -950,10 +1160,13 @@ static int parse_cmdline_ifname_policy(Context *context, const char *key, const 
         Link *link;
         int r;
 
-        /* net.ifname-policy=policy1[,policy2,...][,<MAC>] */
+        assert(context);
+        assert(key);
+
+        /* net.ifname_policy=policy1[,policy2,...][,<MAC>] */
 
         if (proc_cmdline_value_missing(key, value))
-                return -EINVAL;
+                return 0;
 
         for (const char *q = value; ; ) {
                 _cleanup_free_ char *word = NULL;
@@ -963,19 +1176,19 @@ static int parse_cmdline_ifname_policy(Context *context, const char *key, const 
                 if (r == 0)
                         break;
                 if (r < 0)
-                        return r;
+                        return log_debug_errno(r, "Failed to parse ifname policy '%s'", value);
 
                 p = name_policy_from_string(word);
                 if (p < 0) {
                         r = parse_hw_addr(word, &mac);
                         if (r < 0)
-                                return r;
+                                return log_debug_errno(r, "Invalid MAC address '%s'", word);
 
                         if (hw_addr_is_null(&mac))
-                                return -EINVAL;
+                                return log_debug_errno(SYNTHETIC_ERRNO(EINVAL), "MAC address is not set");
 
                         if (!isempty(q))
-                                return -EINVAL;
+                                return log_debug_errno(SYNTHETIC_ERRNO(EINVAL), "Unexpected trailing string '%s' in ifname policy '%s'", q, value);
 
                         break;
                 }
@@ -983,20 +1196,20 @@ static int parse_cmdline_ifname_policy(Context *context, const char *key, const 
                 if (alternative_names_policy_from_string(word) >= 0) {
                         r = strv_extend(&alt_policies, word);
                         if (r < 0)
-                                return r;
+                                return log_oom_debug();
                 }
 
                 r = strv_consume(&policies, TAKE_PTR(word));
                 if (r < 0)
-                        return r;
+                        return log_oom_debug();
         }
 
         if (strv_isempty(policies))
-                return -EINVAL;
+                return log_debug_errno(SYNTHETIC_ERRNO(EINVAL), "No ifname policy specified");
 
         r = link_new(context, NULL, &mac, &link);
         if (r < 0)
-                return r;
+                return log_debug_errno(r, "Failed to create link: %m");
 
         link->policies = TAKE_PTR(policies);
         link->alt_policies = TAKE_PTR(alt_policies);
@@ -1008,23 +1221,23 @@ int parse_cmdline_item(const char *key, const char *value, void *data) {
 
         assert(key);
 
-        if (streq(key, "ip"))
+        if (proc_cmdline_key_streq(key, "ip"))
                 return parse_cmdline_ip(context, key, value);
-        if (streq(key, "rd.route"))
+        if (proc_cmdline_key_streq(key, "rd.route"))
                 return parse_cmdline_rd_route(context, key, value);
-        if (streq(key, "nameserver"))
+        if (proc_cmdline_key_streq(key, "nameserver"))
                 return parse_cmdline_nameserver(context, key, value);
-        if (streq(key, "rd.peerdns"))
+        if (proc_cmdline_key_streq(key, "rd.peerdns"))
                 return parse_cmdline_rd_peerdns(context, key, value);
-        if (streq(key, "vlan"))
+        if (proc_cmdline_key_streq(key, "vlan"))
                 return parse_cmdline_vlan(context, key, value);
-        if (streq(key, "bridge"))
+        if (proc_cmdline_key_streq(key, "bridge"))
                 return parse_cmdline_bridge(context, key, value);
-        if (streq(key, "bond"))
+        if (proc_cmdline_key_streq(key, "bond"))
                 return parse_cmdline_bond(context, key, value);
-        if (streq(key, "ifname"))
+        if (proc_cmdline_key_streq(key, "ifname"))
                 return parse_cmdline_ifname(context, key, value);
-        if (streq(key, "net.ifname-policy"))
+        if (proc_cmdline_key_streq(key, "net.ifname_policy"))
                 return parse_cmdline_ifname_policy(context, key, value);
 
         return 0;
@@ -1056,12 +1269,12 @@ int context_merge_networks(Context *context) {
 
                 r = strv_extend_strv(&network->dns, all->dns, false);
                 if (r < 0)
-                        return r;
+                        return log_oom_debug();
 
                 LIST_FOREACH(routes, route, all->routes) {
                         r = route_new(network, route->family, route->prefixlen, &route->dest, &route->gateway, NULL);
                         if (r < 0)
-                                return r;
+                                return log_debug_errno(r, "Failed to copy route: %m");
                 }
         }
 
@@ -1074,12 +1287,15 @@ void context_clear(Context *context) {
         if (!context)
                 return;
 
-        hashmap_free_with_destructor(context->networks_by_name, network_free);
-        hashmap_free_with_destructor(context->netdevs_by_name, netdev_free);
-        hashmap_free_with_destructor(context->links_by_filename, link_free);
+        hashmap_free(context->networks_by_name);
+        hashmap_free(context->netdevs_by_name);
+        hashmap_free(context->links_by_filename);
 }
 
 static int address_dump(Address *address, FILE *f) {
+        assert(address);
+        assert(f);
+
         fprintf(f,
                 "\n[Address]\n"
                 "Address=%s\n",
@@ -1091,12 +1307,16 @@ static int address_dump(Address *address, FILE *f) {
 }
 
 static int route_dump(Route *route, FILE *f) {
+        assert(route);
+        assert(f);
+
         fputs("\n[Route]\n", f);
         if (in_addr_is_set(route->family, &route->dest))
                 fprintf(f, "Destination=%s\n",
                         IN_ADDR_PREFIX_TO_STRING(route->family, &route->dest, route->prefixlen));
-        fprintf(f, "Gateway=%s\n",
-                IN_ADDR_TO_STRING(route->family, &route->gateway));
+        if (in_addr_is_set(route->family, &route->gateway))
+                fprintf(f, "Gateway=%s\n",
+                        IN_ADDR_TO_STRING(route->family, &route->gateway));
 
         return 0;
 }
@@ -1107,10 +1327,15 @@ void network_dump(Network *network, FILE *f) {
         assert(network);
         assert(f);
 
-        fprintf(f,
-                "[Match]\n"
-                "Name=%s\n",
-                isempty(network->ifname) ? "*" : network->ifname);
+        fputs("[Match]\n", f);
+
+        if (isempty(network->ifname))
+                /* If the interface name is not specified, then let's make the .network file match the all
+                 * physical interfaces. */
+                fputs("Kind=!*\n"
+                      "Type=!loopback\n", f);
+        else
+                fprintf(f, "Name=%s\n", network->ifname);
 
         fputs("\n[Link]\n", f);
 
@@ -1125,12 +1350,22 @@ void network_dump(Network *network, FILE *f) {
         if (dhcp)
                 fprintf(f, "DHCP=%s\n", dhcp);
 
+        const char *ll;
+        ll = networkd_link_local_type_to_string(network->dhcp_type);
+        if (ll)
+                fprintf(f, "LinkLocalAddressing=%s\n", ll);
+
+        const char *ra;
+        ra = networkd_ipv6ra_type_to_string(network->dhcp_type);
+        if (ra)
+                fprintf(f, "IPv6AcceptRA=%s\n", ra);
+
         if (!strv_isempty(network->dns))
                 STRV_FOREACH(dns, network->dns)
                         fprintf(f, "DNS=%s\n", *dns);
 
-        if (network->vlan)
-                fprintf(f, "VLAN=%s\n", network->vlan);
+        STRV_FOREACH(v, network->vlan)
+                fprintf(f, "VLAN=%s\n", *v);
 
         if (network->bridge)
                 fprintf(f, "Bridge=%s\n", network->bridge);
@@ -1166,6 +1401,13 @@ void netdev_dump(NetDev *netdev, FILE *f) {
 
         if (netdev->mtu > 0)
                 fprintf(f, "MTUBytes=%" PRIu32 "\n", netdev->mtu);
+
+        if (streq(netdev->kind, "vlan")) {
+                fprintf(f,
+                        "\n[VLAN]\n"
+                        "Id=%u\n",
+                        netdev->vlan_id);
+        }
 }
 
 void link_dump(Link *link, FILE *f) {
@@ -1198,94 +1440,49 @@ void link_dump(Link *link, FILE *f) {
 }
 
 int network_format(Network *network, char **ret) {
-        _cleanup_free_ char *s = NULL;
-        size_t sz = 0;
-        int r;
+        _cleanup_(memstream_done) MemStream m = {};
+        FILE *f;
 
         assert(network);
         assert(ret);
 
-        {
-                _cleanup_fclose_ FILE *f = NULL;
+        f = memstream_init(&m);
+        if (!f)
+                return log_oom_debug();
 
-                f = open_memstream_unlocked(&s, &sz);
-                if (!f)
-                        return -ENOMEM;
+        network_dump(network, f);
 
-                network_dump(network, f);
-
-                /* Add terminating 0, so that the output buffer is a valid string. */
-                fputc('\0', f);
-
-                r = fflush_and_check(f);
-        }
-        if (r < 0)
-                return r;
-
-        assert(s);
-        *ret = TAKE_PTR(s);
-        assert(sz > 0);
-        return (int) sz - 1;
+        return memstream_finalize(&m, ret, NULL);
 }
 
 int netdev_format(NetDev *netdev, char **ret) {
-        _cleanup_free_ char *s = NULL;
-        size_t sz = 0;
-        int r;
+        _cleanup_(memstream_done) MemStream m = {};
+        FILE *f;
 
         assert(netdev);
         assert(ret);
 
-        {
-                _cleanup_fclose_ FILE *f = NULL;
+        f = memstream_init(&m);
+        if (!f)
+                return log_oom_debug();
 
-                f = open_memstream_unlocked(&s, &sz);
-                if (!f)
-                        return -ENOMEM;
+        netdev_dump(netdev, f);
 
-                netdev_dump(netdev, f);
-
-                /* Add terminating 0, so that the output buffer is a valid string. */
-                fputc('\0', f);
-
-                r = fflush_and_check(f);
-        }
-        if (r < 0)
-                return r;
-
-        assert(s);
-        *ret = TAKE_PTR(s);
-        assert(sz > 0);
-        return (int) sz - 1;
+        return memstream_finalize(&m, ret, NULL);
 }
 
 int link_format(Link *link, char **ret) {
-        _cleanup_free_ char *s = NULL;
-        size_t sz = 0;
-        int r;
+        _cleanup_(memstream_done) MemStream m = {};
+        FILE *f;
 
         assert(link);
         assert(ret);
 
-        {
-                _cleanup_fclose_ FILE *f = NULL;
+        f = memstream_init(&m);
+        if (!f)
+                return log_oom_debug();
 
-                f = open_memstream_unlocked(&s, &sz);
-                if (!f)
-                        return -ENOMEM;
+        link_dump(link, f);
 
-                link_dump(link, f);
-
-                /* Add terminating 0, so that the output buffer is a valid string. */
-                fputc('\0', f);
-
-                r = fflush_and_check(f);
-        }
-        if (r < 0)
-                return r;
-
-        assert(s);
-        *ret = TAKE_PTR(s);
-        assert(sz > 0);
-        return (int) sz - 1;
+        return memstream_finalize(&m, ret, NULL);
 }

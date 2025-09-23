@@ -1,7 +1,10 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
+#include <stdio.h>
+
 #include "sd-path.h"
 
+#include "alloc-util.h"
 #include "conf-files.h"
 #include "constants.h"
 #include "env-file.h"
@@ -9,7 +12,7 @@
 #include "glyph-util.h"
 #include "log.h"
 #include "main-func.h"
-#include "path-lookup.h"
+#include "string-util.h"
 #include "strv.h"
 
 static int environment_dirs(char ***ret) {
@@ -17,7 +20,7 @@ static int environment_dirs(char ***ret) {
         _cleanup_free_ char *c = NULL;
         int r;
 
-        dirs = strv_new(CONF_PATHS_USR("environment.d"), NULL);
+        dirs = strv_new(CONF_PATHS("environment.d"));
         if (!dirs)
                 return -ENOMEM;
 
@@ -26,7 +29,7 @@ static int environment_dirs(char ***ret) {
         if (r < 0)
                 return r;
 
-        r = strv_extend_front(&dirs, c);
+        r = strv_consume_prepend(&dirs, TAKE_PTR(c));
         if (r < 0)
                 return r;
 
@@ -57,7 +60,7 @@ static int load_and_print(void) {
          * that in case of failure, a partial update is better than none. */
 
         STRV_FOREACH(i, files) {
-                log_debug("Reading %s%s", *i, special_glyph(SPECIAL_GLYPH_ELLIPSIS));
+                log_debug("Reading %s%s", *i, glyph(GLYPH_ELLIPSIS));
 
                 r = merge_env_file(&env, NULL, *i);
                 if (r == -ENOMEM)
@@ -84,8 +87,7 @@ static int load_and_print(void) {
 static int run(int argc, char *argv[]) {
         int r;
 
-        log_parse_environment();
-        log_open();
+        log_setup();
 
         if (argc > 1)
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "This program takes no arguments.");

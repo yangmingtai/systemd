@@ -1,18 +1,24 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <net/if_arp.h>
 #include <linux/nl80211.h>
+#include <net/if_arp.h>
 
+#include "sd-netlink.h"
+
+#include "alloc-util.h"
 #include "device-private.h"
 #include "device-util.h"
+#include "errno-util.h"
+#include "hashmap.h"
+#include "networkd-link.h"
 #include "networkd-manager.h"
 #include "networkd-wiphy.h"
-#include "parse-util.h"
 #include "path-util.h"
+#include "string-util.h"
 #include "udev-util.h"
 #include "wifi-util.h"
 
-Wiphy *wiphy_free(Wiphy *w) {
+static Wiphy* wiphy_free(Wiphy *w) {
         if (!w)
                 return NULL;
 
@@ -28,6 +34,13 @@ Wiphy *wiphy_free(Wiphy *w) {
         free(w->name);
         return mfree(w);
 }
+
+DEFINE_TRIVIAL_CLEANUP_FUNC(Wiphy*, wiphy_free);
+
+DEFINE_PRIVATE_HASH_OPS_WITH_VALUE_DESTRUCTOR(
+                wiphy_hash_ops,
+                void, trivial_hash_func, trivial_compare_func,
+                Wiphy, wiphy_free);
 
 static int wiphy_new(Manager *manager, sd_netlink_message *message, Wiphy **ret) {
         _cleanup_(wiphy_freep) Wiphy *w = NULL;
@@ -56,7 +69,7 @@ static int wiphy_new(Manager *manager, sd_netlink_message *message, Wiphy **ret)
                 .name = TAKE_PTR(name),
         };
 
-        r = hashmap_ensure_put(&manager->wiphy_by_index, NULL, UINT32_TO_PTR(w->index), w);
+        r = hashmap_ensure_put(&manager->wiphy_by_index, &wiphy_hash_ops, UINT32_TO_PTR(w->index), w);
         if (r < 0)
                 return r;
 
@@ -118,11 +131,10 @@ static int link_get_wiphy(Link *link, Wiphy **ret) {
         if (!link->dev)
                 return -ENODEV;
 
-        r = sd_device_get_devtype(link->dev, &s);
+        r = device_is_devtype(link->dev, "wlan");
         if (r < 0)
                 return r;
-
-        if (!streq_ptr(s, "wlan"))
+        if (r == 0)
                 return -EOPNOTSUPP;
 
         r = sd_device_new_child(&phy, link->dev, "phy80211");
@@ -214,11 +226,10 @@ int link_rfkilled(Link *link) {
         assert(link);
 
         r = link_get_wiphy(link, &w);
-        if (r < 0) {
-                if (ERRNO_IS_NOT_SUPPORTED(r) || ERRNO_IS_DEVICE_ABSENT(r))
-                        return false; /* Typically, non-wifi interface or running in container */
+        if (ERRNO_IS_NEG_NOT_SUPPORTED(r) || ERRNO_IS_NEG_DEVICE_ABSENT(r))
+                return false; /* Typically, non-wifi interface or running in container */
+        if (r < 0)
                 return log_link_debug_errno(link, r, "Could not get phy: %m");
-        }
 
         return wiphy_rfkilled(w);
 }
@@ -339,20 +350,16 @@ static int wiphy_update(Wiphy *w) {
         assert(w);
 
         r = wiphy_update_device(w);
-        if (r < 0) {
-                if (ERRNO_IS_DEVICE_ABSENT(r))
-                        log_wiphy_debug_errno(w, r, "Failed to update wiphy device, ignoring: %m");
-                else
-                        return log_wiphy_warning_errno(w, r, "Failed to update wiphy device: %m");
-        }
+        if (ERRNO_IS_NEG_DEVICE_ABSENT(r))
+                log_wiphy_debug_errno(w, r, "Failed to update wiphy device, ignoring: %m");
+        else if (r < 0)
+                return log_wiphy_warning_errno(w, r, "Failed to update wiphy device: %m");
 
         r = wiphy_update_rfkill(w);
-        if (r < 0) {
-                if (ERRNO_IS_DEVICE_ABSENT(r))
-                        log_wiphy_debug_errno(w, r, "Failed to update rfkill device, ignoring: %m");
-                else
-                        return log_wiphy_warning_errno(w, r, "Failed to update rfkill device: %m");
-        }
+        if (ERRNO_IS_NEG_DEVICE_ABSENT(r))
+                log_wiphy_debug_errno(w, r, "Failed to update rfkill device, ignoring: %m");
+        else if (r < 0)
+                return log_wiphy_warning_errno(w, r, "Failed to update rfkill device: %m");
 
         return 0;
 }

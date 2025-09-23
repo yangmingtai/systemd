@@ -1,16 +1,13 @@
 # SPDX-License-Identifier: LGPL-2.1-or-later
 
+if conf.get('ENABLE_LOGIND') != 1
+        subdir_done()
+endif
+
 systemd_logind_sources = files(
         'logind.c',
 )
-
-logind_gperf_c = custom_target(
-        'logind_gperf.c',
-        input : 'logind-gperf.gperf',
-        output : 'logind-gperf.c',
-        command : [gperf, '@INPUT@', '--output-file', '@OUTPUT@'])
-
-liblogind_core_sources = files(
+systemd_logind_extract_sources = files(
         'logind-action.c',
         'logind-brightness.c',
         'logind-button.c',
@@ -27,76 +24,111 @@ liblogind_core_sources = files(
         'logind-user-dbus.c',
         'logind-user.c',
         'logind-utmp.c',
+        'logind-varlink.c',
+        'logind-wall.c',
 )
 
-liblogind_core_sources += [logind_gperf_c]
+logind_gperf_c = custom_target(
+        input : 'logind-gperf.gperf',
+        output : 'logind-gperf.c',
+        command : [gperf, '@INPUT@', '--output-file', '@OUTPUT@'])
 
-liblogind_core = static_library(
-        'logind-core',
-        liblogind_core_sources,
-        include_directories : includes,
-        dependencies : [libacl,
-                        userspace],
-        build_by_default : false)
+generated_sources += logind_gperf_c
+systemd_logind_extract_sources += [logind_gperf_c]
 
 loginctl_sources = files(
         'loginctl.c',
         'sysfs-show.c',
 )
 
-user_runtime_dir_sources = files('user-runtime-dir.c')
-
-pam_systemd_sym = 'src/login/pam_systemd.sym'
-pam_systemd_c = files('pam_systemd.c')
-
-enable_logind = conf.get('ENABLE_LOGIND') == 1
-
-custom_target(
-        'logind.conf',
-        input : 'logind.conf.in',
-        output : 'logind.conf',
-        command : [jinja2_cmdline, '@INPUT@', '@OUTPUT@'],
-        install : enable_logind and install_sysconfdir_samples and pkgsysconfdir != 'no',
-        install_dir : pkgsysconfdir)
-
-custom_target(
-        'systemd-user',
-        input : 'systemd-user.in',
-        output : 'systemd-user',
-        command : [jinja2_cmdline, '@INPUT@', '@OUTPUT@'],
-        install : enable_logind and pamconfdir != 'no',
-        install_dir : pamconfdir)
-
-if enable_logind
-        install_data('org.freedesktop.login1.conf',
-                     install_dir : dbuspolicydir)
-        install_data('org.freedesktop.login1.service',
-                     install_dir : dbussystemservicedir)
-        install_data('org.freedesktop.login1.policy',
-                     install_dir : polkitpolicydir)
-endif
-
-############################################################
+executables += [
+        libexec_template + {
+                'name' : 'systemd-logind',
+                'dbus' : true,
+                'sources' : systemd_logind_sources + systemd_logind_extract_sources,
+                'include_directories' : [libexec_template['include_directories'], include_directories('.')],
+                'extract' : systemd_logind_extract_sources,
+                'dependencies' : [
+                        threads,
+                ],
+        },
+        executable_template + {
+                'name' : 'loginctl',
+                'public' : true,
+                'sources' : loginctl_sources,
+                'dependencies' : [
+                        liblz4_cflags,
+                        libxz_cflags,
+                        libzstd_cflags,
+                        threads,
+                ],
+        },
+        executable_template + {
+                'name' : 'systemd-inhibit',
+                'public' : true,
+                'sources' : files('inhibit.c'),
+        },
+        libexec_template + {
+                'name' : 'systemd-user-runtime-dir',
+                'sources' : files('user-runtime-dir.c'),
+        },
+        test_template + {
+                'sources' : files('test-inhibit.c'),
+                'type' : 'manual',
+        },
+        test_template + {
+                'sources' : files('test-login-tables.c'),
+                'objects' : ['systemd-logind'],
+                'dependencies' : threads,
+        },
+        test_template + {
+                'sources' : files('test-session-properties.c'),
+                'type' : 'manual',
+        },
+]
 
 simple_tests += files(
         'test-login-shared.c'
 )
 
-tests += [
-        {
-                'sources' : files('test-inhibit.c'),
-                'type' : 'manual',
+modules += [
+        pam_template + {
+                'name' : 'pam_systemd',
+                'conditions' : ['HAVE_PAM'],
+                'sources' : files('pam_systemd.c'),
+                'version-script' : meson.current_source_dir() / 'pam_systemd.sym',
         },
-        {
-                'sources' : files('test-login-tables.c'),
-                'link_with' : [
-                        liblogind_core,
-                        libshared,
-                ],
-                'dependencies' : threads,
-        },
-        {
-                'sources' : files('test-session-properties.c'),
-                'type' : 'manual',
+        pam_template + {
+                'name' : 'pam_systemd_loadkey',
+                'conditions' : ['HAVE_PAM'],
+                'sources' : files('pam_systemd_loadkey.c'),
+                'version-script' : meson.current_source_dir() / 'pam_systemd_loadkey.sym',
         },
 ]
+
+custom_target(
+        input : 'logind.conf.in',
+        output : 'logind.conf',
+        command : [jinja2_cmdline, '@INPUT@', '@OUTPUT@'],
+        install : install_sysconfdir_samples and pkgsysconfdir != 'no',
+        install_dir : pkgconfigfiledir)
+
+custom_target(
+        input : 'systemd-user.in',
+        output : 'systemd-user',
+        command : [jinja2_cmdline, '@INPUT@', '@OUTPUT@'],
+        install : pamconfdir != 'no',
+        install_dir : pamconfdir)
+
+install_data(
+        'org.freedesktop.login1.conf',
+        install_dir : dbuspolicydir)
+install_data(
+        'org.freedesktop.login1.service',
+        install_dir : dbussystemservicedir)
+install_data(
+        'org.freedesktop.login1.policy',
+        install_dir : polkitpolicydir)
+install_data(
+        '10-systemd-logind-root-ignore-inhibitors.rules.example',
+        install_dir : polkitrulesdir)

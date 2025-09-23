@@ -1,17 +1,21 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <netinet/in.h>
+#include <linux/if_arp.h>
 #include <linux/l2tp.h>
-#include <linux/genetlink.h>
 
+#include "sd-netlink.h"
+
+#include "alloc-util.h"
 #include "conf-parser.h"
+#include "extract-word.h"
 #include "hashmap.h"
 #include "l2tp-tunnel.h"
 #include "netlink-util.h"
 #include "networkd-address.h"
+#include "networkd-link.h"
 #include "networkd-manager.h"
 #include "networkd-route-util.h"
-#include "parse-util.h"
+#include "set.h"
 #include "socket-util.h"
 #include "string-table.h"
 #include "string-util.h"
@@ -29,7 +33,7 @@ static const char* const l2tp_encap_type_table[_NETDEV_L2TP_ENCAPTYPE_MAX] = {
 };
 
 DEFINE_PRIVATE_STRING_TABLE_LOOKUP_FROM_STRING(l2tp_encap_type, L2tpEncapType);
-DEFINE_CONFIG_PARSE_ENUM(config_parse_l2tp_encap_type, l2tp_encap_type, L2tpEncapType, "Failed to parse L2TP Encapsulation Type");
+DEFINE_CONFIG_PARSE_ENUM(config_parse_l2tp_encap_type, l2tp_encap_type, L2tpEncapType);
 
 static const char* const l2tp_local_address_type_table[_NETDEV_L2TP_LOCAL_ADDRESS_MAX] = {
          [NETDEV_L2TP_LOCAL_ADDRESS_AUTO]    = "auto",
@@ -52,6 +56,11 @@ static L2tpSession* l2tp_session_free(L2tpSession *s) {
 }
 
 DEFINE_SECTION_CLEANUP_FUNCTIONS(L2tpSession, l2tp_session_free);
+
+DEFINE_PRIVATE_HASH_OPS_WITH_VALUE_DESTRUCTOR(
+                l2tp_session_hash_ops_by_section,
+                ConfigSection, config_section_hash_func, config_section_compare_func,
+                L2tpSession, l2tp_session_free);
 
 static int l2tp_session_new_static(L2tpTunnel *t, const char *filename, unsigned section_line, L2tpSession **ret) {
         _cleanup_(config_section_freep) ConfigSection *n = NULL;
@@ -83,7 +92,7 @@ static int l2tp_session_new_static(L2tpTunnel *t, const char *filename, unsigned
                 .section = TAKE_PTR(n),
         };
 
-        r = ordered_hashmap_ensure_put(&t->sessions_by_section, &config_section_hash_ops, s->section, s);
+        r = ordered_hashmap_ensure_put(&t->sessions_by_section, &l2tp_session_hash_ops_by_section, s->section, s);
         if (r < 0)
                 return r;
 
@@ -92,14 +101,14 @@ static int l2tp_session_new_static(L2tpTunnel *t, const char *filename, unsigned
 }
 
 static int netdev_l2tp_create_message_tunnel(NetDev *netdev, union in_addr_union *local_address, sd_netlink_message **ret) {
+        assert(local_address);
+        assert(netdev);
+        assert(netdev->manager);
+
         _cleanup_(sd_netlink_message_unrefp) sd_netlink_message *m = NULL;
         uint16_t encap_type;
-        L2tpTunnel *t;
+        L2tpTunnel *t = L2TP(netdev);
         int r;
-
-        assert(netdev);
-        assert(local_address);
-        assert_se(t = L2TP(netdev));
 
         r = sd_genl_message_new(netdev->manager->genl, L2TP_GENL_NAME, L2TP_CMD_TUNNEL_CREATE, &m);
         if (r < 0)
@@ -124,7 +133,6 @@ static int netdev_l2tp_create_message_tunnel(NetDev *netdev, union in_addr_union
         case NETDEV_L2TP_ENCAPTYPE_UDP:
         default:
                 encap_type = L2TP_ENCAPTYPE_UDP;
-                break;
         }
 
         r = sd_netlink_message_append_u16(m, L2TP_ATTR_ENCAP_TYPE, encap_type);
@@ -189,6 +197,7 @@ static int netdev_l2tp_create_message_session(NetDev *netdev, L2tpSession *sessi
         int r;
 
         assert(netdev);
+        assert(netdev->manager);
         assert(session);
         assert(session->tunnel);
 
@@ -225,7 +234,6 @@ static int netdev_l2tp_create_message_session(NetDev *netdev, L2tpSession *sessi
         default:
                 l2_spec_type = L2TP_L2SPECTYPE_DEFAULT;
                 l2_spec_len = 4;
-                break;
         }
 
         r = sd_netlink_message_append_u8(m, L2TP_ATTR_L2SPEC_TYPE, l2_spec_type);
@@ -278,13 +286,11 @@ static int link_get_l2tp_local_address(Link *link, L2tpTunnel *t, union in_addr_
 
 static int l2tp_get_local_address(NetDev *netdev, union in_addr_union *ret) {
         Link *link = NULL;
-        L2tpTunnel *t;
+        L2tpTunnel *t = L2TP(netdev);
         Address *a = NULL;
         int r;
 
-        assert(netdev);
         assert(netdev->manager);
-        assert_se(t = L2TP(netdev));
 
         if (t->local_ifname) {
                 r = link_get_by_name(netdev->manager, t->local_ifname, &link);
@@ -310,9 +316,9 @@ static int l2tp_get_local_address(NetDev *netdev, union in_addr_union *ret) {
 
                 if (!a) {
                         if (link)
-                                r = link_get_address(link, t->family, &t->local, 0, &a);
+                                r = link_get_address(link, t->family, &t->local, &a);
                         else
-                                r = manager_get_address(netdev->manager, t->family, &t->local, 0, &a);
+                                r = manager_get_address(netdev->manager, t->family, &t->local, &a);
                         if (r < 0)
                                 return r;
 
@@ -388,6 +394,11 @@ static int l2tp_create_session(NetDev *netdev, L2tpSession *session) {
         _cleanup_(sd_netlink_message_unrefp) sd_netlink_message *n = NULL;
         int r;
 
+        assert(netdev);
+
+        if (!netdev_is_managed(netdev))
+                return 0; /* Already detached, due to e.g. reloading .netdev files. */
+
         r = netdev_l2tp_create_message_session(netdev, session, &n);
         if (r < 0)
                 return log_netdev_error_errno(netdev, r, "Failed to create netlink message: %m");
@@ -403,15 +414,10 @@ static int l2tp_create_session(NetDev *netdev, L2tpSession *session) {
 
 static int l2tp_create_tunnel_handler(sd_netlink *rtnl, sd_netlink_message *m, NetDev *netdev) {
         L2tpSession *session;
-        L2tpTunnel *t;
+        L2tpTunnel *t = L2TP(netdev);
         int r;
 
-        assert(netdev);
         assert(netdev->state != _NETDEV_STATE_INVALID);
-
-        t = L2TP(netdev);
-
-        assert(t);
 
         r = sd_netlink_message_get_errno(m);
         if (r == -EEXIST)
@@ -434,11 +440,11 @@ static int l2tp_create_tunnel_handler(sd_netlink *rtnl, sd_netlink_message *m, N
 static int l2tp_create_tunnel(NetDev *netdev) {
         _cleanup_(sd_netlink_message_unrefp) sd_netlink_message *m = NULL;
         union in_addr_union local_address;
-        L2tpTunnel *t;
+        L2tpTunnel *t = L2TP(netdev);
         int r;
 
-        assert(netdev);
-        assert_se(t = L2TP(netdev));
+        if (!netdev_is_managed(netdev))
+                return 0; /* Already detached, due to e.g. reloading .netdev files. */
 
         r = l2tp_get_local_address(netdev, &local_address);
         if (r < 0)
@@ -626,30 +632,16 @@ int config_parse_l2tp_tunnel_id(
                 void *data,
                 void *userdata) {
 
-        uint32_t *id = data, k;
-        int r;
-
         assert(filename);
         assert(lvalue);
         assert(rvalue);
-        assert(data);
 
-        r = safe_atou32(rvalue, &k);
-        if (r < 0) {
-                log_syntax(unit, LOG_WARNING, filename, line, r,
-                           "Failed to parse L2TP tunnel id. Ignoring assignment: %s", rvalue);
-                return 0;
-        }
+        uint32_t *id = ASSERT_PTR(data);
 
-        if (k == 0) {
-                log_syntax(unit, LOG_WARNING, filename, line, 0,
-                           "Invalid L2TP tunnel id. Ignoring assignment: %s", rvalue);
-                return 0;
-        }
-
-        *id = k;
-
-        return 0;
+        return config_parse_uint32_bounded(
+                        unit, filename, line, section, section_line, lvalue, rvalue,
+                        1, UINT32_MAX, true,
+                        id);
 }
 
 int config_parse_l2tp_session_id(
@@ -664,40 +656,29 @@ int config_parse_l2tp_session_id(
                 void *data,
                 void *userdata) {
 
-        _cleanup_(l2tp_session_free_or_set_invalidp) L2tpSession *session = NULL;
-        L2tpTunnel *t = userdata;
-        uint32_t k;
-        int r;
-
         assert(filename);
         assert(section);
         assert(lvalue);
         assert(rvalue);
         assert(data);
 
+        L2tpTunnel *t = ASSERT_PTR(userdata);
+        _cleanup_(l2tp_session_free_or_set_invalidp) L2tpSession *session = NULL;
+        int r;
+
         r = l2tp_session_new_static(t, filename, section_line, &session);
         if (r < 0)
                 return log_oom();
 
-        r = safe_atou32(rvalue, &k);
-        if (r < 0) {
-                log_syntax(unit, LOG_WARNING, filename, line, r,
-                           "Failed to parse L2TP session id. Ignoring assignment: %s", rvalue);
-                return 0;
-        }
+        uint32_t *id = streq(lvalue, "SessionId") ? &session->session_id : &session->peer_session_id;
 
-        if (k == 0) {
-                log_syntax(unit, LOG_WARNING, filename, line, 0,
-                           "Invalid L2TP session id. Ignoring assignment: %s", rvalue);
-                return 0;
-        }
-
-        if (streq(lvalue, "SessionId"))
-                session->session_id = k;
-        else
-                session->peer_session_id = k;
-
-        session = NULL;
+        r = config_parse_uint32_bounded(
+                        unit, filename, line, section, section_line, lvalue, rvalue,
+                        1, UINT32_MAX, true,
+                        id);
+        if (r <= 0)
+                return r;
+        TAKE_PTR(session);
         return 0;
 }
 
@@ -782,88 +763,156 @@ int config_parse_l2tp_session_name(
 }
 
 static void l2tp_tunnel_init(NetDev *netdev) {
-        L2tpTunnel *t;
-
-        assert(netdev);
-
-        t = L2TP(netdev);
-
-        assert(t);
+        L2tpTunnel *t = L2TP(netdev);
 
         t->l2tp_encap_type = NETDEV_L2TP_ENCAPTYPE_UDP;
         t->udp6_csum_rx = true;
         t->udp6_csum_tx = true;
 }
 
-static int l2tp_session_verify(L2tpSession *session) {
-        NetDev *netdev;
+#define log_session(session, fmt, ...)                                  \
+        ({                                                              \
+                const L2tpSession *_session = (session);                \
+                log_section_warning_errno(                              \
+                                _session ? _session->section : NULL,    \
+                                SYNTHETIC_ERRNO(EINVAL),                \
+                                fmt " Ignoring [L2TPSession] section.", \
+                                ##__VA_ARGS__);                         \
+        })
+
+static int l2tp_session_verify(L2tpSession *session, Set **names) {
+        int r;
 
         assert(session);
         assert(session->tunnel);
-
-        netdev = NETDEV(session->tunnel);
+        assert(names);
 
         if (section_is_invalid(session->section))
                 return -EINVAL;
 
         if (!session->name)
-                return log_netdev_error_errno(netdev, SYNTHETIC_ERRNO(EINVAL),
-                                              "%s: L2TP session without name configured. "
-                                              "Ignoring [L2TPSession] section from line %u",
-                                              session->section->filename, session->section->line);
+                return log_session(session, "L2TP session without name configured.");
 
         if (session->session_id == 0 || session->peer_session_id == 0)
-                return log_netdev_error_errno(netdev, SYNTHETIC_ERRNO(EINVAL),
-                                              "%s: L2TP session without session IDs configured. "
-                                              "Ignoring [L2TPSession] section from line %u",
-                                              session->section->filename, session->section->line);
+                return log_session(session, "L2TP session without session IDs configured.");
+
+        if (streq(session->name, NETDEV(session->tunnel)->ifname))
+                return log_session(session, "L2TP session name %s cannot be the same as the netdev name.", session->name);
+
+        r = set_ensure_put(names, &string_hash_ops, session->name);
+        if (r < 0)
+                return log_oom();
+        if (r == 0)
+                return log_session(session, "L2TP session name %s is duplicated.", session->name);
 
         return 0;
 }
 
 static int netdev_l2tp_tunnel_verify(NetDev *netdev, const char *filename) {
-        L2tpTunnel *t;
-        L2tpSession *session;
-
-        assert(netdev);
         assert(filename);
 
-        t = L2TP(netdev);
-
-        assert(t);
+        L2tpTunnel *t = L2TP(netdev);
+        L2tpSession *session;
 
         if (!IN_SET(t->family, AF_INET, AF_INET6))
-                return log_netdev_error_errno(netdev, SYNTHETIC_ERRNO(EINVAL),
-                                              "%s: L2TP tunnel with invalid address family configured. Ignoring",
-                                              filename);
+                return log_netdev_warning_errno(netdev, SYNTHETIC_ERRNO(EINVAL),
+                                                "%s: L2TP tunnel with invalid address family configured. Ignoring",
+                                                filename);
 
         if (!in_addr_is_set(t->family, &t->remote))
-                return log_netdev_error_errno(netdev, SYNTHETIC_ERRNO(EINVAL),
-                                              "%s: L2TP tunnel without a remote address configured. Ignoring",
-                                              filename);
+                return log_netdev_warning_errno(netdev, SYNTHETIC_ERRNO(EINVAL),
+                                                "%s: L2TP tunnel without a remote address configured. Ignoring",
+                                                filename);
 
         if (t->tunnel_id == 0 || t->peer_tunnel_id == 0)
-                return log_netdev_error_errno(netdev, SYNTHETIC_ERRNO(EINVAL),
-                                              "%s: L2TP tunnel without tunnel IDs configured. Ignoring",
-                                              filename);
+                return log_netdev_warning_errno(netdev, SYNTHETIC_ERRNO(EINVAL),
+                                                "%s: L2TP tunnel without tunnel IDs configured. Ignoring",
+                                                filename);
 
+        _cleanup_set_free_ Set *names = NULL;
         ORDERED_HASHMAP_FOREACH(session, t->sessions_by_section)
-                if (l2tp_session_verify(session) < 0)
+                if (l2tp_session_verify(session, &names) < 0)
                         l2tp_session_free(session);
 
         return 0;
 }
 
+static int netdev_l2tp_tunnel_attach(NetDev *netdev) {
+        L2tpTunnel *t = L2TP(netdev);
+        L2tpSession *session;
+        int r;
+
+        ORDERED_HASHMAP_FOREACH(session, t->sessions_by_section) {
+                assert(session->name);
+
+                r = netdev_attach_name(netdev, session->name);
+                if (r < 0)
+                        return r;
+        }
+
+        return 0;
+}
+
+static void netdev_l2tp_tunnel_detach(NetDev *netdev) {
+        L2tpTunnel *t = L2TP(netdev);
+        L2tpSession *session;
+
+        ORDERED_HASHMAP_FOREACH(session, t->sessions_by_section)
+                netdev_detach_name(netdev, session->name);
+}
+
+static int netdev_l2tp_tunnel_set_ifindex(NetDev *netdev, const char *name, int ifindex) {
+        L2tpTunnel *t = L2TP(netdev);
+        L2tpSession *session;
+        bool found = false;
+
+        assert(name);
+        assert(ifindex > 0);
+
+        ORDERED_HASHMAP_FOREACH(session, t->sessions_by_section)
+                if (streq(session->name, name)) {
+                        if (session->ifindex == ifindex)
+                                return 0; /* already set. */
+                        if (session->ifindex > 0 && session->ifindex != ifindex)
+                                return log_netdev_warning_errno(netdev, SYNTHETIC_ERRNO(EEXIST),
+                                                                "Could not set ifindex %i for session %s, already set to %i.",
+                                                                ifindex, session->name, session->ifindex);
+
+                        session->ifindex = ifindex;
+                        log_netdev_debug(netdev, "Session %s gained ifindex %i.", session->name, session->ifindex);
+                        found = true;
+                        break;
+                }
+
+        if (!found)
+                return log_netdev_warning_errno(netdev, SYNTHETIC_ERRNO(EINVAL),
+                                                "Received netlink message with unexpected interface name %s (ifindex=%i).",
+                                                name, ifindex);
+
+        ORDERED_HASHMAP_FOREACH(session, t->sessions_by_section)
+                if (session->ifindex <= 0)
+                        return 0; /* This session is not ready yet. */
+
+        return netdev_enter_ready(netdev);
+}
+
+static int netdev_l2tp_tunnel_get_ifindex(NetDev *netdev, const char *name) {
+        L2tpTunnel *t = L2TP(netdev);
+        L2tpSession *session;
+
+        assert(name);
+
+        ORDERED_HASHMAP_FOREACH(session, t->sessions_by_section)
+                if (streq(session->name, name))
+                        return session->ifindex;
+
+        return -ENODEV;
+}
+
 static void l2tp_tunnel_done(NetDev *netdev) {
-        L2tpTunnel *t;
+        L2tpTunnel *t = L2TP(netdev);
 
-        assert(netdev);
-
-        t = L2TP(netdev);
-
-        assert(t);
-
-        ordered_hashmap_free_with_destructor(t->sessions_by_section, l2tp_session_free);
+        ordered_hashmap_free(t->sessions_by_section);
         free(t->local_ifname);
 }
 
@@ -876,4 +925,10 @@ const NetDevVTable l2tptnl_vtable = {
         .create_type = NETDEV_CREATE_INDEPENDENT,
         .is_ready_to_create = netdev_l2tp_is_ready_to_create,
         .config_verify = netdev_l2tp_tunnel_verify,
+        .attach = netdev_l2tp_tunnel_attach,
+        .detach = netdev_l2tp_tunnel_detach,
+        .set_ifindex = netdev_l2tp_tunnel_set_ifindex,
+        .get_ifindex = netdev_l2tp_tunnel_get_ifindex,
+        .iftype = ARPHRD_ETHER,
+        .skip_netdev_kind_check = true,
 };

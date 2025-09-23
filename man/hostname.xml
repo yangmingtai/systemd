@@ -1,6 +1,6 @@
 <?xml version='1.0'?> <!--*-nxml-*-->
 <!DOCTYPE refentry PUBLIC "-//OASIS//DTD DocBook XML V4.5//EN"
-  "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd" [
+  "http://www.oasis-open.org/docbook/xml/4.5/docbookx.dtd" [
 <!ENTITY % entities SYSTEM "custom-entities.ent" >
 %entities;
 ]>
@@ -43,6 +43,13 @@
     attempt to make the name valid, but obviously it is recommended to use a valid name and not rely on this
     filtering.</para>
 
+    <para id="question-mark-hostname-pattern">If the question mark character <literal>?</literal> appears in
+    the hostname, it is automatically substituted by a hexadecimal character derived from the
+    <citerefentry><refentrytitle>machine-id</refentrytitle><manvolnum>5</manvolnum></citerefentry> when
+    applied, securely and deterministically by cryptographic hashing. Example:
+    <literal>foobar-????-????</literal> will automatically expand to <literal>foobar-92a9-061c</literal> or
+    similar, depending on the local machine ID.</para>
+
     <para>You may use
     <citerefentry><refentrytitle>hostnamectl</refentrytitle><manvolnum>1</manvolnum></citerefentry> to change
     the value of this file during runtime from the command line. Use
@@ -56,7 +63,7 @@
     <para><citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry> and the
     associated tools will obtain the hostname in the following ways:</para>
     <itemizedlist>
-      <listitem><para>If the kernel commandline parameter <varname>systemd.hostname=</varname> specifies a
+      <listitem><para>If the kernel command line parameter <varname>systemd.hostname=</varname> specifies a
       valid hostname,
       <citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry> will use it
       to set the hostname during early boot, see
@@ -100,17 +107,17 @@
 
   <refsect1>
       <title>See Also</title>
-      <para>
-        <citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry>,
-        <citerefentry><refentrytitle>sethostname</refentrytitle><manvolnum>2</manvolnum></citerefentry>,
-        <citerefentry><refentrytitle>hostname</refentrytitle><manvolnum>1</manvolnum></citerefentry>,
-        <citerefentry><refentrytitle>hostname</refentrytitle><manvolnum>7</manvolnum></citerefentry>,
-        <citerefentry><refentrytitle>machine-id</refentrytitle><manvolnum>5</manvolnum></citerefentry>,
-        <citerefentry><refentrytitle>machine-info</refentrytitle><manvolnum>5</manvolnum></citerefentry>,
-        <citerefentry><refentrytitle>hostnamectl</refentrytitle><manvolnum>1</manvolnum></citerefentry>,
-        <citerefentry><refentrytitle>systemd-hostnamed.service</refentrytitle><manvolnum>8</manvolnum></citerefentry>,
-        <citerefentry><refentrytitle>systemd-firstboot</refentrytitle><manvolnum>1</manvolnum></citerefentry>
-      </para>
+      <para><simplelist type="inline">
+        <member><citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry></member>
+        <member><citerefentry><refentrytitle>sethostname</refentrytitle><manvolnum>2</manvolnum></citerefentry></member>
+        <member><citerefentry><refentrytitle>hostname</refentrytitle><manvolnum>1</manvolnum></citerefentry></member>
+        <member><citerefentry><refentrytitle>hostname</refentrytitle><manvolnum>7</manvolnum></citerefentry></member>
+        <member><citerefentry><refentrytitle>machine-id</refentrytitle><manvolnum>5</manvolnum></citerefentry></member>
+        <member><citerefentry><refentrytitle>machine-info</refentrytitle><manvolnum>5</manvolnum></citerefentry></member>
+        <member><citerefentry><refentrytitle>hostnamectl</refentrytitle><manvolnum>1</manvolnum></citerefentry></member>
+        <member><citerefentry><refentrytitle>systemd-hostnamed.service</refentrytitle><manvolnum>8</manvolnum></citerefentry></member>
+        <member><citerefentry><refentrytitle>systemd-firstboot</refentrytitle><manvolnum>1</manvolnum></citerefentry></member>
+      </simplelist></para>
   </refsect1>
 
 </refentry>

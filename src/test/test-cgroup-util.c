@@ -1,21 +1,19 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
+#include <unistd.h>
+
 #include "alloc-util.h"
 #include "cgroup-util.h"
-#include "dirent-util.h"
 #include "errno-util.h"
 #include "fd-util.h"
 #include "format-util.h"
-#include "parse-util.h"
-#include "proc-cmdline.h"
+#include "path-util.h"
+#include "pidref.h"
 #include "process-util.h"
 #include "special.h"
 #include "stat-util.h"
 #include "string-util.h"
-#include "strv.h"
 #include "tests.h"
-#include "user-util.h"
-#include "version.h"
 
 static void check_p_d_u(const char *path, int code, const char *result) {
         _cleanup_free_ char *unit = NULL;
@@ -24,7 +22,7 @@ static void check_p_d_u(const char *path, int code, const char *result) {
         r = cg_path_decode_unit(path, &unit);
         printf("%s: %s → %s %d expected %s %d\n", __func__, path, unit, r, strnull(result), code);
         assert_se(r == code);
-        assert_se(streq_ptr(unit, result));
+        ASSERT_STREQ(unit, result);
 }
 
 TEST(path_decode_unit) {
@@ -46,7 +44,7 @@ static void check_p_g_u(const char *path, int code, const char *result) {
         r = cg_path_get_unit(path, &unit);
         printf("%s: %s → %s %d expected %s %d\n", __func__, path, unit, r, strnull(result), code);
         assert_se(r == code);
-        assert_se(streq_ptr(unit, result));
+        ASSERT_STREQ(unit, result);
 }
 
 TEST(path_get_unit) {
@@ -63,6 +61,36 @@ TEST(path_get_unit) {
         check_p_g_u("/user.slice/user-1000.slice/user@.service/server.service", -ENXIO, NULL);
 }
 
+static void check_p_g_u_f(const char *path, int expected_code, const char *expected_unit, const char *expected_subgroup) {
+        _cleanup_free_ char *unit = NULL, *subgroup = NULL;
+        int r;
+
+        r = cg_path_get_unit_full(path, &unit, &subgroup);
+        printf("%s: %s → %s %s %d expected %s %s %d\n", __func__, path, unit, subgroup, r, strnull(expected_unit), strnull(expected_subgroup), expected_code);
+        ASSERT_EQ(r, expected_code);
+        ASSERT_STREQ(unit, expected_unit);
+        ASSERT_STREQ(subgroup, expected_subgroup);
+}
+
+TEST(path_get_unit_full) {
+        check_p_g_u_f("/system.slice/foobar.service/sdfdsaf", 0, "foobar.service", "sdfdsaf");
+        check_p_g_u_f("/system.slice/foobar.service//sdfdsaf", 0, "foobar.service", "sdfdsaf");
+        check_p_g_u_f("/system.slice/foobar.service/sdfdsaf/", 0, "foobar.service", "sdfdsaf");
+        check_p_g_u_f("/system.slice/foobar.service//sdfdsaf/", 0, "foobar.service", "sdfdsaf");
+        check_p_g_u_f("/system.slice/foobar.service//sdfdsaf//", 0, "foobar.service", "sdfdsaf");
+        check_p_g_u_f("/system.slice/foobar.service/sdfdsaf/urks", 0, "foobar.service", "sdfdsaf/urks");
+        check_p_g_u_f("/system.slice/foobar.service//sdfdsaf//urks", 0, "foobar.service", "sdfdsaf/urks");
+        check_p_g_u_f("/system.slice/foobar.service/sdfdsaf/urks/", 0, "foobar.service", "sdfdsaf/urks");
+        check_p_g_u_f("/system.slice/foobar.service//sdfdsaf//urks//", 0, "foobar.service", "sdfdsaf/urks");
+        check_p_g_u_f("/system.slice/foobar.service", 0, "foobar.service", NULL);
+        check_p_g_u_f("/system.slice/foobar.service/", 0, "foobar.service", NULL);
+        check_p_g_u_f("/system.slice/foobar.service//", 0, "foobar.service", NULL);
+        check_p_g_u_f("/system.slice/", -ENXIO, NULL, NULL);
+        check_p_g_u_f("/system.slice/piff", -ENXIO, NULL, NULL);
+        check_p_g_u_f("/system.service/piff", 0, "system.service", "piff");
+        check_p_g_u_f("//system.service//piff", 0, "system.service", "piff");
+}
+
 static void check_p_g_u_p(const char *path, int code, const char *result) {
         _cleanup_free_ char *unit_path = NULL;
         int r;
@@ -70,7 +98,7 @@ static void check_p_g_u_p(const char *path, int code, const char *result) {
         r = cg_path_get_unit_path(path, &unit_path);
         printf("%s: %s → %s %d expected %s %d\n", __func__, path, unit_path, r, strnull(result), code);
         assert_se(r == code);
-        assert_se(streq_ptr(unit_path, result));
+        ASSERT_STREQ(unit_path, result);
 }
 
 TEST(path_get_unit_path) {
@@ -97,7 +125,7 @@ static void check_p_g_u_u(const char *path, int code, const char *result) {
         r = cg_path_get_user_unit(path, &unit);
         printf("%s: %s → %s %d expected %s %d\n", __func__, path, unit, r, strnull(result), code);
         assert_se(r == code);
-        assert_se(streq_ptr(unit, result));
+        ASSERT_STREQ(unit, result);
 }
 
 TEST(path_get_user_unit) {
@@ -114,13 +142,16 @@ TEST(path_get_user_unit) {
         check_p_g_u_u("/user.slice/user-1000.slice/user@1000.service/server.service", 0, "server.service");
         check_p_g_u_u("/user.slice/user-1000.slice/user@1000.service/foobar.slice/foobar@pie.service", 0, "foobar@pie.service");
         check_p_g_u_u("/user.slice/user-1000.slice/user@.service/server.service", -ENXIO, NULL);
+        check_p_g_u_u("/capsule.slice/capsule@test.service/app.slice/run-p9-i1.service", 0, "run-p9-i1.service");
+        check_p_g_u_u("/capsule.slice/capsule@usr-joe.service/foo.slice/foo-bar.slice/run-p9-i1.service", 0, "run-p9-i1.service");
+        check_p_g_u_u("/capsule.slice/capsule@#.service/foo.slice/foo-bar.slice/run-p9-i1.service", -ENXIO, NULL);
 }
 
 static void check_p_g_s(const char *path, int code, const char *result) {
         _cleanup_free_ char *s = NULL;
 
         assert_se(cg_path_get_session(path, &s) == code);
-        assert_se(streq_ptr(s, result));
+        ASSERT_STREQ(s, result);
 }
 
 TEST(path_get_session) {
@@ -147,7 +178,7 @@ static void check_p_g_slice(const char *path, int code, const char *result) {
         _cleanup_free_ char *s = NULL;
 
         assert_se(cg_path_get_slice(path, &s) == code);
-        assert_se(streq_ptr(s, result));
+        ASSERT_STREQ(s, result);
 }
 
 TEST(path_get_slice) {
@@ -158,13 +189,14 @@ TEST(path_get_slice) {
         check_p_g_slice("foobar", 0, SPECIAL_ROOT_SLICE);
         check_p_g_slice("foobar.slice", 0, "foobar.slice");
         check_p_g_slice("foo.slice/foo-bar.slice/waldo.service", 0, "foo-bar.slice");
+        check_p_g_slice("/capsule.slice/capsule@test.service/app.slice/run-p9-i1.service", 0, "capsule.slice");
 }
 
 static void check_p_g_u_slice(const char *path, int code, const char *result) {
         _cleanup_free_ char *s = NULL;
 
         assert_se(cg_path_get_user_slice(path, &s) == code);
-        assert_se(streq_ptr(s, result));
+        ASSERT_STREQ(s, result);
 }
 
 TEST(path_get_user_slice) {
@@ -182,6 +214,10 @@ TEST(path_get_user_slice) {
         check_p_g_u_slice("foo.slice/foo-bar.slice/user@1000.service/waldo.service", 0, SPECIAL_ROOT_SLICE);
         check_p_g_u_slice("foo.slice/foo-bar.slice/user@1000.service/piep.slice/foo.service", 0, "piep.slice");
         check_p_g_u_slice("/foo.slice//foo-bar.slice/user@1000.service/piep.slice//piep-pap.slice//foo.service", 0, "piep-pap.slice");
+
+        check_p_g_u_slice("/capsule.slice/capsule@test.service/app.slice/run-p9-i1.service", 0, "app.slice");
+        check_p_g_u_slice("/capsule.slice/capsule@usr-joe.service/app.slice/run-p9-i1.service", 0, "app.slice");
+        check_p_g_u_slice("/capsule.slice/capsule@usr-joe.service/foo.slice/foo-bar.slice/run-p9-i1.service", 0, "foo-bar.slice");
 }
 
 TEST(get_paths, .sd_booted = true) {
@@ -191,47 +227,69 @@ TEST(get_paths, .sd_booted = true) {
         log_info("Root = %s", a);
 }
 
-TEST(proc) {
+static inline bool hidden_cgroup(const char *p) {
+        assert(p);
+
+        /* Consider top-level cgroup hidden from us */
+        return p[0] == '/' && p[strspn(p, "/")] == '.';
+}
+
+TEST(proc, .sd_booted = true) {
         _cleanup_closedir_ DIR *d = NULL;
         int r;
 
-        d = opendir("/proc");
-        assert_se(d);
+        ASSERT_OK(proc_dir_open(&d));
 
-        FOREACH_DIRENT(de, d, break) {
+        for (;;) {
                 _cleanup_free_ char *path = NULL, *path_shifted = NULL, *session = NULL, *unit = NULL, *user_unit = NULL, *machine = NULL, *slice = NULL;
-                pid_t pid;
+                _cleanup_(pidref_done) PidRef pid = PIDREF_NULL;
                 uid_t uid = UID_INVALID;
 
-                if (!IN_SET(de->d_type, DT_DIR, DT_UNKNOWN))
+                ASSERT_OK(r = proc_dir_read_pidref(d, &pid));
+                if (r == 0)
+                        break;
+
+                if (pidref_is_kernel_thread(&pid) != 0)
                         continue;
 
-                r = parse_pid(de->d_name, &pid);
-                if (r < 0)
+                r = cg_pidref_get_path(SYSTEMD_CGROUP_CONTROLLER, &pid, &path);
+                if (r == -ESRCH)
+                        continue;
+                ASSERT_OK(r);
+
+                /* Test may run in a container with supervising/monitor processes that don't belong to our
+                 * cgroup tree (slices/leaves) */
+                if (hidden_cgroup(path))
                         continue;
 
-                if (is_kernel_thread(pid))
-                        continue;
+                int r1 = cg_pid_get_path_shifted(pid.pid, NULL, &path_shifted);
+                int r2 = cg_pidref_get_unit(&pid, &unit);
+                int r3 = cg_pid_get_slice(pid.pid, &slice);
 
-                cg_pid_get_path(SYSTEMD_CGROUP_CONTROLLER, pid, &path);
-                cg_pid_get_path_shifted(pid, NULL, &path_shifted);
-                cg_pid_get_owner_uid(pid, &uid);
-                cg_pid_get_session(pid, &session);
-                cg_pid_get_unit(pid, &unit);
-                cg_pid_get_user_unit(pid, &user_unit);
-                cg_pid_get_machine_name(pid, &machine);
-                cg_pid_get_slice(pid, &slice);
+                /* Not all processes belong to a specific user or a machine */
+                int r4 = cg_pidref_get_owner_uid(&pid, &uid);
+                int r5 = cg_pidref_get_session(&pid, &session);
+                int r6 = cg_pid_get_user_unit(pid.pid, &user_unit);
+                int r7 = cg_pid_get_machine_name(pid.pid, &machine);
 
-                printf(PID_FMT"\t%s\t%s\t"UID_FMT"\t%s\t%s\t%s\t%s\t%s\n",
-                       pid,
-                       path,
-                       path_shifted,
-                       uid,
-                       session,
-                       unit,
-                       user_unit,
-                       machine,
-                       slice);
+                log_debug(PID_FMT": %s, %s, "UID_FMT", %s, %s, %s, %s, %s",
+                          pid.pid,
+                          path,
+                          strna(path_shifted),
+                          uid,
+                          strna(session),
+                          strna(unit),
+                          strna(user_unit),
+                          strna(machine),
+                          strna(slice));
+
+                ASSERT_OK_OR(r1, -ESRCH);
+                ASSERT_OK_OR(r2, -ESRCH, -ENXIO);
+                ASSERT_OK_OR(r3, -ESRCH, -ENXIO);
+                ASSERT_OK_OR(r4, -ESRCH, -ENXIO);
+                ASSERT_OK_OR(r5, -ESRCH, -ENXIO);
+                ASSERT_OK_OR(r6, -ESRCH, -ENXIO);
+                ASSERT_OK_OR(r7, -ESRCH, -ENXIO, -ENOENT);
         }
 }
 
@@ -241,10 +299,10 @@ static void test_escape_one(const char *s, const char *expected) {
         assert_se(s);
         assert_se(expected);
 
-        assert_se(cg_escape(s, &b) >= 0);
-        assert_se(streq(b, expected));
+        ASSERT_OK(cg_escape(s, &b));
+        ASSERT_STREQ(b, expected);
 
-        assert_se(streq(cg_unescape(b), s));
+        ASSERT_STREQ(cg_unescape(b), s);
 
         assert_se(filename_is_valid(b));
         assert_se(!cg_needs_escape(s) || b[0] == '_');
@@ -277,6 +335,36 @@ TEST(controller_is_valid) {
         assert_se(!cg_controller_is_valid("tatü"));
 }
 
+TEST(cg_split_spec) {
+        char *c, *p;
+
+        ASSERT_OK_ZERO(cg_split_spec("foobar:/", &c, &p));
+        ASSERT_STREQ(c, "foobar");
+        ASSERT_STREQ(p, "/");
+        c = mfree(c);
+        p = mfree(p);
+
+        ASSERT_OK_ZERO(cg_split_spec("foobar:", &c, &p));
+        c = mfree(c);
+        p = mfree(p);
+
+        ASSERT_FAIL(cg_split_spec("foobar:asdfd", &c, &p));
+        ASSERT_FAIL(cg_split_spec(":///", &c, &p));
+        ASSERT_FAIL(cg_split_spec(":", &c, &p));
+        ASSERT_FAIL(cg_split_spec("", &c, &p));
+        ASSERT_FAIL(cg_split_spec("fo/obar:/", &c, &p));
+
+        ASSERT_OK(cg_split_spec("/", &c, &p));
+        ASSERT_NULL(c);
+        ASSERT_STREQ(p, "/");
+        p = mfree(p);
+
+        ASSERT_OK(cg_split_spec("foo", &c, &p));
+        ASSERT_STREQ(c, "foo");
+        ASSERT_NULL(p);
+        c = mfree(c);
+}
+
 static void test_slice_to_path_one(const char *unit, const char *path, int error) {
         _cleanup_free_ char *ret = NULL;
         int r;
@@ -287,7 +375,7 @@ static void test_slice_to_path_one(const char *unit, const char *path, int error
         log_info("actual: %s / %d", strnull(ret), r);
         log_info("expect: %s / %d", strnull(path), error);
         assert_se(r == error);
-        assert_se(streq_ptr(ret, path));
+        ASSERT_STREQ(ret, path);
 }
 
 TEST(slice_to_path) {
@@ -318,8 +406,8 @@ TEST(slice_to_path) {
 static void test_shift_path_one(const char *raw, const char *root, const char *shifted) {
         const char *s = NULL;
 
-        assert_se(cg_shift_path(raw, root, &s) >= 0);
-        assert_se(streq(s, shifted));
+        ASSERT_OK(cg_shift_path(raw, root, &s));
+        ASSERT_STREQ(s, shifted);
 }
 
 TEST(shift_path) {
@@ -331,44 +419,21 @@ TEST(shift_path) {
 
 TEST(mask_supported, .sd_booted = true) {
         CGroupMask m;
-        CGroupController c;
 
-        assert_se(cg_mask_supported(&m) >= 0);
+        ASSERT_OK(cg_mask_supported(&m));
 
-        for (c = 0; c < _CGROUP_CONTROLLER_MAX; c++)
-                printf("'%s' is supported: %s\n", cgroup_controller_to_string(c), yes_no(m & CGROUP_CONTROLLER_TO_MASK(c)));
-}
-
-TEST(is_cgroup_fs, .sd_booted = true) {
-        struct statfs sfs;
-        assert_se(statfs("/sys/fs/cgroup", &sfs) == 0);
-        if (is_temporary_fs(&sfs))
-                assert_se(statfs("/sys/fs/cgroup/systemd", &sfs) == 0);
-        assert_se(is_cgroup_fs(&sfs));
-}
-
-TEST(fd_is_cgroup_fs, .sd_booted = true) {
-        int fd;
-
-        fd = open("/sys/fs/cgroup", O_RDONLY|O_DIRECTORY|O_CLOEXEC|O_NOFOLLOW);
-        assert_se(fd >= 0);
-        if (fd_is_temporary_fs(fd)) {
-                fd = safe_close(fd);
-                fd = open("/sys/fs/cgroup/systemd", O_RDONLY|O_DIRECTORY|O_CLOEXEC|O_NOFOLLOW);
-                assert_se(fd >= 0);
-        }
-        assert_se(fd_is_cgroup_fs(fd));
-        fd = safe_close(fd);
+        for (CGroupController c = 0; c < _CGROUP_CONTROLLER_MAX; c++)
+                printf("'%s' is supported: %s\n",
+                       cgroup_controller_to_string(c),
+                       yes_no(m & CGROUP_CONTROLLER_TO_MASK(c)));
 }
 
 TEST(cg_tests) {
         int all, hybrid, systemd, r;
 
         r = cg_unified();
-        if (r == -ENOMEDIUM) {
-                log_tests_skipped("cgroup not mounted");
-                return;
-        }
+        if (IN_SET(r, -ENOENT, -ENOMEDIUM))
+                return (void) log_tests_skipped("cgroup not mounted");
         assert_se(r >= 0);
 
         all = cg_all_unified();
@@ -395,7 +460,7 @@ TEST(cg_tests) {
 TEST(cg_get_keyed_attribute) {
         _cleanup_free_ char *val = NULL;
         char *vals3[3] = {}, *vals3a[3] = {};
-        int i, r;
+        int r;
 
         r = cg_get_keyed_attribute("cpu", "/init.scope", "no_such_file", STRV_MAKE("no_such_attr"), &val);
         if (r == -ENOMEDIUM || ERRNO_IS_PRIVILEGE(r)) {
@@ -404,7 +469,7 @@ TEST(cg_get_keyed_attribute) {
         }
 
         assert_se(r == -ENOENT);
-        assert_se(val == NULL);
+        ASSERT_NULL(val);
 
         if (access("/sys/fs/cgroup/init.scope/cpu.stat", R_OK) < 0) {
                 log_info_errno(errno, "Skipping most of %s, /init.scope/cpu.stat not accessible: %m", __func__);
@@ -412,49 +477,22 @@ TEST(cg_get_keyed_attribute) {
         }
 
         assert_se(cg_get_keyed_attribute("cpu", "/init.scope", "cpu.stat", STRV_MAKE("no_such_attr"), &val) == -ENXIO);
-        assert_se(cg_get_keyed_attribute_graceful("cpu", "/init.scope", "cpu.stat", STRV_MAKE("no_such_attr"), &val) == 0);
-        assert_se(val == NULL);
+        ASSERT_NULL(val);
 
         assert_se(cg_get_keyed_attribute("cpu", "/init.scope", "cpu.stat", STRV_MAKE("usage_usec"), &val) == 0);
         val = mfree(val);
 
-        assert_se(cg_get_keyed_attribute_graceful("cpu", "/init.scope", "cpu.stat", STRV_MAKE("usage_usec"), &val) == 1);
-        log_info("cpu /init.scope cpu.stat [usage_usec] → \"%s\"", val);
-
         assert_se(cg_get_keyed_attribute("cpu", "/init.scope", "cpu.stat", STRV_MAKE("usage_usec", "no_such_attr"), vals3) == -ENXIO);
-        assert_se(cg_get_keyed_attribute_graceful("cpu", "/init.scope", "cpu.stat", STRV_MAKE("usage_usec", "no_such_attr"), vals3) == 1);
-        assert_se(vals3[0] && !vals3[1]);
-        free(vals3[0]);
-
-        assert_se(cg_get_keyed_attribute("cpu", "/init.scope", "cpu.stat", STRV_MAKE("usage_usec", "usage_usec"), vals3) == -ENXIO);
-        assert_se(cg_get_keyed_attribute_graceful("cpu", "/init.scope", "cpu.stat", STRV_MAKE("usage_usec", "usage_usec"), vals3) == 1);
-        assert_se(vals3[0] && !vals3[1]);
-        free(vals3[0]);
 
         assert_se(cg_get_keyed_attribute("cpu", "/init.scope", "cpu.stat",
                                          STRV_MAKE("usage_usec", "user_usec", "system_usec"), vals3) == 0);
-        for (i = 0; i < 3; i++)
+        for (size_t i = 0; i < 3; i++)
                 free(vals3[i]);
-
-        assert_se(cg_get_keyed_attribute_graceful("cpu", "/init.scope", "cpu.stat",
-                                         STRV_MAKE("usage_usec", "user_usec", "system_usec"), vals3) == 3);
-        log_info("cpu /init.scope cpu.stat [usage_usec user_usec system_usec] → \"%s\", \"%s\", \"%s\"",
-                 vals3[0], vals3[1], vals3[2]);
 
         assert_se(cg_get_keyed_attribute("cpu", "/init.scope", "cpu.stat",
                                          STRV_MAKE("system_usec", "user_usec", "usage_usec"), vals3a) == 0);
-        for (i = 0; i < 3; i++)
+        for (size_t i = 0; i < 3; i++)
                 free(vals3a[i]);
-
-        assert_se(cg_get_keyed_attribute_graceful("cpu", "/init.scope", "cpu.stat",
-                                         STRV_MAKE("system_usec", "user_usec", "usage_usec"), vals3a) == 3);
-        log_info("cpu /init.scope cpu.stat [system_usec user_usec usage_usec] → \"%s\", \"%s\", \"%s\"",
-                 vals3a[0], vals3a[1], vals3a[2]);
-
-        for (i = 0; i < 3; i++) {
-                free(vals3[i]);
-                free(vals3a[i]);
-        }
 }
 
 TEST(bfq_weight_conversion) {
@@ -464,6 +502,47 @@ TEST(bfq_weight_conversion) {
         assert_se(BFQ_WEIGHT(500) == 136);
         assert_se(BFQ_WEIGHT(5000) == 545);
         assert_se(BFQ_WEIGHT(10000) == 1000);
+}
+
+TEST(cgroupid) {
+        _cleanup_free_ char *p = NULL, *p2 = NULL;
+        _cleanup_close_ int fd = -EBADF, fd2 = -EBADF;
+        uint64_t id, id2;
+        int r;
+
+        r = cg_all_unified();
+        if (IN_SET(r, -ENOMEDIUM, -ENOENT))
+                return (void) log_tests_skipped("cgroupfs is not mounted");
+        if (r == 0)
+                return (void) log_tests_skipped("skipping cgroupid test, not running in unified mode");
+        ASSERT_OK_POSITIVE(r);
+
+        fd = cg_path_open(SYSTEMD_CGROUP_CONTROLLER, "/");
+        ASSERT_OK(fd);
+
+        ASSERT_OK(fd_get_path(fd, &p));
+        ASSERT_TRUE(path_equal(p, "/sys/fs/cgroup"));
+
+        ASSERT_OK(cg_fd_get_cgroupid(fd, &id));
+
+        fd2 = cg_cgroupid_open(fd, id);
+
+        if (ERRNO_IS_NEG_PRIVILEGE(fd2))
+                log_notice("Skipping open-by-cgroup-id test because lacking privs.");
+        else if (ERRNO_IS_NEG_NOT_SUPPORTED(fd2))
+                log_notice("Skipping open-by-cgroup-id test because syscall is missing or blocked.");
+        else {
+                ASSERT_OK(fd2);
+
+                ASSERT_OK(fd_get_path(fd2, &p2));
+                ASSERT_TRUE(path_equal(p2, "/sys/fs/cgroup"));
+
+                ASSERT_OK(cg_fd_get_cgroupid(fd2, &id2));
+
+                ASSERT_EQ(id, id2);
+
+                ASSERT_OK_EQ(inode_same_at(fd, NULL, fd2, NULL, AT_EMPTY_PATH), true);
+        }
 }
 
 DEFINE_TEST_MAIN(LOG_DEBUG);

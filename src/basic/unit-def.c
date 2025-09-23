@@ -1,12 +1,16 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
+#include <stdio.h>
+
 #include "alloc-util.h"
 #include "bus-label.h"
+#include "glyph-util.h"
 #include "string-table.h"
+#include "string-util.h"
 #include "unit-def.h"
 #include "unit-name.h"
 
-char *unit_dbus_path_from_name(const char *name) {
+char* unit_dbus_path_from_name(const char *name) {
         _cleanup_free_ char *e = NULL;
 
         assert(name);
@@ -58,7 +62,7 @@ const char* unit_dbus_interface_from_type(UnitType t) {
         return table[t];
 }
 
-const char *unit_dbus_interface_from_name(const char *name) {
+const char* unit_dbus_interface_from_name(const char *name) {
         UnitType t;
 
         t = unit_name_to_type(name);
@@ -91,11 +95,12 @@ static const char* const unit_load_state_table[_UNIT_LOAD_STATE_MAX] = {
         [UNIT_BAD_SETTING] = "bad-setting",
         [UNIT_ERROR]       = "error",
         [UNIT_MERGED]      = "merged",
-        [UNIT_MASKED]      = "masked"
+        [UNIT_MASKED]      = "masked",
 };
 
 DEFINE_STRING_TABLE_LOOKUP(unit_load_state, UnitLoadState);
 
+/* Keep in sync with man/unit-states.xml */
 static const char* const unit_active_state_table[_UNIT_ACTIVE_STATE_MAX] = {
         [UNIT_ACTIVE]       = "active",
         [UNIT_RELOADING]    = "reloading",
@@ -104,18 +109,40 @@ static const char* const unit_active_state_table[_UNIT_ACTIVE_STATE_MAX] = {
         [UNIT_ACTIVATING]   = "activating",
         [UNIT_DEACTIVATING] = "deactivating",
         [UNIT_MAINTENANCE]  = "maintenance",
+        [UNIT_REFRESHING]   = "refreshing",
 };
 
 DEFINE_STRING_TABLE_LOOKUP(unit_active_state, UnitActiveState);
 
 static const char* const freezer_state_table[_FREEZER_STATE_MAX] = {
-        [FREEZER_RUNNING]  = "running",
-        [FREEZER_FREEZING] = "freezing",
-        [FREEZER_FROZEN]   = "frozen",
-        [FREEZER_THAWING]  = "thawing",
+        [FREEZER_RUNNING]            = "running",
+        [FREEZER_FREEZING]           = "freezing",
+        [FREEZER_FREEZING_BY_PARENT] = "freezing-by-parent",
+        [FREEZER_FROZEN]             = "frozen",
+        [FREEZER_FROZEN_BY_PARENT]   = "frozen-by-parent",
+        [FREEZER_THAWING]            = "thawing",
 };
 
 DEFINE_STRING_TABLE_LOOKUP(freezer_state, FreezerState);
+
+/* Maps in-progress freezer states to the corresponding finished state */
+static const FreezerState freezer_state_finish_table[_FREEZER_STATE_MAX] = {
+        [FREEZER_FREEZING]           = FREEZER_FROZEN,
+        [FREEZER_FREEZING_BY_PARENT] = FREEZER_FROZEN_BY_PARENT,
+        [FREEZER_THAWING]            = FREEZER_RUNNING,
+
+        /* Finished states trivially map to themselves */
+        [FREEZER_RUNNING]            = FREEZER_RUNNING,
+        [FREEZER_FROZEN]             = FREEZER_FROZEN,
+        [FREEZER_FROZEN_BY_PARENT]   = FREEZER_FROZEN_BY_PARENT,
+};
+
+FreezerState freezer_state_finish(FreezerState state) {
+        assert(state >= 0);
+        assert(state < _FREEZER_STATE_MAX);
+
+        return freezer_state_finish_table[state];
+}
 
 static const char* const unit_marker_table[_UNIT_MARKER_MAX] = {
         [UNIT_MARKER_NEEDS_RELOAD]  = "needs-reload",
@@ -128,7 +155,7 @@ static const char* const automount_state_table[_AUTOMOUNT_STATE_MAX] = {
         [AUTOMOUNT_DEAD]    = "dead",
         [AUTOMOUNT_WAITING] = "waiting",
         [AUTOMOUNT_RUNNING] = "running",
-        [AUTOMOUNT_FAILED]  = "failed"
+        [AUTOMOUNT_FAILED]  = "failed",
 };
 
 DEFINE_STRING_TABLE_LOOKUP(automount_state, AutomountState);
@@ -162,7 +189,7 @@ static const char* const path_state_table[_PATH_STATE_MAX] = {
         [PATH_DEAD]    = "dead",
         [PATH_WAITING] = "waiting",
         [PATH_RUNNING] = "running",
-        [PATH_FAILED]  = "failed"
+        [PATH_FAILED]  = "failed",
 };
 
 DEFINE_STRING_TABLE_LOOKUP(path_state, PathState);
@@ -190,6 +217,7 @@ static const char* const service_state_table[_SERVICE_STATE_MAX] = {
         [SERVICE_RELOAD]                     = "reload",
         [SERVICE_RELOAD_SIGNAL]              = "reload-signal",
         [SERVICE_RELOAD_NOTIFY]              = "reload-notify",
+        [SERVICE_REFRESH_EXTENSIONS]         = "refresh-extensions",
         [SERVICE_STOP]                       = "stop",
         [SERVICE_STOP_WATCHDOG]              = "stop-watchdog",
         [SERVICE_STOP_SIGTERM]               = "stop-sigterm",
@@ -203,14 +231,16 @@ static const char* const service_state_table[_SERVICE_STATE_MAX] = {
         [SERVICE_FAILED_BEFORE_AUTO_RESTART] = "failed-before-auto-restart",
         [SERVICE_DEAD_RESOURCES_PINNED]      = "dead-resources-pinned",
         [SERVICE_AUTO_RESTART]               = "auto-restart",
+        [SERVICE_AUTO_RESTART_QUEUED]        = "auto-restart-queued",
         [SERVICE_CLEANING]                   = "cleaning",
+        [SERVICE_MOUNTING]                   = "mounting",
 };
 
 DEFINE_STRING_TABLE_LOOKUP(service_state, ServiceState);
 
 static const char* const slice_state_table[_SLICE_STATE_MAX] = {
         [SLICE_DEAD]   = "dead",
-        [SLICE_ACTIVE] = "active"
+        [SLICE_ACTIVE] = "active",
 };
 
 DEFINE_STRING_TABLE_LOOKUP(slice_state, SliceState);
@@ -218,9 +248,11 @@ DEFINE_STRING_TABLE_LOOKUP(slice_state, SliceState);
 static const char* const socket_state_table[_SOCKET_STATE_MAX] = {
         [SOCKET_DEAD]             = "dead",
         [SOCKET_START_PRE]        = "start-pre",
+        [SOCKET_START_OPEN]       = "start-open",
         [SOCKET_START_CHOWN]      = "start-chown",
         [SOCKET_START_POST]       = "start-post",
         [SOCKET_LISTENING]        = "listening",
+        [SOCKET_DEFERRED]         = "deferred",
         [SOCKET_RUNNING]          = "running",
         [SOCKET_STOP_PRE]         = "stop-pre",
         [SOCKET_STOP_PRE_SIGTERM] = "stop-pre-sigterm",
@@ -250,7 +282,7 @@ DEFINE_STRING_TABLE_LOOKUP(swap_state, SwapState);
 
 static const char* const target_state_table[_TARGET_STATE_MAX] = {
         [TARGET_DEAD]   = "dead",
-        [TARGET_ACTIVE] = "active"
+        [TARGET_ACTIVE] = "active",
 };
 
 DEFINE_STRING_TABLE_LOOKUP(target_state, TargetState);
@@ -260,7 +292,7 @@ static const char* const timer_state_table[_TIMER_STATE_MAX] = {
         [TIMER_WAITING] = "waiting",
         [TIMER_RUNNING] = "running",
         [TIMER_ELAPSED] = "elapsed",
-        [TIMER_FAILED]  = "failed"
+        [TIMER_FAILED]  = "failed",
 };
 
 DEFINE_STRING_TABLE_LOOKUP(timer_state, TimerState);
@@ -301,28 +333,59 @@ static const char* const unit_dependency_table[_UNIT_DEPENDENCY_MAX] = {
 
 DEFINE_STRING_TABLE_LOOKUP(unit_dependency, UnitDependency);
 
+void unit_types_list(void) {
+        DUMP_STRING_TABLE(unit_dependency, UnitDependency, _UNIT_DEPENDENCY_MAX);
+}
+
 static const char* const notify_access_table[_NOTIFY_ACCESS_MAX] = {
         [NOTIFY_NONE] = "none",
         [NOTIFY_MAIN] = "main",
         [NOTIFY_EXEC] = "exec",
-        [NOTIFY_ALL]  = "all"
+        [NOTIFY_ALL]  = "all",
 };
 
 DEFINE_STRING_TABLE_LOOKUP(notify_access, NotifyAccess);
 
-SpecialGlyph unit_active_state_to_glyph(UnitActiveState state) {
-        static const SpecialGlyph map[_UNIT_ACTIVE_STATE_MAX] = {
-                [UNIT_ACTIVE]       = SPECIAL_GLYPH_BLACK_CIRCLE,
-                [UNIT_RELOADING]    = SPECIAL_GLYPH_CIRCLE_ARROW,
-                [UNIT_INACTIVE]     = SPECIAL_GLYPH_WHITE_CIRCLE,
-                [UNIT_FAILED]       = SPECIAL_GLYPH_MULTIPLICATION_SIGN,
-                [UNIT_ACTIVATING]   = SPECIAL_GLYPH_BLACK_CIRCLE,
-                [UNIT_DEACTIVATING] = SPECIAL_GLYPH_BLACK_CIRCLE,
-                [UNIT_MAINTENANCE]  = SPECIAL_GLYPH_WHITE_CIRCLE,
+static const char* const job_mode_table[_JOB_MODE_MAX] = {
+        [JOB_FAIL]                 = "fail",
+        [JOB_LENIENT]              = "lenient",
+        [JOB_REPLACE]              = "replace",
+        [JOB_REPLACE_IRREVERSIBLY] = "replace-irreversibly",
+        [JOB_ISOLATE]              = "isolate",
+        [JOB_FLUSH]                = "flush",
+        [JOB_IGNORE_DEPENDENCIES]  = "ignore-dependencies",
+        [JOB_IGNORE_REQUIREMENTS]  = "ignore-requirements",
+        [JOB_TRIGGERING]           = "triggering",
+        [JOB_RESTART_DEPENDENCIES] = "restart-dependencies",
+};
+
+DEFINE_STRING_TABLE_LOOKUP(job_mode, JobMode);
+
+/* This table maps ExecDirectoryType to the setting it is configured with in the unit */
+static const char* const exec_directory_type_table[_EXEC_DIRECTORY_TYPE_MAX] = {
+        [EXEC_DIRECTORY_RUNTIME]       = "RuntimeDirectory",
+        [EXEC_DIRECTORY_STATE]         = "StateDirectory",
+        [EXEC_DIRECTORY_CACHE]         = "CacheDirectory",
+        [EXEC_DIRECTORY_LOGS]          = "LogsDirectory",
+        [EXEC_DIRECTORY_CONFIGURATION] = "ConfigurationDirectory",
+};
+
+DEFINE_STRING_TABLE_LOOKUP(exec_directory_type, ExecDirectoryType);
+
+Glyph unit_active_state_to_glyph(UnitActiveState state) {
+        static const Glyph map[_UNIT_ACTIVE_STATE_MAX] = {
+                [UNIT_ACTIVE]       = GLYPH_BLACK_CIRCLE,
+                [UNIT_RELOADING]    = GLYPH_CIRCLE_ARROW,
+                [UNIT_REFRESHING]   = GLYPH_CIRCLE_ARROW,
+                [UNIT_INACTIVE]     = GLYPH_WHITE_CIRCLE,
+                [UNIT_FAILED]       = GLYPH_MULTIPLICATION_SIGN,
+                [UNIT_ACTIVATING]   = GLYPH_BLACK_CIRCLE,
+                [UNIT_DEACTIVATING] = GLYPH_BLACK_CIRCLE,
+                [UNIT_MAINTENANCE]  = GLYPH_WHITE_CIRCLE,
         };
 
         if (state < 0)
-                return _SPECIAL_GLYPH_INVALID;
+                return _GLYPH_INVALID;
 
         assert(state < _UNIT_ACTIVE_STATE_MAX);
         return map[state];

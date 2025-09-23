@@ -1,22 +1,29 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <fcntl.h>
+#include <linux/hidraw.h>
+#include <linux/input.h>
 #include <string.h>
 #include <sys/ioctl.h>
-#include <sys/types.h>
+#include <sys/sysmacros.h>
 
+#include "sd-bus.h"
 #include "sd-device.h"
-#include "sd-daemon.h"
 
 #include "alloc-util.h"
-#include "bus-util.h"
 #include "daemon-util.h"
+#include "device-util.h"
+#include "errno-util.h"
 #include "fd-util.h"
+#include "hashmap.h"
+#include "logind.h"
+#include "logind-device.h"
+#include "logind-seat.h"
+#include "logind-session.h"
 #include "logind-session-dbus.h"
 #include "logind-session-device.h"
-#include "missing_drm.h"
-#include "missing_input.h"
-#include "parse-util.h"
+#include "missing-drm.h"
+#include "string-util.h"
 
 enum SessionDeviceNotifications {
         SESSION_DEVICE_RESUME,
@@ -94,12 +101,27 @@ static void sd_eviocrevoke(int fd) {
 
         assert(fd >= 0);
 
-        if (ioctl(fd, EVIOCREVOKE, NULL) < 0) {
-
-                if (errno == EINVAL && !warned) {
-                        log_warning_errno(errno, "Kernel does not support evdev-revocation: %m");
+        if (!warned && ioctl(fd, EVIOCREVOKE, NULL) < 0) {
+                if (errno == EINVAL) {
+                        log_warning_errno(errno, "Kernel does not support evdev-revocation, continuing without revoking device access: %m");
                         warned = true;
+                } else if (errno != ENODEV) {
+                        log_warning_errno(errno, "Failed to revoke evdev device, continuing without revoking device access: %m");
                 }
+        }
+}
+
+static void sd_hidiocrevoke(int fd) {
+        static bool warned = false;
+
+        assert(fd >= 0);
+
+        if (!warned && ioctl(fd, HIDIOCREVOKE, NULL) < 0) {
+                if (errno == EINVAL) {
+                        log_warning_errno(errno, "Kernel does not support hidraw-revocation, continuing without revoking device access: %m");
+                        warned = true;
+                } else if (errno != ENODEV)
+                        log_warning_errno(errno, "Failed to revoke hidraw device, continuing without revoking device access: %m");
         }
 }
 
@@ -114,7 +136,8 @@ static int sd_drmdropmaster(int fd) {
 }
 
 static int session_device_open(SessionDevice *sd, bool active) {
-        int fd, r;
+        _cleanup_close_ int fd = -EBADF;
+        int r;
 
         assert(sd);
         assert(sd->type != DEVICE_TYPE_UNKNOWN);
@@ -132,10 +155,8 @@ static int session_device_open(SessionDevice *sd, bool active) {
                         /* Weird legacy DRM semantics might return an error even though we're master. No way to detect
                          * that so fail at all times and let caller retry in inactive state. */
                         r = sd_drmsetmaster(fd);
-                        if (r < 0) {
-                                (void) close_nointr(fd);
+                        if (r < 0)
                                 return r;
-                        }
                 } else
                         /* DRM-Master is granted to the first user who opens a device automatically (ughh,
                          * racy!). Hence, we just drop DRM-Master in case we were the first. */
@@ -147,13 +168,18 @@ static int session_device_open(SessionDevice *sd, bool active) {
                         sd_eviocrevoke(fd);
                 break;
 
+        case DEVICE_TYPE_HIDRAW:
+                if (!active)
+                        sd_hidiocrevoke(fd);
+                break;
+
         case DEVICE_TYPE_UNKNOWN:
         default:
                 /* fallback for devices without synchronizations */
-                break;
+                ;
         }
 
-        return fd;
+        return TAKE_FD(fd);
 }
 
 static int session_device_start(SessionDevice *sd) {
@@ -180,12 +206,13 @@ static int session_device_start(SessionDevice *sd) {
                 break;
 
         case DEVICE_TYPE_EVDEV:
-                /* Evdev devices are revoked while inactive. Reopen it and we are fine. */
+        case DEVICE_TYPE_HIDRAW:
+                /* Evdev/hidraw devices are revoked while inactive. Reopen it and we are fine. */
                 r = session_device_open(sd, true);
                 if (r < 0)
                         return r;
 
-                /* For evdev devices, the file descriptor might be left uninitialized. This might happen while resuming
+                /* For evdev/hidraw devices, the file descriptor might be left uninitialized. This might happen while resuming
                  * into a session and logind has been restarted right before. */
                 close_and_replace(sd->fd, r);
                 break;
@@ -193,7 +220,7 @@ static int session_device_start(SessionDevice *sd) {
         case DEVICE_TYPE_UNKNOWN:
         default:
                 /* fallback for devices without synchronizations */
-                break;
+                ;
         }
 
         sd->active = true;
@@ -229,32 +256,43 @@ static void session_device_stop(SessionDevice *sd) {
                 sd_eviocrevoke(sd->fd);
                 break;
 
+        case DEVICE_TYPE_HIDRAW:
+                /* Revoke access on hidraw file-descriptors during deactivation.
+                 * This will basically prevent any operations on the fd and
+                 * cannot be undone. Good side is: it needs no CAP_SYS_ADMIN
+                 * protection this way. */
+                sd_hidiocrevoke(sd->fd);
+                break;
+
         case DEVICE_TYPE_UNKNOWN:
         default:
                 /* fallback for devices without synchronization */
-                break;
+                ;
         }
 
         sd->active = false;
 }
 
 static DeviceType detect_device_type(sd_device *dev) {
-        const char *sysname, *subsystem;
-        DeviceType type = DEVICE_TYPE_UNKNOWN;
-
-        if (sd_device_get_sysname(dev, &sysname) < 0 ||
-            sd_device_get_subsystem(dev, &subsystem) < 0)
-                return type;
-
-        if (streq(subsystem, "drm")) {
-                if (startswith(sysname, "card"))
-                        type = DEVICE_TYPE_DRM;
-        } else if (streq(subsystem, "input")) {
-                if (startswith(sysname, "event"))
-                        type = DEVICE_TYPE_EVDEV;
+        if (device_in_subsystem(dev, "drm") > 0) {
+                if (device_sysname_startswith(dev, "card") > 0)
+                        return DEVICE_TYPE_DRM;
+                return DEVICE_TYPE_UNKNOWN;
         }
 
-        return type;
+        if (device_in_subsystem(dev, "input") > 0) {
+                if (device_sysname_startswith(dev, "event") > 0)
+                        return DEVICE_TYPE_EVDEV;
+                return DEVICE_TYPE_UNKNOWN;
+        }
+
+        if (device_in_subsystem(dev, "hidraw") > 0) {
+                if (device_sysname_startswith(dev, "hidraw") > 0)
+                        return DEVICE_TYPE_HIDRAW;
+                return DEVICE_TYPE_UNKNOWN;
+        }
+
+        return DEVICE_TYPE_UNKNOWN;
 }
 
 static int session_device_verify(SessionDevice *sd) {
@@ -275,21 +313,27 @@ static int session_device_verify(SessionDevice *sd) {
 
         /* detect device type so we can find the correct sysfs parent */
         sd->type = detect_device_type(dev);
-        if (sd->type == DEVICE_TYPE_UNKNOWN)
-                return -ENODEV;
 
-        else if (sd->type == DEVICE_TYPE_EVDEV) {
+        /* Prevent opening unsupported devices. Especially devices of
+         * subsystem "input" must be opened via the evdev node as
+         * we require EVIOCREVOKE. */
+        switch (sd->type) {
+        case DEVICE_TYPE_EVDEV:
                 /* for evdev devices we need the parent node as device */
                 if (sd_device_get_parent_with_subsystem_devtype(p, "input", NULL, &dev) < 0)
                         return -ENODEV;
                 if (sd_device_get_syspath(dev, &sp) < 0)
                         return -ENODEV;
+                break;
 
-        } else if (sd->type != DEVICE_TYPE_DRM)
-                /* Prevent opening unsupported devices. Especially devices of
-                 * subsystem "input" must be opened via the evdev node as
-                 * we require EVIOCREVOKE. */
+        case DEVICE_TYPE_DRM:
+        case DEVICE_TYPE_HIDRAW:
+                break;
+
+        case  DEVICE_TYPE_UNKNOWN:
+        default:
                 return -ENODEV;
+        }
 
         /* search for an existing seat device and return it if available */
         sd->device = hashmap_get(sd->session->manager->devices, sp);
@@ -310,31 +354,28 @@ static int session_device_verify(SessionDevice *sd) {
         if (sd->device->seat != sd->session->seat)
                 return -EPERM;
 
-        sd->node = strdup(node);
-        if (!sd->node)
-                return -ENOMEM;
-
-        return 0;
+        return strdup_to(&sd->node, node);
 }
 
-int session_device_new(Session *s, dev_t dev, bool open_device, SessionDevice **out) {
+int session_device_new(Session *s, dev_t dev, bool open_device, SessionDevice **ret) {
         SessionDevice *sd;
         int r;
 
         assert(s);
-        assert(out);
 
         if (!s->seat)
                 return -EPERM;
 
-        sd = new0(SessionDevice, 1);
+        sd = new(SessionDevice, 1);
         if (!sd)
                 return -ENOMEM;
 
-        sd->session = s;
-        sd->dev = dev;
-        sd->fd = -EBADF;
-        sd->type = DEVICE_TYPE_UNKNOWN;
+        *sd = (SessionDevice) {
+                .session = s,
+                .dev = dev,
+                .fd = -EBADF,
+                .type = DEVICE_TYPE_UNKNOWN,
+        };
 
         r = session_device_verify(sd);
         if (r < 0)
@@ -365,7 +406,9 @@ int session_device_new(Session *s, dev_t dev, bool open_device, SessionDevice **
 
         LIST_PREPEND(sd_by_device, sd->device->session_devices, sd);
 
-        *out = sd;
+        if (ret)
+                *ret = sd;
+
         return 0;
 
 error:

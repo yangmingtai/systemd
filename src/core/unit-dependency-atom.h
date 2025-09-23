@@ -1,9 +1,7 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include <errno.h>
-
-#include "unit-def.h"
+#include "forward.h"
 
 /* Flags that identify the various "atomic" behaviours a specific dependency type implies. Each dependency is
  * a combination of one or more of these flags that define what they actually entail. */
@@ -56,10 +54,11 @@ typedef enum UnitDependencyAtom {
         /* If our start job succeeded but the unit is inactive then (think: oneshot units), propagate this as
          * failure to the other unit. */
         UNIT_ATOM_PROPAGATE_INACTIVE_START_AS_FAILURE = UINT64_C(1) << 17,
-        /* When putting together a transaction, propagate JOB_STOP from our unit to the other. */
+        /* When putting together a transaction, propagate JOB_STOP/JOB_RESTART from our unit to the other. */
         UNIT_ATOM_PROPAGATE_STOP                      = UINT64_C(1) << 18,
-        /* When putting together a transaction, propagate JOB_RESTART from our unit to the other. */
-        UNIT_ATOM_PROPAGATE_RESTART                   = UINT64_C(1) << 19,
+        /* Like UNIT_ATOM_PROPAGATE_STOP, but enqueues a restart job if there's already a start job (avoids
+         * job type conflict). */
+        UNIT_ATOM_PROPAGATE_STOP_GRACEFUL             = UINT64_C(1) << 19,
 
         /* Add the other unit to the default target dependency queue */
         UNIT_ATOM_ADD_DEFAULT_TARGET_DEPENDENCY_QUEUE = UINT64_C(1) << 20,

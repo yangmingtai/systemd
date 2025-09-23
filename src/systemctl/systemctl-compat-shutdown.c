@@ -3,12 +3,15 @@
 #include <getopt.h>
 
 #include "alloc-util.h"
+#include "log.h"
+#include "parse-util.h"
 #include "pretty-print.h"
 #include "reboot-util.h"
-#include "systemctl-compat-shutdown.h"
-#include "systemctl-sysv-compat.h"
+#include "string-util.h"
+#include "strv.h"
 #include "systemctl.h"
-#include "terminal-util.h"
+#include "systemctl-compat-shutdown.h"
+#include "time-util.h"
 
 static int shutdown_help(void) {
         _cleanup_free_ char *link = NULL;
@@ -17,6 +20,11 @@ static int shutdown_help(void) {
         r = terminal_urlify_man("shutdown", "8", &link);
         if (r < 0)
                 return log_oom();
+
+        /* Note: if you are tempted to add new command line switches here, please do not. Let this
+         * compatibility command rest in peace. Its interface is not even owned by us as much as it is by
+         * sysvinit. If you add something new, add it to "systemctl halt", "systemctl reboot", "systemctl
+         * poweroff" instead. */
 
         printf("%s [OPTIONS...] [TIME] [WALL...]\n"
                "\n%sShut down the system.%s\n"
@@ -30,11 +38,68 @@ static int shutdown_help(void) {
                "     --no-wall   Don't send wall message before halt/power-off/reboot\n"
                "  -c             Cancel a pending shutdown\n"
                "     --show      Show pending shutdown\n"
+               "\n%sThis is a compatibility interface, please use the more powerful 'systemctl halt',\n"
+               "'systemctl poweroff', 'systemctl reboot' commands instead.%s\n"
                "\nSee the %s for details.\n",
                program_invocation_short_name,
-               ansi_highlight(),
-               ansi_normal(),
+               ansi_highlight(), ansi_normal(),
+               ansi_highlight_red(), ansi_normal(),
                link);
+
+        return 0;
+}
+
+static int parse_shutdown_time_spec(const char *t, usec_t *ret) {
+        int r;
+
+        assert(t);
+        assert(ret);
+
+        /* This parses SysV compat time spec. */
+
+        if (streq(t, "now"))
+                *ret = 0;
+        else if (!strchr(t, ':')) {
+                uint64_t u;
+
+                if (safe_atou64(t, &u) < 0)
+                        return -EINVAL;
+
+                *ret = now(CLOCK_REALTIME) + USEC_PER_MINUTE * u;
+        } else {
+                char *e = NULL;
+                long hour, minute;
+
+                errno = 0;
+                hour = strtol(t, &e, 10);
+                if (errno > 0 || *e != ':' || hour < 0 || hour > 23)
+                        return -EINVAL;
+
+                minute = strtol(e+1, &e, 10);
+                if (errno > 0 || *e != 0 || minute < 0 || minute > 59)
+                        return -EINVAL;
+
+                usec_t n = now(CLOCK_REALTIME);
+                struct tm tm = {};
+
+                r = localtime_or_gmtime_usec(n, /* utc= */ false, &tm);
+                if (r < 0)
+                        return r;
+
+                tm.tm_hour = (int) hour;
+                tm.tm_min = (int) minute;
+                tm.tm_sec = 0;
+
+                usec_t s;
+                r = mktime_or_timegm_usec(&tm, /* utc= */ false, &s);
+                if (r < 0)
+                        return r;
+
+                while (s <= n)
+                        s += USEC_PER_DAY;
+
+                *ret = s;
+        }
 
         return 0;
 }
@@ -130,7 +195,7 @@ int shutdown_parse_argv(int argc, char *argv[]) {
                         return r;
                 }
         } else
-                arg_when = now(CLOCK_REALTIME) + USEC_PER_MINUTE;
+                arg_when = USEC_INFINITY; /* logind chooses on server side */
 
         if (argc > optind && arg_action == ACTION_CANCEL_SHUTDOWN)
                 /* No time argument for shutdown cancel */

@@ -1,23 +1,19 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
+#include "dns-def.h"
+#include "forward.h"
 #include "list.h"
 #include "ratelimit.h"
-
-typedef struct DnsQueryCandidate DnsQueryCandidate;
-typedef struct DnsScope DnsScope;
-
+#include "resolve-util.h"
 #include "resolved-dns-cache.h"
-#include "resolved-dns-dnssec.h"
 #include "resolved-dns-packet.h"
-#include "resolved-dns-query.h"
-#include "resolved-dns-search-domain.h"
-#include "resolved-dns-server.h"
-#include "resolved-dns-stream.h"
 #include "resolved-dns-zone.h"
+#include "resolved-forward.h"
 
 typedef enum DnsScopeMatch {
         DNS_SCOPE_NO,
+        DNS_SCOPE_LAST_RESORT,
         DNS_SCOPE_MAYBE,
         DNS_SCOPE_YES_BASE, /* Add the number of matching labels to this */
         DNS_SCOPE_YES_END = DNS_SCOPE_YES_BASE + DNS_N_LABELS_MAX,
@@ -25,8 +21,18 @@ typedef enum DnsScopeMatch {
         _DNS_SCOPE_MATCH_INVALID = -EINVAL,
 } DnsScopeMatch;
 
-struct DnsScope {
+typedef enum DnsScopeOrigin {
+        DNS_SCOPE_GLOBAL,
+        DNS_SCOPE_LINK,
+        DNS_SCOPE_DELEGATE,
+        _DNS_SCOPE_ORIGIN_MAX,
+        _DNS_SCOPE_ORIGIN_INVALID = -EINVAL,
+} DnsScopeOrigin;
+
+typedef struct DnsScope {
         Manager *manager;
+
+        DnsScopeOrigin origin;
 
         DnsProtocol protocol;
         int family;
@@ -36,6 +42,7 @@ struct DnsScope {
         DnsOverTlsMode dns_over_tls_mode;
 
         Link *link;
+        DnsDelegate *delegate;
 
         DnsCache cache;
         DnsZone zone;
@@ -44,6 +51,8 @@ struct DnsScope {
         sd_event_source *conflict_event_source;
 
         sd_event_source *announce_event_source;
+
+        sd_event_source *mdns_goodbye_event_source;
 
         RateLimit ratelimit;
 
@@ -64,9 +73,9 @@ struct DnsScope {
         LIST_FIELDS(DnsScope, scopes);
 
         bool announced;
-};
+} DnsScope;
 
-int dns_scope_new(Manager *m, DnsScope **ret, Link *l, DnsProtocol p, int family);
+int dns_scope_new(Manager *m, DnsScope **ret, DnsScopeOrigin origin, Link *link, DnsDelegate *delegate, DnsProtocol protocol, int family);
 DnsScope* dns_scope_free(DnsScope *s);
 
 void dns_scope_packet_received(DnsScope *s, usec_t rtt);
@@ -76,7 +85,7 @@ int dns_scope_emit_udp(DnsScope *s, int fd, int af, DnsPacket *p);
 int dns_scope_socket_tcp(DnsScope *s, int family, const union in_addr_union *address, DnsServer *server, uint16_t port, union sockaddr_union *ret_socket_address);
 int dns_scope_socket_udp(DnsScope *s, DnsServer *server);
 
-DnsScopeMatch dns_scope_good_domain(DnsScope *s, DnsQuery *q);
+DnsScopeMatch dns_scope_good_domain(DnsScope *s, DnsQuery *q, uint64_t query_flags);
 bool dns_scope_good_key(DnsScope *s, const DnsResourceKey *key);
 
 DnsServer *dns_scope_get_dns_server(DnsScope *s);
@@ -103,10 +112,19 @@ bool dns_scope_name_wants_search_domain(DnsScope *s, const char *name);
 bool dns_scope_network_good(DnsScope *s);
 
 int dns_scope_ifindex(DnsScope *s);
+const char* dns_scope_ifname(DnsScope *s);
 
 int dns_scope_announce(DnsScope *scope, bool goodbye);
 
-int dns_scope_add_dnssd_services(DnsScope *scope);
-int dns_scope_remove_dnssd_services(DnsScope *scope);
+int dns_scope_add_dnssd_registered_services(DnsScope *scope);
+int dns_scope_remove_dnssd_registered_services(DnsScope *scope);
 
 bool dns_scope_is_default_route(DnsScope *scope);
+
+int dns_scope_dump_cache_to_json(DnsScope *scope, sd_json_variant **ret);
+
+int dns_type_suitable_for_protocol(uint16_t type, DnsProtocol protocol);
+int dns_question_types_suitable_for_protocol(DnsQuestion *q, DnsProtocol protocol);
+
+const char* dns_scope_origin_to_string(DnsScopeOrigin origin) _const_;
+DnsScopeOrigin dns_scope_origin_from_string(const char *s) _pure_;

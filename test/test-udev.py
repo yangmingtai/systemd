@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: LGPL-2.1-or-later
 
-# pylint: disable=missing-docstring,redefined-outer-name,invalid-name
-# pylint: disable=unspecified-encoding,no-else-return,line-too-long,too-many-lines
-# pylint: disable=multiple-imports,too-many-instance-attributes,consider-using-with
-# pylint: disable=global-statement
+# pylint: disable=redefined-outer-name,no-else-return,multiple-imports
+# pylint: disable=consider-using-with,global-statement
 
 # udev test
 #
@@ -43,7 +41,7 @@ SYS_SCRIPT     = Path(__file__).with_name('sys-script.py')
 try:
     UDEV_BIN   = Path(os.environ['UDEV_RULE_RUNNER'])
 except KeyError:
-    UDEV_BIN   = Path(__file__).parent / 'manual/udev-rule-runner'
+    UDEV_BIN   = Path(__file__).parent / 'manual/test-udev-rule-runner'
 UDEV_BIN = UDEV_BIN.absolute()
 
 # Those will be set by the udev_setup() fixture
@@ -124,7 +122,7 @@ class Device:
         print(f'check_add {self.devpath}')
 
         devnode = self.get_devnode()
-        st = devnode.stat(follow_symlinks=False)
+        st = devnode.lstat()
         assert stat.S_ISCHR(st.st_mode) or stat.S_ISBLK(st.st_mode)
         self.check_permissions(st)
         self.check_major_minor(st)
@@ -2315,6 +2313,17 @@ SUBSYSTEMS=="scsi", PROGRAM=="/bin/sh -c \"printf %%s 'foo1 foo2' | grep 'foo1 f
         SUBSYSTEM=="block", SUBSYSTEMS=="scsi", KERNEL=="sd*", SYMLINK+="blockdev"
         KERNEL=="sda6", OPTIONS+="link_priority=10"
         """),
+
+    Rules.new(
+        "case insensitive match",
+        Device(
+            "/devices/pci0000:00/0000:00:1f.2/host0/target0:0:0/0:0:0:0/block/sda/sda1",
+            exp_links     = ["ok"],
+        ),
+
+        rules = r"""
+        KERNEL==i"SDA1", SUBSYSTEMS==i"SCSI", ATTRS{vendor}==i"a?a", SYMLINK+="ok"
+        """),
 ]
 
 def fork_and_run_udev(action: str, rules: Rules) -> None:
@@ -2346,6 +2355,12 @@ def environment_issue():
                        check=False)
     if c.returncode == 0:
         return 'Running in a chroot, skipping the test'
+
+    c = subprocess.run(['systemd-detect-virt', '-c', '-q'],
+                       check=False)
+    if c.returncode == 0:
+        return 'Running in a container, skipping the test'
+
     return None
 
 

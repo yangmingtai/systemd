@@ -2,11 +2,14 @@
 
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/sysmacros.h>
 
+#include "alloc-util.h"
 #include "chase.h"
 #include "devnum-util.h"
 #include "parse-util.h"
 #include "path-util.h"
+#include "stdio-util.h"
 #include "string-util.h"
 
 int parse_devnum(const char *s, dev_t *ret) {
@@ -58,21 +61,18 @@ int device_path_make_major_minor(mode_t mode, dev_t devnum, char **ret) {
 }
 
 int device_path_make_inaccessible(mode_t mode, char **ret) {
-        char *s;
+        const char *s;
 
         assert(ret);
 
         if (S_ISCHR(mode))
-                s = strdup("/run/systemd/inaccessible/chr");
+                s = "/run/systemd/inaccessible/chr";
         else if (S_ISBLK(mode))
-                s = strdup("/run/systemd/inaccessible/blk");
+                s = "/run/systemd/inaccessible/blk";
         else
                 return -ENODEV;
-        if (!s)
-                return -ENOMEM;
 
-        *ret = s;
-        return 0;
+        return strdup_to(ret, s);
 }
 
 int device_path_make_canonical(mode_t mode, dev_t devnum, char **ret) {
@@ -135,4 +135,8 @@ int device_path_parse_major_minor(const char *path, mode_t *ret_mode, dev_t *ret
                 *ret_devnum = devnum;
 
         return 0;
+}
+
+char* format_devnum(dev_t d, char buf[static DEVNUM_STR_MAX]) {
+        return ASSERT_PTR(snprintf_ok(buf, DEVNUM_STR_MAX, DEVNUM_FORMAT_STR, DEVNUM_FORMAT_VAL(d)));
 }

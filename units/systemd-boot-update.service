@@ -10,16 +10,18 @@
 [Unit]
 Description=Automatic Boot Loader Update
 Documentation=man:bootctl(1)
+ConditionPathExists=!/etc/initrd-release
 
 DefaultDependencies=no
 After=local-fs.target
+Before=sysinit.target systemd-update-done.service
 Conflicts=shutdown.target
-Before=sysinit.target shutdown.target systemd-update-done.service
+Before=shutdown.target
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=bootctl --no-variables --graceful update
+ExecStart=bootctl --variables=no --graceful update
 
 [Install]
 WantedBy=sysinit.target

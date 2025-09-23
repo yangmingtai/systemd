@@ -1,15 +1,35 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
+#include "alloc-util.h"
+#include "env-util.h"
 #include "errno-util.h"
 #include "kbd-util.h"
 #include "log.h"
-#include "nulstr-util.h"
 #include "path-util.h"
 #include "recurse-dir.h"
 #include "set.h"
 #include "string-util.h"
 #include "strv.h"
 #include "utf8.h"
+
+#define KBD_KEYMAP_DIRS                         \
+        "/usr/share/keymaps/",                  \
+        "/usr/share/kbd/keymaps/",              \
+        "/usr/lib/kbd/keymaps/"
+
+int keymap_directories(char ***ret) {
+        assert(ret);
+
+        if (getenv_path_list("SYSTEMD_KEYMAP_DIRECTORIES", ret) >= 0)
+                return 0;
+
+        char **paths = strv_new(KBD_KEYMAP_DIRS);
+        if (!paths)
+                return log_oom_debug();
+
+        *ret = TAKE_PTR(paths);
+        return 0;
+}
 
 struct recurse_dir_userdata {
         const char *keymap_name;
@@ -64,17 +84,22 @@ static int keymap_recurse_dir_callback(
 }
 
 int get_keymaps(char ***ret) {
-        _cleanup_(set_free_freep) Set *keymaps = NULL;
+        _cleanup_set_free_ Set *keymaps = NULL;
+        _cleanup_strv_free_ char **keymap_dirs = NULL;
         int r;
 
-        keymaps = set_new(&string_hash_ops);
+        r = keymap_directories(&keymap_dirs);
+        if (r < 0)
+                return r;
+
+        keymaps = set_new(&string_hash_ops_free);
         if (!keymaps)
                 return -ENOMEM;
 
-        NULSTR_FOREACH(dir, KBD_KEYMAP_DIRS) {
+        STRV_FOREACH(dir, keymap_dirs) {
                 r = recurse_dir_at(
                                 AT_FDCWD,
-                                dir,
+                                *dir,
                                 /* statx_mask= */ 0,
                                 /* n_depth_max= */ UINT_MAX,
                                 RECURSE_DIR_IGNORE_DOT|RECURSE_DIR_ENSURE_TYPE,
@@ -82,23 +107,17 @@ int get_keymaps(char ***ret) {
                                 &(struct recurse_dir_userdata) {
                                         .keymaps = keymaps,
                                 });
-                if (r < 0) {
-                        if (r == -ENOENT)
-                                continue;
-                        if (ERRNO_IS_RESOURCE(r))
-                                return log_warning_errno(r, "Failed to read keymap list from %s: %m", dir);
-
-                        log_debug_errno(r, "Failed to read keymap list from %s, ignoring: %m", dir);
-                }
+                if (r == -ENOENT)
+                        continue;
+                if (ERRNO_IS_NEG_RESOURCE(r))
+                        return log_warning_errno(r, "Failed to read keymap list from %s: %m", *dir);
+                if (r < 0)
+                        log_debug_errno(r, "Failed to read keymap list from %s, ignoring: %m", *dir);
         }
 
-        _cleanup_strv_free_ char **l = set_get_strv(keymaps);
+        _cleanup_strv_free_ char **l = set_to_strv(&keymaps);
         if (!l)
                 return -ENOMEM;
-
-        keymaps = set_free(keymaps); /* If we got the strv above, then do a set_free() rather than
-                                      * set_free_free() since the entries of the set are now owned by the
-                                      * strv */
 
         if (strv_isempty(l))
                 return -ENOENT;
@@ -129,15 +148,20 @@ bool keymap_is_valid(const char *name) {
 }
 
 int keymap_exists(const char *name) {
-        int r = 0;
+        _cleanup_strv_free_ char **keymap_dirs = NULL;
+        int r;
 
         if (!keymap_is_valid(name))
                 return -EINVAL;
 
-        NULSTR_FOREACH(dir, KBD_KEYMAP_DIRS) {
+        r = keymap_directories(&keymap_dirs);
+        if (r < 0)
+                return r;
+
+        STRV_FOREACH(dir, keymap_dirs) {
                 r = recurse_dir_at(
                                 AT_FDCWD,
-                                dir,
+                                *dir,
                                 /* statx_mask= */ 0,
                                 /* n_depth_max= */ UINT_MAX,
                                 RECURSE_DIR_IGNORE_DOT|RECURSE_DIR_ENSURE_TYPE,
@@ -145,17 +169,13 @@ int keymap_exists(const char *name) {
                                 &(struct recurse_dir_userdata) {
                                         .keymap_name = name,
                                 });
-                if (r == -ENOENT)
-                        continue;
-                if (ERRNO_IS_RESOURCE(r))
-                        return r;
-                if (r < 0) {
-                        log_debug_errno(r, "Failed to read keymap list from %s, ignoring: %m", dir);
-                        continue;
-                }
                 if (r > 0)
-                        break;
+                        return true;
+                if (ERRNO_IS_NEG_RESOURCE(r))
+                        return r;
+                if (r < 0 && r != -ENOENT)
+                        log_debug_errno(r, "Failed to read keymap list from %s, ignoring: %m", *dir);
         }
 
-        return r > 0;
+        return false;
 }

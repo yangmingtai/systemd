@@ -1,15 +1,17 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <poll.h>
+#include <sys/socket.h>
 
 #include "sd-login.h"
 
 #include "alloc-util.h"
+#include "argv-util.h"
 #include "errno-list.h"
 #include "fd-util.h"
 #include "format-util.h"
 #include "log.h"
-#include "missing_syscall.h"
+#include "pidfd-util.h"
 #include "process-util.h"
 #include "string-util.h"
 #include "strv.h"
@@ -34,12 +36,10 @@ static char* format_uids(char **buf, uid_t* uids, int count) {
         return *buf;
 }
 
-static const char *e(int r) {
-        return r == 0 ? "OK" : errno_to_name(r);
-}
+#define e(r) (r == 0 ? "OK" : ERRNO_NAME(r))
 
 TEST(login) {
-        _cleanup_close_pair_ int pair[2] = PIPE_EBADF;
+        _cleanup_close_pair_ int pair[2] = EBADF_PAIR;
         _cleanup_free_ char *pp = NULL, *qq = NULL,
                 *display_session = NULL, *cgroup = NULL,
                 *display = NULL, *remote_user = NULL, *remote_host = NULL,
@@ -103,7 +103,7 @@ TEST(login) {
                 assert_se(IN_SET(r, 0, -ENOMEDIUM));
         }
 
-        r = sd_uid_get_display(u2, &display_session);
+        r = ASSERT_RETURN_IS_CRITICAL(uid_is_valid(u2), sd_uid_get_display(u2, &display_session));
         log_info("sd_uid_get_display("UID_FMT", …) → %s / \"%s\"", u2, e(r), strnull(display_session));
         if (u2 == UID_INVALID)
                 assert_se(r == -EINVAL);
@@ -115,7 +115,7 @@ TEST(login) {
         sd_peer_get_session(pair[1], &qq);
         assert_se(streq_ptr(pp, qq));
 
-        r = sd_uid_get_sessions(u2, false, &sessions);
+        r = ASSERT_RETURN_IS_CRITICAL(uid_is_valid(u2), sd_uid_get_sessions(u2, false, &sessions));
         assert_se(t = strv_join(sessions, " "));
         log_info("sd_uid_get_sessions("UID_FMT", …) → %s \"%s\"", u2, e(r), t);
         if (u2 == UID_INVALID)
@@ -127,9 +127,9 @@ TEST(login) {
         sessions = strv_free(sessions);
         free(t);
 
-        assert_se(r == sd_uid_get_sessions(u2, false, NULL));
+        assert_se(r == ASSERT_RETURN_IS_CRITICAL(uid_is_valid(u2), sd_uid_get_sessions(u2, false, NULL)));
 
-        r = sd_uid_get_seats(u2, false, &seats);
+        r = ASSERT_RETURN_IS_CRITICAL(uid_is_valid(u2), sd_uid_get_seats(u2, false, &seats));
         assert_se(t = strv_join(seats, " "));
         log_info("sd_uid_get_seats("UID_FMT", …) → %s \"%s\"", u2, e(r), t);
         if (u2 == UID_INVALID)
@@ -141,7 +141,7 @@ TEST(login) {
         seats = strv_free(seats);
         free(t);
 
-        assert_se(r == sd_uid_get_seats(u2, false, NULL));
+        assert_se(r == ASSERT_RETURN_IS_CRITICAL(uid_is_valid(u2), sd_uid_get_seats(u2, false, NULL)));
 
         if (session) {
                 r = sd_session_is_active(session);
@@ -327,6 +327,9 @@ TEST(monitor) {
 }
 
 static int intro(void) {
+        if (IN_SET(cg_unified(), -ENOENT, -ENOMEDIUM))
+                return log_tests_skipped("cgroupfs is not mounted");
+
         log_info("/* Information printed is from the live system */");
         return EXIT_SUCCESS;
 }

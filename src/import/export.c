@@ -4,23 +4,26 @@
 #include <locale.h>
 
 #include "sd-event.h"
-#include "sd-id128.h"
 
 #include "alloc-util.h"
+#include "ansi-color.h"
 #include "build.h"
 #include "discover-image.h"
 #include "export-raw.h"
 #include "export-tar.h"
 #include "fd-util.h"
-#include "fs-util.h"
-#include "hostname-util.h"
-#include "import-util.h"
+#include "import-common.h"
+#include "log.h"
 #include "main-func.h"
+#include "runtime-scope.h"
 #include "signal-util.h"
 #include "string-util.h"
+#include "terminal-util.h"
 #include "verbs.h"
 
 static ImportCompressType arg_compress = IMPORT_COMPRESS_UNKNOWN;
+static ImageClass arg_class = IMAGE_MACHINE;
+static RuntimeScope arg_runtime_scope = _RUNTIME_SCOPE_INVALID;
 
 static void determine_compression_from_filename(const char *p) {
 
@@ -38,14 +41,10 @@ static void determine_compression_from_filename(const char *p) {
                 arg_compress = IMPORT_COMPRESS_GZIP;
         else if (endswith(p, ".bz2"))
                 arg_compress = IMPORT_COMPRESS_BZIP2;
+        else if (endswith(p, ".zst"))
+                arg_compress = IMPORT_COMPRESS_ZSTD;
         else
                 arg_compress = IMPORT_COMPRESS_UNCOMPRESSED;
-}
-
-static int interrupt_signal_handler(sd_event_source *s, const struct signalfd_siginfo *si, void *userdata) {
-        log_notice("Transfer aborted.");
-        sd_event_exit(sd_event_source_get_event(s), EINTR);
-        return 0;
 }
 
 static void on_tar_finished(TarExport *export, int error, void *userdata) {
@@ -55,7 +54,7 @@ static void on_tar_finished(TarExport *export, int error, void *userdata) {
         if (error == 0)
                 log_info("Operation completed successfully.");
 
-        sd_event_exit(event, abs(error));
+        sd_event_exit(event, ABS(error));
 }
 
 static int export_tar(int argc, char *argv[], void *userdata) {
@@ -66,12 +65,13 @@ static int export_tar(int argc, char *argv[], void *userdata) {
         _cleanup_close_ int open_fd = -EBADF;
         int r, fd;
 
-        if (hostname_is_valid(argv[1], 0)) {
-                r = image_find(IMAGE_MACHINE, argv[1], NULL, &image);
+        local = argv[1];
+        if (image_name_is_valid(local)) {
+                r = image_find(arg_runtime_scope, arg_class, local, NULL, &image);
                 if (r == -ENOENT)
-                        return log_error_errno(r, "Machine image %s not found.", argv[1]);
+                        return log_error_errno(r, "Image %s not found.", local);
                 if (r < 0)
-                        return log_error_errno(r, "Failed to look for machine %s: %m", argv[1]);
+                        return log_error_errno(r, "Failed to look for image %s: %m", local);
 
                 local = image->path;
         } else
@@ -94,19 +94,18 @@ static int export_tar(int argc, char *argv[], void *userdata) {
         } else {
                 _cleanup_free_ char *pretty = NULL;
 
+                if (isatty_safe(STDOUT_FILENO))
+                        return log_error_errno(SYNTHETIC_ERRNO(EBADF), "Refusing to write archive to TTY.");
+
                 fd = STDOUT_FILENO;
 
                 (void) fd_get_path(fd, &pretty);
                 log_info("Exporting '%s', saving to '%s' with compression '%s'.", local, strna(pretty), import_compress_type_to_string(arg_compress));
         }
 
-        r = sd_event_default(&event);
+        r = import_allocate_event_with_signals(&event);
         if (r < 0)
-                return log_error_errno(r, "Failed to allocate event loop: %m");
-
-        assert_se(sigprocmask_many(SIG_BLOCK, NULL, SIGTERM, SIGINT, -1) >= 0);
-        (void) sd_event_add_signal(event, NULL, SIGTERM, interrupt_signal_handler,  NULL);
-        (void) sd_event_add_signal(event, NULL, SIGINT, interrupt_signal_handler, NULL);
+                return r;
 
         r = tar_export_new(&export, event, on_tar_finished, event);
         if (r < 0)
@@ -131,7 +130,7 @@ static void on_raw_finished(RawExport *export, int error, void *userdata) {
         if (error == 0)
                 log_info("Operation completed successfully.");
 
-        sd_event_exit(event, abs(error));
+        sd_event_exit(event, ABS(error));
 }
 
 static int export_raw(int argc, char *argv[], void *userdata) {
@@ -142,12 +141,13 @@ static int export_raw(int argc, char *argv[], void *userdata) {
         _cleanup_close_ int open_fd = -EBADF;
         int r, fd;
 
-        if (hostname_is_valid(argv[1], 0)) {
-                r = image_find(IMAGE_MACHINE, argv[1], NULL, &image);
+        local = argv[1];
+        if (image_name_is_valid(local)) {
+                r = image_find(arg_runtime_scope, arg_class, local, NULL, &image);
                 if (r == -ENOENT)
-                        return log_error_errno(r, "Machine image %s not found.", argv[1]);
+                        return log_error_errno(r, "Image %s not found.", local);
                 if (r < 0)
-                        return log_error_errno(r, "Failed to look for machine %s: %m", argv[1]);
+                        return log_error_errno(r, "Failed to look for image %s: %m", local);
 
                 local = image->path;
         } else
@@ -176,13 +176,9 @@ static int export_raw(int argc, char *argv[], void *userdata) {
                 log_info("Exporting '%s', saving to '%s' with compression '%s'.", local, strna(pretty), import_compress_type_to_string(arg_compress));
         }
 
-        r = sd_event_default(&event);
+        r = import_allocate_event_with_signals(&event);
         if (r < 0)
-                return log_error_errno(r, "Failed to allocate event loop: %m");
-
-        assert_se(sigprocmask_many(SIG_BLOCK, NULL, SIGTERM, SIGINT, -1) >= 0);
-        (void) sd_event_add_signal(event, NULL, SIGTERM, interrupt_signal_handler,  NULL);
-        (void) sd_event_add_signal(event, NULL, SIGINT, interrupt_signal_handler, NULL);
+                return r;
 
         r = raw_export_new(&export, event, on_raw_finished, event);
         if (r < 0)
@@ -201,16 +197,22 @@ static int export_raw(int argc, char *argv[], void *userdata) {
 }
 
 static int help(int argc, char *argv[], void *userdata) {
-
-        printf("%s [OPTIONS...] {COMMAND} ...\n\n"
-               "Export container or virtual machine images.\n\n"
+        printf("%1$s [OPTIONS...] {COMMAND} ...\n"
+               "\n%4$sExport disk images.%5$s\n"
+               "\n%2$sCommands:%3$s\n"
+               "  tar NAME [FILE]              Export a TAR image\n"
+               "  raw NAME [FILE]              Export a RAW image\n"
+               "\n%2$sOptions:%3$s\n"
                "  -h --help                    Show this help\n"
                "     --version                 Show package version\n"
-               "     --format=FORMAT           Select format\n\n"
-               "Commands:\n"
-               "  tar NAME [FILE]              Export a TAR image\n"
-               "  raw NAME [FILE]              Export a RAW image\n",
-               program_invocation_short_name);
+               "     --format=FORMAT           Select format\n"
+               "     --class=CLASS             Select image class (machine, sysext, confext,\n"
+               "                               portable)\n",
+               program_invocation_short_name,
+               ansi_underline(),
+               ansi_normal(),
+               ansi_highlight(),
+               ansi_normal());
 
         return 0;
 }
@@ -220,12 +222,14 @@ static int parse_argv(int argc, char *argv[]) {
         enum {
                 ARG_VERSION = 0x100,
                 ARG_FORMAT,
+                ARG_CLASS,
         };
 
         static const struct option options[] = {
                 { "help",    no_argument,       NULL, 'h'         },
                 { "version", no_argument,       NULL, ARG_VERSION },
                 { "format",  required_argument, NULL, ARG_FORMAT  },
+                { "class",   required_argument, NULL, ARG_CLASS   },
                 {}
         };
 
@@ -253,9 +257,18 @@ static int parse_argv(int argc, char *argv[]) {
                                 arg_compress = IMPORT_COMPRESS_GZIP;
                         else if (streq(optarg, "bzip2"))
                                 arg_compress = IMPORT_COMPRESS_BZIP2;
+                        else if (streq(optarg, "zstd"))
+                                arg_compress = IMPORT_COMPRESS_ZSTD;
                         else
                                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                                        "Unknown format: %s", optarg);
+                        break;
+
+                case ARG_CLASS:
+                        arg_class = image_class_from_string(optarg);
+                        if (arg_class < 0)
+                                return log_error_errno(arg_class, "Failed to parse --class= argument: %s", optarg);
+
                         break;
 
                 case '?':
@@ -283,8 +296,7 @@ static int run(int argc, char *argv[]) {
         int r;
 
         setlocale(LC_ALL, "");
-        log_parse_environment();
-        log_open();
+        log_setup();
 
         r = parse_argv(argc, argv);
         if (r <= 0)

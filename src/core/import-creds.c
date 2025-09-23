@@ -1,17 +1,22 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
+#include <stdlib.h>
 #include <sys/mount.h>
+#include <unistd.h>
 
+#include "confidential-virt.h"
 #include "copy.h"
 #include "creds-util.h"
+#include "errno-util.h"
 #include "escape.h"
 #include "fileio.h"
 #include "format-util.h"
 #include "fs-util.h"
 #include "hexdecoct.h"
-#include "initrd-util.h"
 #include "import-creds.h"
+#include "initrd-util.h"
 #include "io-util.h"
+#include "log.h"
 #include "mkdir-label.h"
 #include "mount-util.h"
 #include "mountpoint-util.h"
@@ -19,6 +24,9 @@
 #include "path-util.h"
 #include "proc-cmdline.h"
 #include "recurse-dir.h"
+#include "smbios11.h"
+#include "stat-util.h"
+#include "string-util.h"
 #include "strv.h"
 #include "virt.h"
 
@@ -70,21 +78,36 @@ static void import_credentials_context_free(ImportCredentialContext *c) {
         c->target_dir_fd = safe_close(c->target_dir_fd);
 }
 
-static int acquire_encrypted_credential_directory(ImportCredentialContext *c) {
+static int acquire_credential_directory(ImportCredentialContext *c, const char *path, bool with_mount) {
         int r;
 
         assert(c);
+        assert(path);
 
         if (c->target_dir_fd >= 0)
                 return c->target_dir_fd;
 
-        r = mkdir_safe_label(ENCRYPTED_SYSTEM_CREDENTIALS_DIRECTORY, 0700, 0, 0, MKDIR_WARN_MODE);
-        if (r < 0)
-                return log_error_errno(r, "Failed to create " ENCRYPTED_SYSTEM_CREDENTIALS_DIRECTORY ": %m");
+        r = path_is_mount_point(path);
+        if (r < 0) {
+                if (r != -ENOENT)
+                        return log_error_errno(r, "Failed to determine if %s is a mount point: %m", path);
 
-        c->target_dir_fd = open(ENCRYPTED_SYSTEM_CREDENTIALS_DIRECTORY, O_RDONLY|O_DIRECTORY|O_CLOEXEC);
+                r = mkdir_safe_label(path, 0700, 0, 0, MKDIR_WARN_MODE);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to create %s mount point: %m", path);
+
+                r = 0; /* Now it exists and is not a mount point */
+        }
+        if (r > 0)
+                /* If already a mount point, then remount writable */
+                (void) mount_nofollow_verbose(LOG_WARNING, NULL, path, NULL, MS_BIND|MS_REMOUNT|credentials_fs_mount_flags(/* ro= */ false), NULL);
+        else if (with_mount)
+                /* If not a mount point yet, and the credentials are not encrypted, then let's try to mount a no-swap fs there */
+                (void) mount_credentials_fs(path, CREDENTIALS_TOTAL_SIZE_MAX, /* ro= */ false);
+
+        c->target_dir_fd = open(path, O_RDONLY|O_DIRECTORY|O_CLOEXEC);
         if (c->target_dir_fd < 0)
-                return log_error_errno(errno, "Failed to open " ENCRYPTED_SYSTEM_CREDENTIALS_DIRECTORY ": %m");
+                return log_error_errno(errno, "Failed to open %s: %m", path);
 
         return c->target_dir_fd;
 }
@@ -137,7 +160,7 @@ static int finalize_credentials_dir(const char *dir, const char *envvar) {
         if (r < 0)
                 log_warning_errno(r, "Failed to make '%s' a mount point, ignoring: %m", dir);
         else
-                (void) mount_nofollow_verbose(LOG_WARNING, NULL, dir, NULL, MS_BIND|MS_NODEV|MS_NOEXEC|MS_NOSUID|MS_RDONLY|MS_REMOUNT, NULL);
+                (void) mount_nofollow_verbose(LOG_WARNING, NULL, dir, NULL, MS_BIND|MS_REMOUNT|credentials_fs_mount_flags(/* ro= */ true), NULL);
 
         if (setenv(envvar, dir, /* overwrite= */ true) < 0)
                 return log_error_errno(errno, "Failed to set $%s environment variable: %m", envvar);
@@ -185,8 +208,8 @@ static int import_credentials_boot(void) {
                         continue;
                 }
 
-                for (size_t i = 0; i < de->n_entries; i++) {
-                        const struct dirent *d = de->entries[i];
+                FOREACH_ARRAY(i, de->entries, de->n_entries) {
+                        const struct dirent *d = *i;
                         _cleanup_close_ int cfd = -EBADF, nfd = -EBADF;
                         _cleanup_free_ char *n = NULL;
                         const char *e;
@@ -227,7 +250,7 @@ static int import_credentials_boot(void) {
                         if (!credential_size_ok(&context, n, st.st_size))
                                 continue;
 
-                        r = acquire_encrypted_credential_directory(&context);
+                        r = acquire_credential_directory(&context, ENCRYPTED_SYSTEM_CREDENTIALS_DIRECTORY, /* with_mount= */ false);
                         if (r < 0)
                                 return r;
 
@@ -261,48 +284,23 @@ static int import_credentials_boot(void) {
         return 0;
 }
 
-static int acquire_credential_directory(ImportCredentialContext *c) {
-        int r;
-
-        assert(c);
-
-        if (c->target_dir_fd >= 0)
-                return c->target_dir_fd;
-
-        r = path_is_mount_point(SYSTEM_CREDENTIALS_DIRECTORY, NULL, 0);
-        if (r < 0) {
-                if (r != -ENOENT)
-                        return log_error_errno(r, "Failed to determine if " SYSTEM_CREDENTIALS_DIRECTORY " is a mount point: %m");
-
-                r = mkdir_safe_label(SYSTEM_CREDENTIALS_DIRECTORY, 0700, 0, 0, MKDIR_WARN_MODE);
-                if (r < 0)
-                        return log_error_errno(r, "Failed to create " SYSTEM_CREDENTIALS_DIRECTORY " mount point: %m");
-
-                r = 0; /* Now it exists and is not a mount point */
-        }
-        if (r == 0)
-                /* If not a mountpoint yet, try to mount a ramfs there (so that this stuff isn't swapped
-                 * out), but if that doesn't work, let's just use the regular tmpfs it already is. */
-                (void) mount_nofollow_verbose(LOG_WARNING, "ramfs", SYSTEM_CREDENTIALS_DIRECTORY, "ramfs", MS_NODEV|MS_NOEXEC|MS_NOSUID, "mode=0700");
-
-        c->target_dir_fd = open(SYSTEM_CREDENTIALS_DIRECTORY, O_RDONLY|O_DIRECTORY|O_CLOEXEC);
-        if (c->target_dir_fd < 0)
-                return log_error_errno(errno, "Failed to open " SYSTEM_CREDENTIALS_DIRECTORY ": %m");
-
-        return c->target_dir_fd;
-}
-
 static int proc_cmdline_callback(const char *key, const char *value, void *data) {
         ImportCredentialContext *c = ASSERT_PTR(data);
+        _cleanup_free_ void *binary = NULL;
         _cleanup_free_ char *n = NULL;
         _cleanup_close_ int nfd = -EBADF;
-        const char *colon;
+        const char *colon, *d;
+        bool base64;
         size_t l;
         int r;
 
         assert(key);
 
-        if (!proc_cmdline_key_streq(key, "systemd.set_credential"))
+        if (proc_cmdline_key_streq(key, "systemd.set_credential"))
+                base64 = false;
+        else if (proc_cmdline_key_streq(key, "systemd.set_credential_binary"))
+                base64 = true;
+        else
                 return 0;
 
         colon = value ? strchr(value, ':') : NULL;
@@ -321,12 +319,24 @@ static int proc_cmdline_callback(const char *key, const char *value, void *data)
         }
 
         colon++;
-        l = strlen(colon);
+
+        if (base64) {
+                r = unbase64mem(colon, &binary, &l);
+                if (r < 0) {
+                        log_warning_errno(r, "Failed to decode binary credential '%s' data, ignoring: %m", n);
+                        return 0;
+                }
+
+                d = binary;
+        } else {
+                d = colon;
+                l = strlen(colon);
+        }
 
         if (!credential_size_ok(c, n, l))
                 return 0;
 
-        r = acquire_credential_directory(c);
+        r = acquire_credential_directory(c, SYSTEM_CREDENTIALS_DIRECTORY, /* with_mount= */ true);
         if (r < 0)
                 return r;
 
@@ -336,7 +346,7 @@ static int proc_cmdline_callback(const char *key, const char *value, void *data)
         if (nfd < 0)
                 return nfd;
 
-        r = loop_write(nfd, colon, l, /* do_poll= */ false);
+        r = loop_write(nfd, d, l);
         if (r < 0) {
                 (void) unlinkat(c->target_dir_fd, n, 0);
                 return log_error_errno(r, "Failed to write credential: %m");
@@ -372,6 +382,9 @@ static int import_credentials_qemu(ImportCredentialContext *c) {
         assert(c);
 
         if (detect_container() > 0) /* don't access /sys/ in a container */
+                return 0;
+
+        if (detect_confidential_virtualization() > 0) /* don't trust firmware if confidential VMs */
                 return 0;
 
         source_dir_fd = open(QEMU_FWCFG_PATH, O_RDONLY|O_DIRECTORY|O_CLOEXEC);
@@ -433,7 +446,7 @@ static int import_credentials_qemu(ImportCredentialContext *c) {
                         continue;
                 }
 
-                r = acquire_credential_directory(c);
+                r = acquire_credential_directory(c, SYSTEM_CREDENTIALS_DIRECTORY, /* with_mount= */ true);
                 if (r < 0)
                         return r;
 
@@ -513,13 +526,13 @@ static int parse_smbios_strings(ImportCredentialContext *c, const char *data, si
                         return log_oom();
 
                 if (!credential_name_valid(cn)) {
-                        log_warning("SMBIOS credential name '%s' is not valid, ignoring: %m", cn);
+                        log_warning("SMBIOS credential name '%s' is not valid, ignoring.", cn);
                         continue;
                 }
 
                 /* Optionally base64 decode the data, if requested, to allow binary credentials */
                 if (unbase64) {
-                        r = unbase64mem(eq + 1, nul - (eq + 1), &buf, &buflen);
+                        r = unbase64mem_full(eq + 1, nul - (eq + 1), /* secure = */ false, &buf, &buflen);
                         if (r < 0) {
                                 log_warning_errno(r, "Failed to base64 decode credential '%s', ignoring: %m", cn);
                                 continue;
@@ -535,7 +548,7 @@ static int parse_smbios_strings(ImportCredentialContext *c, const char *data, si
                 if (!credential_size_ok(c, cn, cdata_len))
                         continue;
 
-                r = acquire_credential_directory(c);
+                r = acquire_credential_directory(c, SYSTEM_CREDENTIALS_DIRECTORY, /* with_mount= */ true);
                 if (r < 0)
                         return r;
 
@@ -545,7 +558,7 @@ static int parse_smbios_strings(ImportCredentialContext *c, const char *data, si
                 if (nfd < 0)
                         return nfd;
 
-                r = loop_write(nfd, cdata, cdata_len, /* do_poll= */ false);
+                r = loop_write(nfd, cdata, cdata_len);
                 if (r < 0) {
                         (void) unlinkat(c->target_dir_fd, cn, 0);
                         return log_error_errno(r, "Failed to write credential: %m");
@@ -568,39 +581,22 @@ static int import_credentials_smbios(ImportCredentialContext *c) {
         if (detect_container() > 0) /* don't access /sys/ in a container */
                 return 0;
 
+        if (detect_confidential_virtualization() > 0) /* don't trust firmware if confidential VMs */
+                return 0;
+
         for (unsigned i = 0;; i++) {
-                struct dmi_field_header {
-                        uint8_t type;
-                        uint8_t length;
-                        uint16_t handle;
-                        uint8_t count;
-                        char contents[];
-                } _packed_ *dmi_field_header;
-                _cleanup_free_ char *p = NULL;
-                _cleanup_free_ void *data = NULL;
+                _cleanup_free_ char *data = NULL;
                 size_t size;
 
-                assert_cc(offsetof(struct dmi_field_header, contents) == 5);
-
-                if (asprintf(&p, "/sys/firmware/dmi/entries/11-%u/raw", i) < 0)
-                        return log_oom();
-
-                r = read_virtual_file(p, sizeof(dmi_field_header) + CREDENTIALS_TOTAL_SIZE_MAX, (char**) &data, &size);
+                r = read_smbios11_field(i, CREDENTIALS_TOTAL_SIZE_MAX, &data, &size);
+                if (r == -ENOENT) /* Once we reach ENOENT there are no more DMI Type 11 fields around. */
+                        break;
                 if (r < 0) {
-                        /* Once we reach ENOENT there are no more DMI Type 11 fields around. */
-                        log_full_errno(r == -ENOENT ? LOG_DEBUG : LOG_WARNING, r, "Failed to open '%s', ignoring: %m", p);
+                        log_warning_errno(r, "Failed to read SMBIOS type #11 object %u, ignoring: %m", i);
                         break;
                 }
 
-                if (size < offsetof(struct dmi_field_header, contents))
-                        return log_error_errno(SYNTHETIC_ERRNO(EBADMSG), "DMI field header of '%s' too short.", p);
-
-                dmi_field_header = data;
-                if (dmi_field_header->type != 11 ||
-                    dmi_field_header->length != offsetof(struct dmi_field_header, contents))
-                        return log_error_errno(SYNTHETIC_ERRNO(EBADMSG), "Invalid DMI field header.");
-
-                r = parse_smbios_strings(c, dmi_field_header->contents, size - offsetof(struct dmi_field_header, contents));
+                r = parse_smbios_strings(c, data, size);
                 if (r < 0)
                         return r;
 
@@ -611,27 +607,157 @@ static int import_credentials_smbios(ImportCredentialContext *c) {
         return 0;
 }
 
+static int import_credentials_initrd(ImportCredentialContext *c) {
+        _cleanup_free_ DirectoryEntries *de = NULL;
+        _cleanup_close_ int source_dir_fd = -EBADF;
+        int r;
+
+        assert(c);
+
+        /* This imports credentials from /run/credentials/@initrd/ into our credentials directory and deletes
+         * the source directory afterwards. This is run once after the initrd → host transition. This is
+         * supposed to establish a well-defined avenue for initrd-based host configurators to pass
+         * credentials into the main system. */
+
+        if (in_initrd())
+                return 0;
+
+        source_dir_fd = open("/run/credentials/@initrd", O_RDONLY|O_DIRECTORY|O_CLOEXEC|O_NOFOLLOW);
+        if (source_dir_fd < 0) {
+                if (errno == ENOENT)
+                        log_debug_errno(errno, "No credentials passed from initrd.");
+                else
+                        log_warning_errno(errno, "Failed to open '%s', ignoring: %m", "/run/credentials/@initrd");
+                return 0;
+        }
+
+        r = readdir_all(source_dir_fd, RECURSE_DIR_SORT|RECURSE_DIR_IGNORE_DOT, &de);
+        if (r < 0) {
+                log_warning_errno(r, "Failed to read '/run/credentials/@initrd' contents, ignoring: %m");
+                return 0;
+        }
+
+        FOREACH_ARRAY(entry, de->entries, de->n_entries) {
+                _cleanup_close_ int cfd = -EBADF, nfd = -EBADF;
+                const struct dirent *d = *entry;
+                struct stat st;
+
+                if (!credential_name_valid(d->d_name)) {
+                        log_warning("Credential '%s' has invalid name, ignoring.", d->d_name);
+                        continue;
+                }
+
+                cfd = openat(source_dir_fd, d->d_name, O_RDONLY|O_CLOEXEC);
+                if (cfd < 0) {
+                        log_warning_errno(errno, "Failed to open %s, ignoring: %m", d->d_name);
+                        continue;
+                }
+
+                if (fstat(cfd, &st) < 0) {
+                        log_warning_errno(errno, "Failed to stat %s, ignoring: %m", d->d_name);
+                        continue;
+                }
+
+                r = stat_verify_regular(&st);
+                if (r < 0) {
+                        log_warning_errno(r, "Credential file %s is not a regular file, ignoring: %m", d->d_name);
+                        continue;
+                }
+
+                if (!credential_size_ok(c, d->d_name, st.st_size))
+                        continue;
+
+                r = acquire_credential_directory(c, SYSTEM_CREDENTIALS_DIRECTORY, /* with_mount= */ true);
+                if (r < 0)
+                        return r;
+
+                nfd = open_credential_file_for_write(c->target_dir_fd, SYSTEM_CREDENTIALS_DIRECTORY, d->d_name);
+                if (nfd == -EEXIST)
+                        continue;
+                if (nfd < 0)
+                        return nfd;
+
+                r = copy_bytes(cfd, nfd, st.st_size, 0);
+                if (r < 0) {
+                        (void) unlinkat(c->target_dir_fd, d->d_name, 0);
+                        return log_error_errno(r, "Failed to create credential '%s': %m", d->d_name);
+                }
+
+                c->size_sum += st.st_size;
+                c->n_credentials++;
+
+                log_debug("Successfully copied initrd credential '%s'.", d->d_name);
+
+                (void) unlinkat(source_dir_fd, d->d_name, 0);
+        }
+
+        source_dir_fd = safe_close(source_dir_fd);
+
+        if (rmdir("/run/credentials/@initrd") < 0)
+                log_warning_errno(errno, "Failed to remove /run/credentials/@initrd after import, ignoring: %m");
+
+        return 0;
+}
+
 static int import_credentials_trusted(void) {
         _cleanup_(import_credentials_context_free) ImportCredentialContext c = {
                 .target_dir_fd = -EBADF,
         };
-        int q, w, r;
+        int q, w, r, y;
+
+        /* This is invoked during early boot when no credentials have been imported so far. (Specifically, if
+         * the $CREDENTIALS_DIRECTORY or $ENCRYPTED_CREDENTIALS_DIRECTORY environment variables are not set
+         * yet.) */
 
         r = import_credentials_qemu(&c);
         w = import_credentials_smbios(&c);
         q = import_credentials_proc_cmdline(&c);
+        y = import_credentials_initrd(&c);
 
         if (c.n_credentials > 0) {
                 int z;
 
-                log_debug("Imported %u credentials from kernel command line/smbios/fw_cfg.", c.n_credentials);
+                log_debug("Imported %u credentials from kernel command line/smbios/fw_cfg/initrd.", c.n_credentials);
 
                 z = finalize_credentials_dir(SYSTEM_CREDENTIALS_DIRECTORY, "CREDENTIALS_DIRECTORY");
                 if (z < 0)
                         return z;
         }
 
-        return r < 0 ? r : w < 0 ? w : q;
+        return r < 0 ? r : w < 0 ? w : q < 0 ? q : y;
+}
+
+static int merge_credentials_trusted(const char *creds_dir) {
+        _cleanup_(import_credentials_context_free) ImportCredentialContext c = {
+                .target_dir_fd = -EBADF,
+        };
+        int r;
+
+        /* This is invoked after the initrd → host transitions, when credentials already have been imported,
+         * but we might want to import some more from the initrd. */
+
+        if (in_initrd())
+                return 0;
+
+        /* Do not try to merge initrd credentials into foreign credentials directories */
+        if (!path_equal(creds_dir, SYSTEM_CREDENTIALS_DIRECTORY)) {
+                log_debug("Not importing initrd credentials, as foreign $CREDENTIALS_DIRECTORY has been set.");
+                return 0;
+        }
+
+        r = import_credentials_initrd(&c);
+
+        if (c.n_credentials > 0) {
+                int z;
+
+                log_debug("Merged %u credentials from initrd.", c.n_credentials);
+
+                z = finalize_credentials_dir(SYSTEM_CREDENTIALS_DIRECTORY, "CREDENTIALS_DIRECTORY");
+                if (z < 0)
+                        return z;
+        }
+
+        return r;
 }
 
 static int symlink_credential_dir(const char *envvar, const char *path, const char *where) {
@@ -657,10 +783,78 @@ static int symlink_credential_dir(const char *envvar, const char *path, const ch
         return 0;
 }
 
+static int setenv_notify_socket(void) {
+        _cleanup_free_ char *address = NULL;
+        int r;
+
+        r = read_credential_with_decryption("vmm.notify_socket", (void **)&address, /* ret_size= */ NULL);
+        if (r < 0)
+                return log_warning_errno(r, "Failed to read 'vmm.notify_socket' credential, ignoring: %m");
+
+        if (isempty(address))
+                return 0;
+
+        if (setenv("NOTIFY_SOCKET", address, /* replace= */ 1) < 0)
+                return log_warning_errno(errno, "Failed to set $NOTIFY_SOCKET environment variable, ignoring: %m");
+
+        return 1;
+}
+
+static int report_credentials_per_func(const char *title, int (*get_directory_func)(const char **ret)) {
+        _cleanup_free_ DirectoryEntries *de = NULL;
+        _cleanup_free_ char *ll = NULL;
+        const char *d = NULL;
+        int r, c = 0;
+
+        assert(title);
+        assert(get_directory_func);
+
+        r = get_directory_func(&d);
+        if (r < 0) {
+                if (r == -ENXIO) /* Env var not set */
+                        return 0;
+
+                return log_warning_errno(r, "Failed to determine %s directory: %m", title);
+        }
+
+        r = readdir_all_at(AT_FDCWD, d, RECURSE_DIR_SORT|RECURSE_DIR_IGNORE_DOT, &de);
+        if (r < 0)
+                return log_warning_errno(r, "Failed to enumerate credentials directory %s: %m", d);
+
+        FOREACH_ARRAY(entry, de->entries, de->n_entries) {
+                const struct dirent *e = *entry;
+
+                if (!credential_name_valid(e->d_name))
+                        continue;
+
+                if (!strextend_with_separator(&ll, ", ", e->d_name))
+                        return log_oom();
+
+                c++;
+        }
+
+        if (ll)
+                log_info("Received %s: %s", title, ll);
+
+        return c;
+}
+
+static void report_credentials(void) {
+        int p, q;
+
+        p = report_credentials_per_func("regular credentials", get_credentials_dir);
+        q = report_credentials_per_func("untrusted credentials", get_encrypted_credentials_dir);
+
+        log_full(p > 0 || q > 0 ? LOG_INFO : LOG_DEBUG,
+                 "Acquired %i regular credentials, %i untrusted credentials.",
+                 p > 0 ? p : 0,
+                 q > 0 ? q : 0);
+}
+
 int import_credentials(void) {
         const char *received_creds_dir = NULL, *received_encrypted_creds_dir = NULL;
         bool envvar_set = false;
-        int r, q;
+        int r;
 
         r = get_credentials_dir(&received_creds_dir);
         if (r < 0 && r != -ENXIO) /* ENXIO → env var not set yet */
@@ -684,47 +878,32 @@ int import_credentials(void) {
                 else
                         r = 0;
 
-                if (received_encrypted_creds_dir) {
-                        q = symlink_credential_dir("ENCRYPTED_CREDENTIALS_DIRECTORY", received_encrypted_creds_dir, ENCRYPTED_SYSTEM_CREDENTIALS_DIRECTORY);
-                        if (r >= 0)
-                                r = q;
-                }
+                if (received_encrypted_creds_dir)
+                        RET_GATHER(r, symlink_credential_dir("ENCRYPTED_CREDENTIALS_DIRECTORY",
+                                                             received_encrypted_creds_dir,
+                                                             ENCRYPTED_SYSTEM_CREDENTIALS_DIRECTORY));
+
+                RET_GATHER(r, merge_credentials_trusted(received_creds_dir));
 
         } else {
-                _cleanup_free_ char *v = NULL;
+                bool import;
 
-                r = proc_cmdline_get_key("systemd.import_credentials", PROC_CMDLINE_STRIP_RD_PREFIX, &v);
+                r = proc_cmdline_get_bool("systemd.import_credentials", PROC_CMDLINE_STRIP_RD_PREFIX|PROC_CMDLINE_TRUE_WHEN_MISSING, &import);
                 if (r < 0)
-                        log_debug_errno(r, "Failed to check if 'systemd.import_credentials=' kernel command line option is set, ignoring: %m");
-                else if (r > 0) {
-                        r = parse_boolean(v);
-                        if (r < 0)
-                                log_debug_errno(r, "Failed to parse 'systemd.import_credentials=' parameter, ignoring: %m");
-                        else if (r == 0) {
-                                log_notice("systemd.import_credentials=no is set, skipping importing of credentials.");
-                                return 0;
-                        }
+                        log_debug_errno(r, "Failed to check systemd.import_credentials= kernel command line option, proceeding: %m");
+                else if (!import) {
+                        log_notice("systemd.import_credentials=no is set, skipping importing of credentials.");
+                        return 0;
                 }
 
                 r = import_credentials_boot();
-
-                q = import_credentials_trusted();
-                if (r >= 0)
-                        r = q;
+                RET_GATHER(r, import_credentials_trusted());
         }
 
-        if (r >= 0) {
-                _cleanup_free_ char *address = NULL;
+        report_credentials();
 
-                r = read_credential("vmm.notify_socket", (void **)&address, /* ret_size= */ NULL);
-                if (r < 0 && !IN_SET(r, -ENOENT, -ENXIO))
-                        log_warning_errno(r, "Failed to read 'vmm.notify_socket' credential, ignoring: %m");
-                else if (r >= 0 && !isempty(address)) {
-                        r = setenv("NOTIFY_SOCKET", address, /* replace= */ 1);
-                        if (r < 0)
-                                log_warning_errno(errno, "Failed to set $NOTIFY_SOCKET environment variable, ignoring: %m");
-                }
-        }
+        /* Propagate vmm_notify_socket credential → $NOTIFY_SOCKET env var */
+        (void) setenv_notify_socket();
 
         return r;
 }

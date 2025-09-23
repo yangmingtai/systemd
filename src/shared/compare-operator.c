@@ -6,11 +6,12 @@
 #include "string-util.h"
 
 CompareOperator parse_compare_operator(const char **s, CompareOperatorParseFlags flags) {
+
         static const struct {
                 CompareOperator op;
                 const char *str;
                 CompareOperatorParseFlags valid_mask; /* If this operator appears when flags in mask not set, fail */
-                CompareOperatorParseFlags need_mask;  /* Skip over this operattor when flags in mask not set */
+                CompareOperatorParseFlags need_mask;  /* Skip over this operator when flags in mask not set */
         } table[] = {
                 { COMPARE_FNMATCH_EQUAL,    "$=",  .valid_mask = COMPARE_ALLOW_FNMATCH   },
                 { COMPARE_FNMATCH_UNEQUAL,  "!$=", .valid_mask = COMPARE_ALLOW_FNMATCH   },
@@ -40,19 +41,19 @@ CompareOperator parse_compare_operator(const char **s, CompareOperatorParseFlags
                   * parse_compare_operator() are use on the same string? */
                 return _COMPARE_OPERATOR_INVALID;
 
-        for (size_t i = 0; i < ELEMENTSOF(table); i ++) {
+        FOREACH_ELEMENT(i, table) {
                 const char *e;
 
-                if (table[i].need_mask != 0 && !FLAGS_SET(flags, table[i].need_mask))
+                if (i->need_mask != 0 && !FLAGS_SET(flags, i->need_mask))
                         continue;
 
-                e = startswith(*s, table[i].str);
+                e = startswith(*s, i->str);
                 if (e) {
-                        if (table[i].valid_mask != 0 && !FLAGS_SET(flags, table[i].valid_mask))
+                        if (i->valid_mask != 0 && !FLAGS_SET(flags, i->valid_mask))
                                 return _COMPARE_OPERATOR_INVALID;
 
                         *s = e;
-                        return table[i].op;
+                        return i->op;
                 }
         }
 

@@ -1,14 +1,15 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <getopt.h>
-#include <stdbool.h>
 
 #include "sd-bus.h"
 
+#include "alloc-util.h"
 #include "build.h"
 #include "bus-error.h"
 #include "bus-locator.h"
 #include "bus-map-properties.h"
+#include "bus-util.h"
 #include "fd-util.h"
 #include "fileio.h"
 #include "format-table.h"
@@ -17,14 +18,15 @@
 #include "main-func.h"
 #include "memory-util.h"
 #include "pager.h"
+#include "parse-argument.h"
+#include "path-util.h"
+#include "polkit-agent.h"
 #include "pretty-print.h"
-#include "proc-cmdline.h"
-#include "set.h"
-#include "spawn-polkit-agent.h"
+#include "runtime-scope.h"
+#include "string-util.h"
 #include "strv.h"
-#include "terminal-util.h"
+#include "time-util.h"
 #include "verbs.h"
-#include "virt.h"
 
 /* Enough time for locale-gen to finish server-side (in case it is in use) */
 #define LOCALE_SLOW_BUS_CALL_TIMEOUT_USEC (2*USEC_PER_MINUTE)
@@ -34,6 +36,7 @@ static bool arg_ask_password = true;
 static BusTransport arg_transport = BUS_TRANSPORT_LOCAL;
 static const char *arg_host = NULL;
 static bool arg_convert = true;
+static bool arg_full = false;
 
 typedef struct StatusInfo {
         char **locale;
@@ -75,6 +78,9 @@ static int print_status_info(StatusInfo *i) {
         table = table_new_vertical();
         if (!table)
                 return log_oom();
+
+        if (arg_full)
+                table_set_width(table, 0);
 
         assert_se(cell = table_get_cell(table, 0, 0));
         (void) table_set_ellipsize_percent(table, cell, 100);
@@ -183,7 +189,7 @@ static int set_locale(int argc, char **argv, void *userdata) {
         sd_bus *bus = ASSERT_PTR(userdata);
         int r;
 
-        polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
+        (void) polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
 
         r = bus_message_new_method_call(bus, &m, bus_locale, "SetLocale");
         if (r < 0)
@@ -225,7 +231,7 @@ static int set_vconsole_keymap(int argc, char **argv, void *userdata) {
         sd_bus *bus = ASSERT_PTR(userdata);
         int r;
 
-        polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
+        (void) polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
 
         map = argv[1];
         toggle_map = argc > 2 ? argv[2] : "";
@@ -264,7 +270,7 @@ static int set_x11_keymap(int argc, char **argv, void *userdata) {
         sd_bus *bus = userdata;
         int r;
 
-        polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
+        (void) polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
 
         layout = argv[1];
         model = argc > 2 ? argv[2] : "";
@@ -285,6 +291,14 @@ static int set_x11_keymap(int argc, char **argv, void *userdata) {
         return 0;
 }
 
+static const char* xkb_directory(void) {
+        static const char *cached = NULL;
+
+        if (!cached)
+                cached = secure_getenv("SYSTEMD_XKB_DIRECTORY") ?: "/usr/share/X11/xkb";
+        return cached;
+}
+
 static int list_x11_keymaps(int argc, char **argv, void *userdata) {
         _cleanup_fclose_ FILE *f = NULL;
         _cleanup_strv_free_ char **list = NULL;
@@ -297,9 +311,15 @@ static int list_x11_keymaps(int argc, char **argv, void *userdata) {
         } state = NONE, look_for;
         int r;
 
-        f = fopen("/usr/share/X11/xkb/rules/base.lst", "re");
+        _cleanup_free_ char *xkb_base = path_join(xkb_directory(), "rules/base.lst");
+        if (!xkb_base)
+                return log_oom();
+
+        f = fopen(xkb_base, "re");
         if (!f)
-                return log_error_errno(errno, "Failed to open keyboard mapping list. %m");
+                return log_error_errno(errno,
+                                       "Failed to open keyboard mapping list %s: %m",
+                                       xkb_base);
 
         if (streq(argv[0], "list-x11-keymap-models"))
                 look_for = MODELS;
@@ -314,27 +334,27 @@ static int list_x11_keymaps(int argc, char **argv, void *userdata) {
 
         for (;;) {
                 _cleanup_free_ char *line = NULL;
-                char *l, *w;
+                char *w;
 
-                r = read_line(f, LONG_LINE_MAX, &line);
+                r = read_stripped_line(f, LONG_LINE_MAX, &line);
                 if (r < 0)
-                        return log_error_errno(r, "Failed to read keyboard mapping list: %m");
+                        return log_error_errno(r,
+                                               "Failed to read keyboard mapping list %s: %m",
+                                               xkb_base);
                 if (r == 0)
                         break;
 
-                l = strstrip(line);
-
-                if (isempty(l))
+                if (isempty(line))
                         continue;
 
-                if (l[0] == '!') {
-                        if (startswith(l, "! model"))
+                if (line[0] == '!') {
+                        if (startswith(line, "! model"))
                                 state = MODELS;
-                        else if (startswith(l, "! layout"))
+                        else if (startswith(line, "! layout"))
                                 state = LAYOUTS;
-                        else if (startswith(l, "! variant"))
+                        else if (startswith(line, "! variant"))
                                 state = VARIANTS;
-                        else if (startswith(l, "! option"))
+                        else if (startswith(line, "! option"))
                                 state = OPTIONS;
                         else
                                 state = NONE;
@@ -345,7 +365,7 @@ static int list_x11_keymaps(int argc, char **argv, void *userdata) {
                 if (state != look_for)
                         continue;
 
-                w = l + strcspn(l, WHITESPACE);
+                w = line + strcspn(line, WHITESPACE);
 
                 if (argc > 1) {
                         char *e;
@@ -368,17 +388,16 @@ static int list_x11_keymaps(int argc, char **argv, void *userdata) {
                 } else
                         *w = 0;
 
-                r = strv_extend(&list, l);
-                if (r < 0)
+                if (strv_consume(&list, TAKE_PTR(line)) < 0)
                         return log_oom();
         }
 
         if (strv_isempty(list))
                 return log_error_errno(SYNTHETIC_ERRNO(ENOENT),
-                                       "Couldn't find any entries.");
+                                       "Couldn't find any entries in keyboard mapping list %s.",
+                                       xkb_base);
 
-        strv_sort(list);
-        strv_uniq(list);
+        strv_sort_uniq(list);
 
         pager_open(arg_pager_flags);
 
@@ -412,6 +431,7 @@ static int help(void) {
                "\nOptions:\n"
                "  -h --help                Show this help\n"
                "     --version             Show package version\n"
+               "  -l --full                Do not ellipsize output\n"
                "     --no-pager            Do not pipe output into a pager\n"
                "     --no-ask-password     Do not prompt for password\n"
                "  -H --host=[USER@]HOST    Operate on remote host\n"
@@ -442,6 +462,7 @@ static int parse_argv(int argc, char *argv[]) {
         static const struct option options[] = {
                 { "help",            no_argument,       NULL, 'h'                 },
                 { "version",         no_argument,       NULL, ARG_VERSION         },
+                { "full",            no_argument,       NULL, 'l'                 },
                 { "no-pager",        no_argument,       NULL, ARG_NO_PAGER        },
                 { "host",            required_argument, NULL, 'H'                 },
                 { "machine",         required_argument, NULL, 'M'                 },
@@ -450,12 +471,12 @@ static int parse_argv(int argc, char *argv[]) {
                 {}
         };
 
-        int c;
+        int r, c;
 
         assert(argc >= 0);
         assert(argv);
 
-        while ((c = getopt_long(argc, argv, "hH:M:", options, NULL)) >= 0)
+        while ((c = getopt_long(argc, argv, "hlH:M:", options, NULL)) >= 0)
 
                 switch (c) {
 
@@ -464,6 +485,10 @@ static int parse_argv(int argc, char *argv[]) {
 
                 case ARG_VERSION:
                         return version();
+
+                case 'l':
+                        arg_full = true;
+                        break;
 
                 case ARG_NO_CONVERT:
                         arg_convert = false;
@@ -483,8 +508,9 @@ static int parse_argv(int argc, char *argv[]) {
                         break;
 
                 case 'M':
-                        arg_transport = BUS_TRANSPORT_MACHINE;
-                        arg_host = optarg;
+                        r = parse_machine_argument(optarg, &arg_host, &arg_transport);
+                        if (r < 0)
+                                return r;
                         break;
 
                 case '?':
@@ -530,7 +556,7 @@ static int run(int argc, char *argv[]) {
 
         r = bus_connect_transport(arg_transport, arg_host, RUNTIME_SCOPE_SYSTEM, &bus);
         if (r < 0)
-                return bus_log_connect_error(r, arg_transport);
+                return bus_log_connect_error(r, arg_transport, RUNTIME_SCOPE_SYSTEM);
 
         return localectl_main(bus, argc, argv);
 }

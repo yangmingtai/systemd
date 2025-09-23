@@ -1,17 +1,15 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include <inttypes.h>
-#include <limits.h>
-#include <stddef.h>
-#include <stdint.h>
-#include <sys/types.h>
-
-#include "macro.h"
+#include "forward.h"
 
 typedef unsigned long loadavg_t;
 
 int parse_boolean(const char *v) _pure_;
+int parse_tristate_full(const char *v, const char *third, int *ret);
+static inline int parse_tristate(const char *v, int *ret) {
+        return parse_tristate_full(v, NULL, ret);
+}
 int parse_pid(const char *s, pid_t* ret_pid);
 int parse_mode(const char *s, mode_t *ret);
 int parse_ifindex(const char *s);
@@ -22,6 +20,7 @@ int parse_sector_size(const char *t, uint64_t *ret);
 int parse_range(const char *t, unsigned *lower, unsigned *upper);
 int parse_errno(const char *t);
 int parse_fd(const char *t);
+int parse_user_shell(const char *s, char **ret_sh, bool *ret_copy);
 
 #define SAFE_ATO_REFUSE_PLUS_MINUS (1U << 30)
 #define SAFE_ATO_REFUSE_LEADING_ZERO (1U << 29)
@@ -30,13 +29,14 @@ int parse_fd(const char *t);
 #define SAFE_ATO_MASK_FLAGS(base) ((base) & ~SAFE_ATO_ALL_FLAGS)
 
 int safe_atou_full(const char *s, unsigned base, unsigned *ret_u);
-
 static inline int safe_atou(const char *s, unsigned *ret_u) {
         return safe_atou_full(s, 0, ret_u);
 }
 
+int safe_atou_bounded(const char *s, unsigned min, unsigned max, unsigned *ret);
+
 int safe_atoi(const char *s, int *ret_i);
-int safe_atolli(const char *s, long long int *ret_i);
+int safe_atolli(const char *s, long long *ret_i);
 
 int safe_atou8_full(const char *s, unsigned base, uint8_t *ret);
 
@@ -82,8 +82,8 @@ static inline int safe_atou64(const char *s, uint64_t *ret_u) {
 }
 
 static inline int safe_atoi64(const char *s, int64_t *ret_i) {
-        assert_cc(sizeof(int64_t) == sizeof(long long int));
-        return safe_atolli(s, (long long int*) ret_i);
+        assert_cc(sizeof(int64_t) == sizeof(long long));
+        return safe_atolli(s, (long long*) ret_i);
 }
 
 static inline int safe_atoux64(const char *s, uint64_t *ret) {
@@ -96,8 +96,8 @@ static inline int safe_atolu_full(const char *s, unsigned base, unsigned long *r
         assert_cc(sizeof(unsigned long) == sizeof(unsigned));
         return safe_atou_full(s, base, (unsigned*) ret_u);
 }
-static inline int safe_atoli(const char *s, long int *ret_u) {
-        assert_cc(sizeof(long int) == sizeof(int));
+static inline int safe_atoli(const char *s, long *ret_u) {
+        assert_cc(sizeof(long) == sizeof(int));
         return safe_atoi(s, (int*) ret_u);
 }
 #else
@@ -105,9 +105,9 @@ static inline int safe_atolu_full(const char *s, unsigned base, unsigned long *r
         assert_cc(sizeof(unsigned long) == sizeof(unsigned long long));
         return safe_atollu_full(s, base, (unsigned long long*) ret_u);
 }
-static inline int safe_atoli(const char *s, long int *ret_u) {
-        assert_cc(sizeof(long int) == sizeof(long long int));
-        return safe_atolli(s, (long long int*) ret_u);
+static inline int safe_atoli(const char *s, long *ret_u) {
+        assert_cc(sizeof(long) == sizeof(long long));
+        return safe_atolli(s, (long long*) ret_u);
 }
 #endif
 
@@ -134,9 +134,7 @@ int parse_fractional_part_u(const char **s, size_t digits, unsigned *res);
 int parse_nice(const char *p, int *ret);
 
 int parse_ip_port(const char *s, uint16_t *ret);
-int parse_ip_port_range(const char *s, uint16_t *low, uint16_t *high);
-
-int parse_ip_prefix_length(const char *s, int *ret);
+int parse_ip_port_range(const char *s, uint16_t *low, uint16_t *high, bool allow_zero);
 
 int parse_oom_score_adjust(const char *s, int *ret);
 
@@ -152,3 +150,5 @@ int parse_oom_score_adjust(const char *s, int *ret);
  * to a loadavg_t. */
 int store_loadavg_fixed_point(unsigned long i, unsigned long f, loadavg_t *ret);
 int parse_loadavg_fixed_point(const char *s, loadavg_t *ret);
+
+bool nft_identifier_valid(const char *id);

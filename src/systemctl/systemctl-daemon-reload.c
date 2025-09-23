@@ -1,10 +1,15 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
+#include "sd-bus.h"
+
 #include "bus-error.h"
 #include "bus-locator.h"
+#include "bus-util.h"
+#include "constants.h"
+#include "string-util.h"
+#include "systemctl.h"
 #include "systemctl-daemon-reload.h"
 #include "systemctl-util.h"
-#include "systemctl.h"
 
 int daemon_reload(enum action action, bool graceful) {
         _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
@@ -45,11 +50,13 @@ int daemon_reload(enum action action, bool graceful) {
                 return 1;
         if (r < 0) {
                 if (graceful) { /* If graceful mode is selected, debug log, but don't fail */
-                        log_debug_errno(r, "Failed to reload daemon via the bus, ignoring: %s", bus_error_message(&error, r));
+                        log_debug_errno(r, "%s daemon failed via the bus, ignoring: %s",
+                                        method, bus_error_message(&error, r));
                         return 0;
                 }
 
-                return log_error_errno(r, "Failed to reload daemon: %s", bus_error_message(&error, r));
+                return log_error_errno(r, "%s daemon failed: %s",
+                                       method, bus_error_message(&error, r));
         }
 
         return 1;

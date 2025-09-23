@@ -1,12 +1,20 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
+#include <stdio.h>
+
 #include "alloc-util.h"
 #include "dns-domain.h"
 #include "list.h"
+#include "log.h"
+#include "resolved-dns-answer.h"
 #include "resolved-dns-packet.h"
+#include "resolved-dns-rr.h"
+#include "resolved-dns-scope.h"
+#include "resolved-dns-transaction.h"
 #include "resolved-dns-zone.h"
 #include "resolved-dnssd.h"
 #include "resolved-manager.h"
+#include "set.h"
 #include "string-util.h"
 
 /* Never allow more than 1K entries */
@@ -70,8 +78,8 @@ void dns_zone_flush(DnsZone *z) {
         while ((i = hashmap_first(z->by_key)))
                 dns_zone_item_remove_and_free(z, i);
 
-        assert(hashmap_size(z->by_key) == 0);
-        assert(hashmap_size(z->by_name) == 0);
+        assert(hashmap_isempty(z->by_key));
+        assert(hashmap_isempty(z->by_name));
 
         z->by_key = hashmap_free(z->by_key);
         z->by_name = hashmap_free(z->by_name);

@@ -1,13 +1,19 @@
 # SPDX-License-Identifier: LGPL-2.1-or-later
 
 shared_sources = files(
+        'acl-util.c',
         'acpi-fpdt.c',
         'apparmor-util.c',
+        'ask-password-agent.c',
         'ask-password-api.c',
+        'async.c',
         'barrier.c',
         'base-filesystem.c',
+        'battery-util.c',
         'binfmt-util.c',
         'bitmap.c',
+        'blkid-util.c',
+        'blockdev-list.c',
         'blockdev-util.c',
         'bond-util.c',
         'boot-entry.c',
@@ -36,6 +42,7 @@ shared_sources = files(
         'chown-recursive.c',
         'clean-ipc.c',
         'clock-util.c',
+        'color-util.c',
         'common-signal.c',
         'compare-operator.c',
         'condition.c',
@@ -44,6 +51,8 @@ shared_sources = files(
         'coredump-util.c',
         'cpu-set-util.c',
         'creds-util.c',
+        'cryptsetup-fido2.c',
+        'cryptsetup-tpm2.c',
         'cryptsetup-util.c',
         'daemon-util.c',
         'data-fd-util.c',
@@ -51,7 +60,6 @@ shared_sources = files(
         'device-nodes.c',
         'discover-image.c',
         'dissect-image.c',
-        'dlfcn-util.c',
         'dm-util.c',
         'dns-domain.c',
         'dropin.c',
@@ -60,22 +68,23 @@ shared_sources = files(
         'efi-loader.c',
         'elf-util.c',
         'enable-mempool.c',
-        'env-file-label.c',
         'ethtool-util.c',
         'exec-util.c',
         'exit-status.c',
         'extension-util.c',
+        'factory-reset.c',
         'fdset.c',
-        'fileio-label.c',
+        'fido2-util.c',
         'find-esp.c',
-        'firewall-util-nft.c',
         'firewall-util.c',
+        'fork-notify.c',
         'format-table.c',
         'fstab-util.c',
         'generator.c',
         'geneve-util.c',
         'gpt.c',
         'group-record.c',
+        'hibernate-util.c',
         'hostname-setup.c',
         'hwdb-util.c',
         'id128-print.c',
@@ -87,16 +96,19 @@ shared_sources = files(
         'install-file.c',
         'install-printf.c',
         'install.c',
+        'ioprio-util.c',
         'ip-protocol-list.c',
         'ipvlan-util.c',
+        'journal-file-util.c',
         'journal-importer.c',
         'journal-util.c',
-        'json.c',
         'kbd-util.c',
+        'kernel-config.c',
         'kernel-image.c',
-        'keyring-util.c',
         'killall.c',
-        'label.c',
+        'label-util.c',
+        'libarchive-util.c',
+        'libaudit-util.c',
         'libcrypt-util.c',
         'libfido2-util.c',
         'libmount-util.c',
@@ -106,30 +118,43 @@ shared_sources = files(
         'loop-util.c',
         'loopback-setup.c',
         'lsm-util.c',
+        'machine-bind-user.c',
+        'machine-credential.c',
         'machine-id-setup.c',
         'machine-pool.c',
         'macvlan-util.c',
+        'main-func.c',
         'mkdir-label.c',
         'mkfs-util.c',
+        'module-util.c',
         'mount-setup.c',
         'mount-util.c',
         'net-condition.c',
         'netif-naming-scheme.c',
         'netif-sriov.c',
         'netif-util.c',
+        'notify-recv.c',
         'nsflags.c',
+        'nsresource.c',
         'numa-util.c',
         'open-file.c',
         'openssl-util.c',
+        'osc-context.c',
         'output-mode.c',
         'pager.c',
         'parse-argument.c',
         'parse-helpers.c',
+        'password-quality-util-passwdqc.c',
+        'password-quality-util-pwquality.c',
         'pcre2-util.c',
+        'pcrextend-util.c',
+        'pe-binary.c',
         'pkcs11-util.c',
+        'plymouth-util.c',
+        'polkit-agent.c',
+        'portable-util.c',
         'pretty-print.c',
         'ptyfwd.c',
-        'pwquality-util.c',
         'qrcode-util.c',
         'quota-util.c',
         'reboot-util.c',
@@ -137,119 +162,116 @@ shared_sources = files(
         'resize-fs.c',
         'resolve-util.c',
         'rm-rf.c',
+        'seccomp-util.c',
         'securebits-util.c',
         'selinux-util.c',
         'serialize.c',
         'service-util.c',
+        'shift-uid.c',
         'sleep-config.c',
         'smack-util.c',
+        'smbios11.c',
         'socket-label.c',
         'socket-netlink.c',
-        'spawn-ask-password-agent.c',
-        'spawn-polkit-agent.c',
         'specifier.c',
         'switch-root.c',
         'tmpfile-util-label.c',
         'tomoyo-util.c',
         'tpm2-util.c',
+        'tpm2-event-log.c',
         'udev-util.c',
-        'uid-alloc-range.c',
+        'unit-file.c',
         'user-record-nss.c',
         'user-record-show.c',
         'user-record.c',
         'userdb-dropin.c',
         'userdb.c',
-        'varlink.c',
+        'varlink-idl-common.c',
+        'varlink-io.systemd.AskPassword.c',
+        'varlink-io.systemd.BootControl.c',
+        'varlink-io.systemd.Credentials.c',
+        'varlink-io.systemd.FactoryReset.c',
+        'varlink-io.systemd.Hostname.c',
+        'varlink-io.systemd.Import.c',
+        'varlink-io.systemd.Journal.c',
+        'varlink-io.systemd.Login.c',
+        'varlink-io.systemd.Machine.c',
+        'varlink-io.systemd.MachineImage.c',
+        'varlink-io.systemd.ManagedOOM.c',
+        'varlink-io.systemd.Manager.c',
+        'varlink-io.systemd.MountFileSystem.c',
+        'varlink-io.systemd.NamespaceResource.c',
+        'varlink-io.systemd.Network.c',
+        'varlink-io.systemd.PCRExtend.c',
+        'varlink-io.systemd.PCRLock.c',
+        'varlink-io.systemd.Resolve.c',
+        'varlink-io.systemd.Resolve.Monitor.c',
+        'varlink-io.systemd.Udev.c',
+        'varlink-io.systemd.Unit.c',
+        'varlink-io.systemd.UserDatabase.c',
+        'varlink-io.systemd.oom.c',
+        'varlink-io.systemd.service.c',
+        'varlink-io.systemd.sysext.c',
+        'varlink-serialize.c',
+        'vconsole-util.c',
         'verb-log-control.c',
         'verbs.c',
         'vlan-util.c',
         'volatile-util.c',
+        'vpick.c',
+        'wall.c',
         'watchdog.c',
         'web-util.c',
         'wifi-util.c',
         'xml.c',
 )
 
-if get_option('tests') != 'false'
-        shared_sources += files(
-                'tests.c',
-        )
+if conf.get('ENABLE_NSS') == 1
+        shared_sources += files('nss-util.c')
 endif
 
-generate_syscall_list = find_program('generate-syscall-list.py')
-fname = 'syscall-list.h'
-syscall_list_h = custom_target(
-        fname,
+if get_option('tests') != 'false'
+        shared_sources += files('tests.c')
+endif
+
+syscall_list_inc = custom_target(
         input : syscall_list_txt,
-        output : fname,
-        command : [generate_syscall_list,
+        output : 'syscall-list.inc',
+        command : [files('generate-syscall-list.py'),
                    '@INPUT@'],
         capture : true)
 
-if conf.get('HAVE_ACL') == 1
-        shared_sources += files(
-                'acl-util.c',
-                'devnode-acl.c',
-        )
-endif
+generated_sources += syscall_list_inc
+shared_sources += syscall_list_inc
 
 if conf.get('ENABLE_UTMP') == 1
         shared_sources += files('utmp-wtmp.c')
 endif
 
-if conf.get('HAVE_SECCOMP') == 1
-        shared_sources += files('seccomp-util.c')
-        shared_sources += syscall_list_h
-endif
-
-if conf.get('HAVE_LIBIPTC') == 1
-        shared_sources += files('firewall-util-iptables.c')
-endif
-
 if conf.get('HAVE_LIBBPF') == 1
-        shared_sources += files(
-                'bpf-link.c',
-        )
-endif
-
-if conf.get('HAVE_KMOD') == 1
-        shared_sources += files('module-util.c')
+        shared_sources += files('bpf-link.c')
 endif
 
 if conf.get('HAVE_PAM') == 1
-        shared_sources += files(
-                'pam-util.c',
-        )
+        shared_sources += files('pam-util.c')
 endif
 
-if conf.get('ENABLE_NSCD') == 1
-        shared_sources += files('nscd-flush.c')
-endif
-
-if conf.get('HAVE_LIBFIDO2') == 1 and conf.get('HAVE_LIBCRYPTSETUP') == 1
-        shared_sources += files('cryptsetup-fido2.c')
-endif
-
-generate_ip_protocol_list = find_program('generate-ip-protocol-list.sh')
+generate_ip_protocol_list = files('generate-ip-protocol-list.sh')
 ip_protocol_list_txt = custom_target(
-        'ip-protocol-list.txt',
+        input : [generate_ip_protocol_list, ipproto_sources],
         output : 'ip-protocol-list.txt',
-        command : [generate_ip_protocol_list, cpp],
+        command : [env, 'bash', generate_ip_protocol_list, cpp, system_include_args],
         capture : true)
 
-fname = 'ip-protocol-from-name.gperf'
 gperf_file = custom_target(
-        fname,
         input : ip_protocol_list_txt,
-        output : fname,
-        command : [generate_gperfs, 'ip_protocol', 'IPPROTO_', '@INPUT@'],
+        output : 'ip-protocol-from-name.gperf',
+        command : [generate_gperfs, 'ip_protocol', 'IPPROTO_', '@INPUT@', '<netinet/in.h>'],
         capture : true)
 
-fname = 'ip-protocol-from-name.h'
 target1 = custom_target(
-        fname,
         input : gperf_file,
-        output : fname,
+        output : 'ip-protocol-from-name.inc',
         command : [gperf,
                    '-L', 'ANSI-C', '-t', '--ignore-case',
                    '-N', 'lookup_ip_protocol',
@@ -258,48 +280,65 @@ target1 = custom_target(
                    '@INPUT@'],
         capture : true)
 
-fname = 'ip-protocol-to-name.h'
 awkscript = 'ip-protocol-to-name.awk'
 target2 = custom_target(
-        fname,
         input : [awkscript, ip_protocol_list_txt],
-        output : fname,
+        output : 'ip-protocol-to-name.inc',
         command : [awk, '-f', '@INPUT0@', '@INPUT1@'],
         capture : true)
 
-shared_generated_gperf_headers = [target1, target2]
-shared_sources += shared_generated_gperf_headers
+generated_sources += [target1, target2]
+shared_sources += [target1, target2]
+
+ethtool_link_mode_py = files('ethtool-link-mode.py')
+ethtool_link_mode_inc = custom_target(
+        input : [ethtool_link_mode_py, ethtool_link_mode_sources],
+        output : 'ethtool-link-mode.inc',
+        command : [python, ethtool_link_mode_py, '--header', cpp, system_include_args],
+        capture : true)
+
+generated_sources += ethtool_link_mode_inc
+shared_sources += ethtool_link_mode_inc
+sources += shared_sources
+
+ethtool_link_mode_xml = custom_target(
+        input : [ethtool_link_mode_py, ethtool_link_mode_sources],
+        output : 'ethtool-link-mode.xml',
+        command : [python, ethtool_link_mode_py, '--xml', cpp, system_include_args],
+        capture : true)
+man_page_depends += ethtool_link_mode_xml
 
 libshared_name = 'systemd-shared-@0@'.format(shared_lib_tag)
 
 libshared_deps = [threads,
                   libacl,
+                  libaudit_cflags,
                   libblkid,
                   libcap,
                   libcrypt,
                   libdl,
-                  libgcrypt,
-                  libiptc,
-                  libkmod,
-                  liblz4,
+                  libgcrypt_cflags,
+                  libkmod_cflags,
+                  liblz4_cflags,
                   libmount,
                   libopenssl,
                   libp11kit_cflags,
-                  libpam,
+                  libpam_cflags,
                   librt,
                   libseccomp,
                   libselinux,
-                  libxenctrl,
-                  libxz,
-                  libzstd,
-                  versiondep]
+                  libxenctrl_cflags,
+                  libxz_cflags,
+                  libzstd_cflags]
 
-libshared_sym_path = '@0@/libshared.sym'.format(meson.current_source_dir())
+libshared_sym_path = meson.current_source_dir() / 'libshared.sym'
+libshared_build_dir = meson.current_build_dir()
 
 libshared_static = static_library(
         libshared_name,
         shared_sources,
         include_directories : includes,
+        implicit_include_directories : false,
         dependencies : [libshared_deps,
                         userspace],
         c_args : ['-fvisibility=default'],
@@ -308,29 +347,28 @@ libshared_static = static_library(
 libshared = shared_library(
         libshared_name,
         include_directories : includes,
+        implicit_include_directories : false,
         c_args : ['-fvisibility=default'],
         link_args : ['-shared',
                      '-Wl,--version-script=' + libshared_sym_path],
-        link_whole : [libshared_static,
-                      libbasic,
-                      libbasic_gcrypt,
+        link_depends : libshared_sym_path,
+        link_whole : [libc_wrapper_static,
+                      libshared_static,
+                      libbasic_static,
                       libsystemd_static],
         dependencies : [libshared_deps,
                         userspace],
         install : true,
-        install_dir : rootpkglibdir)
+        install_dir : pkglibdir)
 
-shared_fdisk_sources = files(
-        'fdisk-util.c',
-)
+shared_fdisk_sources = files('fdisk-util.c')
 
-if get_option('fdisk') != 'false'
-        libshared_fdisk = static_library(
-                'shared-fdisk',
-                shared_fdisk_sources,
-                include_directories : includes,
-                dependencies : [libfdisk,
-                                userspace],
-                c_args : ['-fvisibility=default'],
-                build_by_default : false)
-endif
+libshared_fdisk = static_library(
+        'shared-fdisk',
+        shared_fdisk_sources,
+        include_directories : includes,
+        implicit_include_directories : false,
+        dependencies : [libfdisk,
+                        userspace],
+        c_args : ['-fvisibility=default'],
+        build_by_default : false)

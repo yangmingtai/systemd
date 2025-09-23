@@ -139,7 +139,7 @@ static int dump_mapping_table(void) {
                         continue;
                 }
 
-                printf("%s -> %i/%s\n", strna(m->name), m->code, strna(errno_to_name(m->code)));
+                printf("%s -> %i/%s\n", strna(m->name), m->code, ERRNO_NAME(m->code));
                 m++;
         }
         printf("---------------------------\n");
@@ -213,8 +213,8 @@ TEST(errno_mapping_custom) {
 
         assert_se(sd_bus_error_set(NULL, BUS_ERROR_NO_SUCH_UNIT, NULL) == -ENOENT);
 
-        assert_se(sd_bus_error_add_map(test_errors_bad1) == -EINVAL);
-        assert_se(sd_bus_error_add_map(test_errors_bad2) == -EINVAL);
+        ASSERT_RETURN_EXPECTED_SE(sd_bus_error_add_map(test_errors_bad1) == -EINVAL);
+        ASSERT_RETURN_EXPECTED_SE(sd_bus_error_add_map(test_errors_bad2) == -EINVAL);
 }
 
 TEST(sd_bus_error_set_errnof) {

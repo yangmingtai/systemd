@@ -1,14 +1,7 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include <errno.h>
-#include <stdbool.h>
-#include <stddef.h>
-#include <stdint.h>
-
-#include "dns-def.h"
-#include "hashmap.h"
-#include "in-addr-util.h"
+#include "forward.h"
 
 typedef enum DNSLabelFlags {
         DNS_LABEL_LDH                = 1 << 0, /* Follow the "LDH" rule — only letters, digits, and internal hyphens. */
@@ -21,9 +14,7 @@ int dns_label_unescape_suffix(const char *name, const char **label_end, char *de
 int dns_label_escape(const char *p, size_t l, char *dest, size_t sz);
 int dns_label_escape_new(const char *p, size_t l, char **ret);
 
-static inline int dns_name_parent(const char **name) {
-        return dns_label_unescape(name, NULL, DNS_LABEL_MAX, 0);
-}
+int dns_name_parent(const char **name);
 
 #if HAVE_LIBIDN
 int dns_label_apply_idna(const char *encoded, size_t encoded_size, char *decoded, size_t decoded_max);
@@ -79,10 +70,12 @@ bool dns_name_is_root(const char *name);
 bool dns_name_is_single_label(const char *name);
 
 int dns_name_to_wire_format(const char *domain, uint8_t *buffer, size_t len, bool canonical);
+int dns_name_from_wire_format(const uint8_t **data, size_t *len, char **ret);
 
 bool dns_srv_type_is_valid(const char *name);
 bool dnssd_srv_type_is_valid(const char *name);
 bool dns_service_name_is_valid(const char *name);
+bool dns_subtype_name_is_valid(const char *name);
 
 int dns_service_join(const char *name, const char *type, const char *domain, char **ret);
 int dns_service_split(const char *joined, char **ret_name, char **ret_type, char **ret_domain);

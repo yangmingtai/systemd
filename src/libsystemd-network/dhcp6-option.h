@@ -1,12 +1,12 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include "sd-dhcp6-client.h"
+#include <netinet/in.h>
 
-#include "hash-funcs.h"
+#include "sd-dhcp6-option.h" /* IWYU pragma: export */
+
+#include "forward.h"
 #include "list.h"
-#include "macro.h"
-#include "ordered-set.h"
 #include "sparse-endian.h"
 
 typedef struct sd_dhcp6_option {
@@ -88,6 +88,7 @@ int dhcp6_option_parse(
                 size_t *ret_option_data_len,
                 const uint8_t **ret_option_data);
 int dhcp6_option_parse_status(const uint8_t *data, size_t data_len, char **ret_status_message);
+int dhcp6_option_parse_string(const uint8_t *data, size_t data_len, char **ret);
 int dhcp6_option_parse_ia(
                 sd_dhcp6_client *client,
                 be32_t iaid,

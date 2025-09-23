@@ -1,6 +1,6 @@
 <?xml version='1.0'?>
 <!DOCTYPE refentry PUBLIC "-//OASIS//DTD DocBook XML V4.5//EN"
-  "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd">
+  "http://www.oasis-open.org/docbook/xml/4.5/docbookx.dtd">
 <!-- SPDX-License-Identifier: LGPL-2.1-or-later -->
 
 <refentry id="hwdb" conditional="ENABLE_HWDB">
@@ -29,7 +29,7 @@
       <para>The hwdb files are read from the files located in the
       system hwdb directory <filename>/usr/lib/udev/hwdb.d</filename> and
       the local administration directory <filename>/etc/udev/hwdb.d</filename>.
-      All hwdb files are collectively sorted and processed in lexical order,
+      All hwdb files are collectively sorted and processed in lexicographic order,
       regardless of the directories in which they live. However, files with
       identical filenames replace each other. Files in <filename>/etc/</filename>
       have the highest priority and take precedence over files with the same
@@ -132,7 +132,7 @@ evdev:atkbd:*
  PROPERTY_WITH_SPACES=some string</programlisting>
 
       <para>If the hwdb consists of those two files, a keyboard with the lookup string
-      <literal>evdev:atkbd:dmi:bvnAcer:bdXXXXX:bd08/05/2010:svnAcer:pnX123</literal>
+      <literal>evdev:atkbd:dmi:bvnAcer:bvr:bdXXXXX:bd08/05/2010:svnAcer:pnX123:</literal>
       will match all three records, and end up with the following properties:</para>
 
       <programlisting>KEYBOARD_KEY_a1=help
@@ -145,10 +145,8 @@ PROPERTY_WITH_SPACES=some string</programlisting>
 
   <refsect1>
     <title>See Also</title>
-    <para>
-      <citerefentry>
-        <refentrytitle>systemd-hwdb</refentrytitle><manvolnum>8</manvolnum>
-      </citerefentry>
-    </para>
+    <para><simplelist type="inline">
+      <member><citerefentry><refentrytitle>systemd-hwdb</refentrytitle><manvolnum>8</manvolnum></citerefentry></member>
+    </simplelist></para>
   </refsect1>
 </refentry>

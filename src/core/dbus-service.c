@@ -1,38 +1,41 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/sysmacros.h>
 
 #include "alloc-util.h"
 #include "async.h"
 #include "bus-common-errors.h"
 #include "bus-get-properties.h"
+#include "constants.h"
 #include "dbus-cgroup.h"
 #include "dbus-execute.h"
 #include "dbus-kill.h"
 #include "dbus-manager.h"
 #include "dbus-service.h"
 #include "dbus-util.h"
+#include "dissect-image.h"
 #include "execute.h"
 #include "exit-status.h"
 #include "fd-util.h"
-#include "fileio.h"
+#include "glyph-util.h"
 #include "locale-util.h"
-#include "missing_fcntl.h"
+#include "manager.h"
 #include "mount-util.h"
 #include "open-file.h"
-#include "parse-util.h"
 #include "path-util.h"
 #include "selinux-access.h"
 #include "service.h"
 #include "signal-util.h"
 #include "string-util.h"
-#include "strv.h"
 #include "unit.h"
 
 static BUS_DEFINE_PROPERTY_GET_ENUM(property_get_type, service_type, ServiceType);
 static BUS_DEFINE_PROPERTY_GET_ENUM(property_get_exit_type, service_exit_type, ServiceExitType);
 static BUS_DEFINE_PROPERTY_GET_ENUM(property_get_result, service_result, ServiceResult);
 static BUS_DEFINE_PROPERTY_GET_ENUM(property_get_restart, service_restart, ServiceRestart);
+static BUS_DEFINE_PROPERTY_GET_ENUM(property_get_restart_mode, service_restart_mode, ServiceRestartMode);
 static BUS_DEFINE_PROPERTY_GET_ENUM(property_get_emergency_action, emergency_action, EmergencyAction);
 static BUS_DEFINE_PROPERTY_GET2(property_get_notify_access, "s", Service, service_get_notify_access, notify_access_to_string);
 static BUS_DEFINE_PROPERTY_GET(property_get_restart_usec_next, "t", Service, service_restart_usec_next);
@@ -60,7 +63,35 @@ static int property_get_open_files(
                 return r;
 
         LIST_FOREACH(open_files, of, *open_files) {
-                r = sd_bus_message_append(reply, "(sst)", of->path, of->fdname, of->flags);
+                r = sd_bus_message_append(reply, "(sst)", of->path, of->fdname, (uint64_t) of->flags);
+                if (r < 0)
+                        return r;
+        }
+
+        return sd_bus_message_close_container(reply);
+}
+
+static int property_get_extra_file_descriptors(
+                sd_bus *bus,
+                const char *path,
+                const char *interface,
+                const char *property,
+                sd_bus_message *reply,
+                void *userdata,
+                sd_bus_error *error) {
+
+        Service *s = ASSERT_PTR(userdata);
+        int r;
+
+        assert(bus);
+        assert(reply);
+
+        r = sd_bus_message_open_container(reply, 'a', "s");
+        if (r < 0)
+                return r;
+
+        FOREACH_ARRAY(i, s->extra_fds, s->n_extra_fds) {
+                r = sd_bus_message_append_basic(reply, 's', i->fdname);
                 if (r < 0)
                         return r;
         }
@@ -128,34 +159,38 @@ static int property_get_exit_status_set(
 }
 
 static int bus_service_method_mount(sd_bus_message *message, void *userdata, sd_bus_error *error, bool is_image) {
-        _cleanup_(mount_options_free_allp) MountOptions *options = NULL;
-        const char *dest, *src, *propagate_directory;
-        int read_only, make_file_or_directory;
+        MountInNamespaceFlags flags = 0;
         Unit *u = ASSERT_PTR(userdata);
-        ExecContext *c;
-        pid_t unit_pid;
         int r;
 
         assert(message);
 
         if (!MANAGER_IS_SYSTEM(u->manager))
-                return sd_bus_error_set(error, SD_BUS_ERROR_NOT_SUPPORTED, "Adding bind mounts at runtime is only supported for system managers.");
+                return sd_bus_error_set(error, SD_BUS_ERROR_NOT_SUPPORTED, "Adding bind mounts at runtime is only supported by system manager");
+
+        r = unit_can_live_mount(u, error);
+        if (r < 0)
+                return log_unit_debug_errno(u, r, "Cannot schedule live mount operation: %s", bus_error_message(error, r));
 
         r = mac_selinux_unit_access_check(u, message, "start", error);
         if (r < 0)
                 return r;
+
+        _cleanup_(mount_options_free_allp) MountOptions *options = NULL;
+        const char *src, *dest;
+        int read_only, make_file_or_directory;
 
         r = sd_bus_message_read(message, "ssbb", &src, &dest, &read_only, &make_file_or_directory);
         if (r < 0)
                 return r;
 
         if (!path_is_absolute(src) || !path_is_normalized(src))
-                return sd_bus_error_set(error, SD_BUS_ERROR_INVALID_ARGS, "Source path must be absolute and normalized.");
+                return sd_bus_error_set(error, SD_BUS_ERROR_INVALID_ARGS, "Source path must be absolute and normalized");
 
         if (!is_image && isempty(dest))
                 dest = src;
         else if (!path_is_absolute(dest) || !path_is_normalized(dest))
-                return sd_bus_error_set(error, SD_BUS_ERROR_INVALID_ARGS, "Destination path must be absolute and normalized.");
+                return sd_bus_error_set(error, SD_BUS_ERROR_INVALID_ARGS, "Destination path must be absolute and normalized");
 
         if (is_image) {
                 r = bus_read_mount_options(message, error, &options, NULL, "");
@@ -166,9 +201,7 @@ static int bus_service_method_mount(sd_bus_message *message, void *userdata, sd_
         r = bus_verify_manage_units_async_full(
                         u,
                         is_image ? "mount-image" : "bind-mount",
-                        CAP_SYS_ADMIN,
                         N_("Authentication is required to mount on '$(unit)'."),
-                        true,
                         message,
                         error);
         if (r < 0)
@@ -176,48 +209,18 @@ static int bus_service_method_mount(sd_bus_message *message, void *userdata, sd_
         if (r == 0)
                 return 1; /* No authorization for now, but the async polkit stuff will call us again when it has it */
 
-        if (u->type != UNIT_SERVICE)
-                return sd_bus_error_set(error, SD_BUS_ERROR_INVALID_ARGS, "Unit is not of type .service");
-
-        /* If it would be dropped at startup time, return an error. The context should always be available, but
-         * there's an assert in exec_needs_mount_namespace, so double-check just in case. */
-        c = unit_get_exec_context(u);
-        if (!c)
-                return sd_bus_error_set(error, SD_BUS_ERROR_INVALID_ARGS, "Cannot access unit execution context");
-        if (path_startswith_strv(dest, c->inaccessible_paths))
-                return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "%s is not accessible to this unit", dest);
-
-        /* Ensure that the unit was started in a private mount namespace */
-        if (!exec_needs_mount_namespace(c, NULL, unit_get_exec_runtime(u)))
-                return sd_bus_error_set(error, SD_BUS_ERROR_INVALID_ARGS, "Unit not running in private mount namespace, cannot activate bind mount");
-
-        unit_pid = unit_main_pid(u);
-        if (unit_pid == 0 || !UNIT_IS_ACTIVE_OR_RELOADING(unit_active_state(u)))
-                return sd_bus_error_set(error, SD_BUS_ERROR_INVALID_ARGS, "Unit is not running");
-
-        propagate_directory = strjoina("/run/systemd/propagate/", u->id);
         if (is_image)
-                r = mount_image_in_namespace(
-                                unit_pid,
-                                propagate_directory,
-                                "/run/systemd/incoming/",
-                                src, dest,
-                                read_only,
-                                make_file_or_directory,
-                                options,
-                                c->mount_image_policy ?: &image_policy_service);
-        else
-                r = bind_mount_in_namespace(
-                                unit_pid,
-                                propagate_directory,
-                                "/run/systemd/incoming/",
-                                src, dest,
-                                read_only,
-                                make_file_or_directory);
-        if (r < 0)
-                return sd_bus_error_set_errnof(error, r, "Failed to mount %s on %s in unit's namespace: %m", src, dest);
+                flags |= MOUNT_IN_NAMESPACE_IS_IMAGE;
+        if (read_only)
+                flags |= MOUNT_IN_NAMESPACE_READ_ONLY;
+        if (make_file_or_directory)
+                flags |= MOUNT_IN_NAMESPACE_MAKE_FILE_OR_DIRECTORY;
 
-        return sd_bus_reply_method_return(message, NULL);
+        r = unit_live_mount(u, src, dest, message, flags, options, error);
+        if (r < 0)
+                return r;
+
+        return 1;
 }
 
 int bus_service_method_bind_mount(sd_bus_message *message, void *userdata, sd_bus_error *error) {
@@ -266,7 +269,7 @@ int bus_service_method_dump_file_descriptor_store(sd_bus_message *message, void 
                         continue;
                 }
 
-                /* glibc implies O_LARGEFILE everywhere on 64bit off_t builds, but forgets to hide it away on
+                /* glibc implies O_LARGEFILE everywhere on 64-bit off_t builds, but forgets to hide it away on
                  * F_GETFL, but provides no definition to check for that. Let's mask the flag away manually,
                  * to not confuse clients. */
                 flags &= ~RAW_O_LARGEFILE;
@@ -291,7 +294,7 @@ int bus_service_method_dump_file_descriptor_store(sd_bus_message *message, void 
         if (r < 0)
                 return r;
 
-        return sd_bus_send(NULL, reply, NULL);
+        return sd_bus_message_send(reply);
 }
 
 #if __SIZEOF_SIZE_T__ == 8
@@ -307,7 +310,7 @@ static int property_get_size_as_uint32(
         size_t *value = ASSERT_PTR(userdata);
         uint32_t sz = *value >= UINT32_MAX ? UINT32_MAX : (uint32_t) *value;
 
-        /* Returns a size_t as a D-Bus "u" type, i.e. as 32bit value, even if size_t is 64bit. We'll saturate if it doesn't fit. */
+        /* Returns a size_t as a D-Bus "u" type, i.e. as 32-bit value, even if size_t is 64-bit. We'll saturate if it doesn't fit. */
 
         return sd_bus_message_append_basic(reply, 'u', &sz);
 }
@@ -322,11 +325,12 @@ const sd_bus_vtable bus_service_vtable[] = {
         SD_BUS_PROPERTY("Type", "s", property_get_type, offsetof(Service, type), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("ExitType", "s", property_get_exit_type, offsetof(Service, exit_type), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("Restart", "s", property_get_restart, offsetof(Service, restart), SD_BUS_VTABLE_PROPERTY_CONST),
+        SD_BUS_PROPERTY("RestartMode", "s", property_get_restart_mode, offsetof(Service, restart_mode), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("PIDFile", "s", NULL, offsetof(Service, pid_file), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("NotifyAccess", "s", property_get_notify_access, 0, SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
         SD_BUS_PROPERTY("RestartUSec", "t", bus_property_get_usec, offsetof(Service, restart_usec), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("RestartSteps", "u", bus_property_get_unsigned, offsetof(Service, restart_steps), SD_BUS_VTABLE_PROPERTY_CONST),
-        SD_BUS_PROPERTY("RestartUSecMax", "t", bus_property_get_usec, offsetof(Service, restart_usec_max), SD_BUS_VTABLE_PROPERTY_CONST),
+        SD_BUS_PROPERTY("RestartMaxDelayUSec", "t", bus_property_get_usec, offsetof(Service, restart_max_delay_usec), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("RestartUSecNext", "t", property_get_restart_usec_next, 0, 0),
         SD_BUS_PROPERTY("TimeoutStartUSec", "t", bus_property_get_usec, offsetof(Service, timeout_start_usec), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("TimeoutStopUSec", "t", bus_property_get_usec, offsetof(Service, timeout_stop_usec), SD_BUS_VTABLE_PROPERTY_CONST),
@@ -344,17 +348,20 @@ const sd_bus_vtable bus_service_vtable[] = {
         SD_BUS_PROPERTY("RestartPreventExitStatus", "(aiai)", property_get_exit_status_set, offsetof(Service, restart_prevent_status), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("RestartForceExitStatus", "(aiai)", property_get_exit_status_set, offsetof(Service, restart_force_status), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("SuccessExitStatus", "(aiai)", property_get_exit_status_set, offsetof(Service, success_status), SD_BUS_VTABLE_PROPERTY_CONST),
-        SD_BUS_PROPERTY("MainPID", "u", bus_property_get_pid, offsetof(Service, main_pid), SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
-        SD_BUS_PROPERTY("ControlPID", "u", bus_property_get_pid, offsetof(Service, control_pid), SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
+        SD_BUS_PROPERTY("MainPID", "u", bus_property_get_pid, offsetof(Service, main_pid.pid), SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
+        SD_BUS_PROPERTY("ControlPID", "u", bus_property_get_pid, offsetof(Service, control_pid.pid), SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
         SD_BUS_PROPERTY("BusName", "s", NULL, offsetof(Service, bus_name), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("FileDescriptorStoreMax", "u", bus_property_get_unsigned, offsetof(Service, n_fd_store_max), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("NFileDescriptorStore", "u", property_get_size_as_uint32, offsetof(Service, n_fd_store), 0),
         SD_BUS_PROPERTY("FileDescriptorStorePreserve", "s", bus_property_get_exec_preserve_mode, offsetof(Service, fd_store_preserve_mode), 0),
         SD_BUS_PROPERTY("StatusText", "s", NULL, offsetof(Service, status_text), SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
         SD_BUS_PROPERTY("StatusErrno", "i", bus_property_get_int, offsetof(Service, status_errno), SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
+        SD_BUS_PROPERTY("StatusBusError", "s", NULL, offsetof(Service, status_bus_error), SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
+        SD_BUS_PROPERTY("StatusVarlinkError", "s", NULL, offsetof(Service, status_varlink_error), SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
         SD_BUS_PROPERTY("Result", "s", property_get_result, offsetof(Service, result), SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
         SD_BUS_PROPERTY("ReloadResult", "s", property_get_result, offsetof(Service, reload_result), SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
         SD_BUS_PROPERTY("CleanResult", "s", property_get_result, offsetof(Service, clean_result), SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
+        SD_BUS_PROPERTY("LiveMountResult", "s", property_get_result, offsetof(Service, live_mount_result), SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
         SD_BUS_PROPERTY("USBFunctionDescriptors", "s", NULL, offsetof(Service, usb_function_descriptors), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("USBFunctionStrings", "s", NULL, offsetof(Service, usb_function_strings), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("UID", "u", bus_property_get_uid, offsetof(Unit, ref_uid), SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
@@ -362,6 +369,7 @@ const sd_bus_vtable bus_service_vtable[] = {
         SD_BUS_PROPERTY("NRestarts", "u", bus_property_get_unsigned, offsetof(Service, n_restarts), SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
         SD_BUS_PROPERTY("OOMPolicy", "s", bus_property_get_oom_policy, offsetof(Service, oom_policy), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("OpenFile", "a(sst)", property_get_open_files, offsetof(Service, open_files), SD_BUS_VTABLE_PROPERTY_CONST),
+        SD_BUS_PROPERTY("ExtraFileDescriptorNames", "as", property_get_extra_file_descriptors, 0, SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("ReloadSignal", "i", bus_property_get_int, offsetof(Service, reload_signal), SD_BUS_VTABLE_PROPERTY_CONST),
 
         BUS_EXEC_STATUS_VTABLE("ExecMain", offsetof(Service, main_exec_status), SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
@@ -387,10 +395,10 @@ const sd_bus_vtable bus_service_vtable[] = {
                                 SD_BUS_VTABLE_UNPRIVILEGED),
 
         SD_BUS_METHOD_WITH_ARGS("MountImage",
-                                 SD_BUS_ARGS("s", source, "s", destination, "b", read_only, "b", mkdir, "a(ss)", options),
-                                 SD_BUS_NO_RESULT,
-                                 bus_service_method_mount_image,
-                                 SD_BUS_VTABLE_UNPRIVILEGED),
+                                SD_BUS_ARGS("s", source, "s", destination, "b", read_only, "b", mkdir, "a(ss)", options),
+                                SD_BUS_NO_RESULT,
+                                bus_service_method_mount_image,
+                                SD_BUS_VTABLE_UNPRIVILEGED),
 
         SD_BUS_METHOD_WITH_ARGS("DumpFileDescriptorStore",
                                 SD_BUS_NO_ARGS,
@@ -512,6 +520,7 @@ static BUS_DEFINE_SET_TRANSIENT_PARSE(notify_access, NotifyAccess, notify_access
 static BUS_DEFINE_SET_TRANSIENT_PARSE(service_type, ServiceType, service_type_from_string);
 static BUS_DEFINE_SET_TRANSIENT_PARSE(service_exit_type, ServiceExitType, service_exit_type_from_string);
 static BUS_DEFINE_SET_TRANSIENT_PARSE(service_restart, ServiceRestart, service_restart_from_string);
+static BUS_DEFINE_SET_TRANSIENT_PARSE(service_restart_mode, ServiceRestartMode, service_restart_mode_from_string);
 static BUS_DEFINE_SET_TRANSIENT_PARSE(oom_policy, OOMPolicy, oom_policy_from_string);
 static BUS_DEFINE_SET_TRANSIENT_STRING_WITH_CHECK(bus_name, sd_bus_service_name_is_valid);
 static BUS_DEFINE_SET_TRANSIENT_PARSE(timeout_failure_mode, ServiceTimeoutFailureMode, service_timeout_failure_mode_from_string);
@@ -561,8 +570,8 @@ static int bus_service_set_transient_property(
         if (streq(name, "RestartSteps"))
                 return bus_set_transient_unsigned(u, name, &s->restart_steps, message, flags, error);
 
-        if (streq(name, "RestartUSecMax"))
-                return bus_set_transient_usec(u, name, &s->restart_usec_max, message, flags, error);
+        if (streq(name, "RestartMaxDelayUSec"))
+                return bus_set_transient_usec(u, name, &s->restart_max_delay_usec, message, flags, error);
 
         if (streq(name, "TimeoutStartUSec")) {
                 r = bus_set_transient_usec(u, name, &s->timeout_start_usec, message, flags, error);
@@ -634,7 +643,7 @@ static int bus_service_set_transient_property(
 
                                 if (!UNIT_WRITE_FLAGS_NOOP(flags))
                                         log_unit_notice(u, "Transient unit's PIDFile= property references path below legacy directory /var/run, updating %s %s %s; please update client accordingly.",
-                                                        n, special_glyph(SPECIAL_GLYPH_ARROW_RIGHT), z);
+                                                        n, glyph(GLYPH_ARROW_RIGHT), z);
 
                                 free_and_replace(n, z);
                         }
@@ -659,6 +668,9 @@ static int bus_service_set_transient_property(
 
         if (streq(name, "Restart"))
                 return bus_set_transient_service_restart(u, name, &s->restart, message, flags, error);
+
+        if (streq(name, "RestartMode"))
+                return bus_set_transient_service_restart_mode(u, name, &s->restart_mode, message, flags, error);
 
         if (streq(name, "RestartPreventExitStatus"))
                 return bus_set_transient_exit_status(u, name, &s->restart_prevent_status, message, flags, error);
@@ -737,6 +749,57 @@ static int bus_service_set_transient_property(
         if (streq(name, "ReloadSignal"))
                 return bus_set_transient_reload_signal(u, name, &s->reload_signal, message, flags, error);
 
+        if (streq(name, "ExtraFileDescriptors")) {
+                r = sd_bus_message_enter_container(message, 'a', "(hs)");
+                if (r < 0)
+                        return r;
+
+                for (;;) {
+                        const char *fdname;
+                        int fd;
+
+                        r = sd_bus_message_read(message, "(hs)", &fd, &fdname);
+                        if (r < 0)
+                                return r;
+                        if (r == 0)
+                                break;
+
+                        /* Disallow empty string for ExtraFileDescriptors.
+                         * Unlike OpenFile, StandardInput and friends, there isn't a good sane
+                         * default for an arbitrary FD. */
+                        if (isempty(fdname) || !fdname_is_valid(fdname))
+                                return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Invalid extra fd name: %s", fdname);
+
+                        if (s->n_extra_fds >= NOTIFY_FD_MAX)
+                                return sd_bus_error_set(error, SD_BUS_ERROR_LIMITS_EXCEEDED, "Too many extra fds sent");
+
+                        if (UNIT_WRITE_FLAGS_NOOP(flags))
+                                continue;
+
+                        if (!GREEDY_REALLOC(s->extra_fds, s->n_extra_fds + 1))
+                                return -ENOMEM;
+
+                        _cleanup_free_ char *fdname_dup = strdup(fdname);
+                        if (!fdname_dup)
+                                return -ENOMEM;
+
+                        _cleanup_close_ int fd_dup = fcntl(fd, F_DUPFD_CLOEXEC, 3);
+                        if (fd_dup < 0)
+                                return -errno;
+
+                        s->extra_fds[s->n_extra_fds++] = (ServiceExtraFD) {
+                                .fd = TAKE_FD(fd_dup),
+                                .fdname = TAKE_PTR(fdname_dup),
+                        };
+                }
+
+                r = sd_bus_message_exit_container(message);
+                if (r < 0)
+                        return r;
+
+                return 1;
+        }
+
         return 0;
 }
 
@@ -780,7 +843,7 @@ int bus_service_set_property(
 int bus_service_commit_properties(Unit *u) {
         assert(u);
 
-        unit_realize_cgroup(u);
+        (void) unit_realize_cgroup(u);
 
         return 0;
 }

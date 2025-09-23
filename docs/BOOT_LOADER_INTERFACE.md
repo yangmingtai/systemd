@@ -31,11 +31,13 @@ variables. All EFI variables use the vendor UUID
 * The EFI variable `LoaderConfigTimeout` contains the boot menu timeout
   currently in use. It may be modified both by the boot loader and by the
   host. The value should be formatted as numeric, NUL-terminated, decimal
-  string, in UTF-16. The time is specified in seconds. A value of `menu-force`
+  string, in UTF-16. The time is specified in seconds. In addition some
+  non-numeric string values are also accepted. A value of `menu-force`
   will disable the timeout and show the menu indefinitely. If set to `0` or
   `menu-hidden` the default entry is booted immediately without showing a menu.
-  The boot loader should provide a way to interrupt this by for example
-  listening for key presses for a brief moment before booting.
+  Unless a value of `menu-disabled` is set, the boot loader should provide a
+  way to interrupt this by for example listening for key presses for a brief
+  moment before booting.
 
 * Similarly, the EFI variable `LoaderConfigTimeoutOneShot` contains a boot menu
   timeout for a single following boot. It is set by the OS in order to request
@@ -50,11 +52,23 @@ variables. All EFI variables use the vendor UUID
   be used to let the OS know which boot menu entries were discovered by the
   boot loader. A boot loader entry identifier should be a short, non-empty
   alphanumeric string (possibly containing `-`, too). The list should be in the
-  order the entries are shown on screen during boot. See below regarding a
+  order the entries are shown on screen during boot. See below regarding the
   recommended vocabulary for boot loader entry identifiers.
 
 * The EFI variable `LoaderEntryDefault` contains the default boot loader entry
   to use. It contains a NUL-terminated boot loader entry identifier.
+
+* The EFI variable `LoaderEntrySysFail` specifies the boot loader entry to be
+  used in case of a system failure. System failure (SysFail) boot entries can
+  optionally modify the automatic selection order in the event of a failure,
+  such as a boot firmware update failure with the failure status recorded in
+  the EFI system table. If a system failure occurs and `LoaderEntrySysFail` is
+  set, systemd-boot will use this boot entry, and store the actual SysFail
+  reason in the `LoaderSysFailReason` EFI variable.
+
+* The EFI variable `LoaderSysFailReason` contains the system failure reason.
+  This variable is used in cooperation with `LoaderEntrySysFail` boot entry.
+  If system failure doesn't occur, `LoaderSysFailReason` is not set.
 
 * Similarly, the EFI variable `LoaderEntryOneShot` contains the default boot
   loader entry to use for a single following boot. It is set by the OS in order
@@ -67,7 +81,7 @@ variables. All EFI variables use the vendor UUID
   identifier that was booted. It is set by the boot loader and read by
   the OS in order to identify which entry has been used for the current boot.
 
-* The EFI variable `LoaderFeatures` contains a 64bit unsigned integer with a
+* The EFI variable `LoaderFeatures` contains a 64-bit unsigned integer with a
   number of flags bits that are set by the boot loader and passed to the OS and
   indicate the features the boot loader supports. Specifically, the following
   bits are defined:
@@ -76,9 +90,10 @@ variables. All EFI variables use the vendor UUID
   * `1 << 1` → The boot loader honours `LoaderConfigTimeoutOneShot` when set.
   * `1 << 2` → The boot loader honours `LoaderEntryDefault` when set.
   * `1 << 3` → The boot loader honours `LoaderEntryOneShot` when set.
-  * `1 << 4` → The boot loader supports boot counting as described in [Automatic Boot Assessment](AUTOMATIC_BOOT_ASSESSMENT.md).
+  * `1 << 4` → The boot loader supports boot counting as described in [Automatic Boot Assessment](/AUTOMATIC_BOOT_ASSESSMENT).
   * `1 << 5` → The boot loader supports looking for boot menu entries in the Extended Boot Loader Partition.
   * `1 << 6` → The boot loader supports passing a random seed to the OS.
+  * `1 << 13` → The boot loader honours `menu-disabled` option when set.
 
 * The EFI variable `LoaderSystemToken` contains binary random data,
   persistently set by the OS installer. Boot loaders that support passing
@@ -93,6 +108,14 @@ variables. All EFI variables use the vendor UUID
   up with different random seeds. Note that the `LoaderSystemToken` is
   generally only written once, by the OS installer, and is usually not touched
   after that.
+
+* The EFI variable `LoaderDeviceURL` contains the URL the boot loader was
+  downloaded from, in UTF-16 format. Only set in case of network boots.
+
+* The EFI variable `LoaderTpm2ActivePcrBanks` contains a hexadecimal string
+  representation of a bitmask with values defined by the TCG EFI Protocol
+  Specification for TPM 2.0 as EFI_TCG2_BOOT_HASH_ALG_*. If no TPM2 support or
+  no active banks were detected, will be set to `0`.
 
 If `LoaderTimeInitUSec` and `LoaderTimeExecUSec` are set, `systemd-analyze`
 will include them in its boot-time analysis.  If `LoaderDevicePartUUID` is set,

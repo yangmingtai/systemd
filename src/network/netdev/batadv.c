@@ -1,24 +1,18 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <inttypes.h>
-#include <netinet/in.h>
-#include <linux/genetlink.h>
 #include <linux/if_arp.h>
 
+#include "sd-netlink.h"
+
 #include "batadv.h"
-#include "fileio.h"
+#include "conf-parser.h"
 #include "netlink-util.h"
-#include "network-internal.h"
 #include "networkd-manager.h"
 #include "parse-util.h"
-#include "stdio-util.h"
 #include "string-table.h"
-#include "string-util.h"
 
 static void batadv_init(NetDev *n) {
-        BatmanAdvanced *b;
-
-        b = BATADV(n);
+        BatmanAdvanced *b = BATADV(n);
 
         /* Set defaults */
         b->aggregation            = true;
@@ -49,12 +43,10 @@ static const char* const batadv_routing_algorithm_kernel_table[_BATADV_ROUTING_A
 };
 
 DEFINE_PRIVATE_STRING_TABLE_LOOKUP_FROM_STRING(batadv_gateway_mode, BatadvGatewayModes);
-DEFINE_CONFIG_PARSE_ENUM(config_parse_batadv_gateway_mode, batadv_gateway_mode, BatadvGatewayModes,
-                         "Failed to parse GatewayMode=");
+DEFINE_CONFIG_PARSE_ENUM(config_parse_batadv_gateway_mode, batadv_gateway_mode, BatadvGatewayModes);
 
 DEFINE_PRIVATE_STRING_TABLE_LOOKUP_FROM_STRING(batadv_routing_algorithm, BatadvRoutingAlgorithm);
-DEFINE_CONFIG_PARSE_ENUM(config_parse_batadv_routing_algorithm, batadv_routing_algorithm, BatadvRoutingAlgorithm,
-                         "Failed to parse RoutingAlgorithm=");
+DEFINE_CONFIG_PARSE_ENUM(config_parse_batadv_routing_algorithm, batadv_routing_algorithm, BatadvRoutingAlgorithm);
 
 DEFINE_PRIVATE_STRING_TABLE_LOOKUP_TO_STRING(batadv_routing_algorithm_kernel, BatadvRoutingAlgorithm);
 
@@ -115,10 +107,8 @@ static int netdev_batman_set_handler(sd_netlink *rtnl, sd_netlink_message *m, Ne
 }
 
 static int netdev_batadv_post_create_message(NetDev *netdev, sd_netlink_message *message) {
-        BatmanAdvanced *b;
+        BatmanAdvanced *b = BATADV(netdev);
         int r;
-
-        assert_se(b = BATADV(netdev));
 
         r = sd_netlink_message_append_u32(message, BATADV_ATTR_MESH_IFINDEX, netdev->ifindex);
         if (r < 0)
@@ -169,6 +159,9 @@ static int netdev_batadv_post_create(NetDev *netdev, Link *link) {
 
         assert(netdev);
 
+        if (!netdev_is_managed(netdev))
+                return 0; /* Already detached, due to e.g. reloading .netdev files. */
+
         r = sd_genl_message_new(netdev->manager->genl, BATADV_NL_NAME, BATADV_CMD_SET_MESH, &message);
         if (r < 0)
                 return log_netdev_error_errno(netdev, r, "Could not allocate netlink message: %m");
@@ -188,14 +181,10 @@ static int netdev_batadv_post_create(NetDev *netdev, Link *link) {
 }
 
 static int netdev_batadv_fill_message_create(NetDev *netdev, Link *link, sd_netlink_message *m) {
-        BatmanAdvanced *b;
-        int r;
-
-        assert(netdev);
         assert(m);
 
-        b = BATADV(netdev);
-        assert(b);
+        BatmanAdvanced *b = BATADV(netdev);
+        int r;
 
         r = sd_netlink_message_append_string(m, IFLA_BATADV_ALGO_NAME, batadv_routing_algorithm_kernel_to_string(b->routing_algorithm));
         if (r < 0)

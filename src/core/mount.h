@@ -1,10 +1,11 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-typedef struct Mount Mount;
-
+#include "cgroup.h"
+#include "core-forward.h"
+#include "execute.h"
 #include "kill.h"
-#include "dynamic-user.h"
+#include "pidref.h"
 #include "unit.h"
 
 typedef enum MountExecCommand {
@@ -41,7 +42,7 @@ typedef enum MountProcFlags {
         MOUNT_PROC_JUST_CHANGED = 1 << 2,
 } MountProcFlags;
 
-struct Mount {
+typedef struct Mount {
         Unit meta;
 
         char *where;
@@ -76,21 +77,27 @@ struct Mount {
         CGroupContext cgroup_context;
 
         ExecRuntime *exec_runtime;
+        CGroupRuntime *cgroup_runtime;
 
         MountState state, deserialized_state;
 
-        ExecCommand* control_command;
+        ExecCommand *control_command;
         MountExecCommand control_command_id;
-        pid_t control_pid;
+        PidRef control_pid;
 
         sd_event_source *timer_event_source;
 
         unsigned n_retry_umount;
-};
+} Mount;
 
 extern const UnitVTable mount_vtable;
 
 void mount_fd_event(Manager *m, int events);
+
+char* mount_get_where_escaped(const Mount *m);
+char* mount_get_what_escaped(const Mount *m);
+char* mount_get_options_escaped(const Mount *m);
+const char* mount_get_fstype(const Mount *m);
 
 const char* mount_exec_command_to_string(MountExecCommand i) _const_;
 MountExecCommand mount_exec_command_from_string(const char *s) _pure_;

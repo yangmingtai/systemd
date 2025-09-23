@@ -3,23 +3,25 @@
 #include <sys/sendfile.h>
 
 #include "sd-daemon.h"
+#include "sd-event.h"
 
 #include "alloc-util.h"
-#include "btrfs-util.h"
 #include "copy.h"
 #include "export-raw.h"
 #include "fd-util.h"
+#include "format-util.h"
 #include "fs-util.h"
 #include "import-common.h"
-#include "missing_fcntl.h"
+#include "log.h"
+#include "pretty-print.h"
 #include "ratelimit.h"
 #include "stat-util.h"
 #include "string-util.h"
+#include "terminal-util.h"
+#include "time-util.h"
 #include "tmpfile-util.h"
 
-#define COPY_BUFFER_SIZE (16*1024)
-
-struct RawExport {
+typedef struct RawExport {
         sd_event *event;
 
         RawExportFinished on_finished;
@@ -49,7 +51,7 @@ struct RawExport {
         bool eof;
         bool tried_reflink;
         bool tried_sendfile;
-};
+} RawExport;
 
 RawExport *raw_export_unref(RawExport *e) {
         if (!e)
@@ -120,8 +122,17 @@ static void raw_export_report_progress(RawExport *e) {
         if (!ratelimit_below(&e->progress_ratelimit))
                 return;
 
-        sd_notifyf(false, "X_IMPORT_PROGRESS=%u", percent);
-        log_info("Exported %u%%.", percent);
+        sd_notifyf(false, "X_IMPORT_PROGRESS=%u%%", percent);
+
+        if (isatty_safe(STDERR_FILENO))
+                (void) draw_progress_barf(
+                                percent,
+                                "%s %s/%s",
+                                glyph(GLYPH_ARROW_RIGHT),
+                                FORMAT_BYTES(e->written_uncompressed),
+                                FORMAT_BYTES(e->st.st_size));
+        else
+                log_info("Exported %u%%.", percent);
 
         e->last_percent = percent;
 }
@@ -149,7 +160,7 @@ static int raw_export_process(RawExport *e) {
 
         if (!e->tried_sendfile && e->compress.type == IMPORT_COMPRESS_UNCOMPRESSED) {
 
-                l = sendfile(e->output_fd, e->input_fd, NULL, COPY_BUFFER_SIZE);
+                l = sendfile(e->output_fd, e->input_fd, NULL, IMPORT_BUFFER_SIZE);
                 if (l < 0) {
                         if (errno == EAGAIN)
                                 return 0;
@@ -169,7 +180,7 @@ static int raw_export_process(RawExport *e) {
         }
 
         while (e->buffer_size <= 0) {
-                uint8_t input[COPY_BUFFER_SIZE];
+                uint8_t input[IMPORT_BUFFER_SIZE];
 
                 if (e->eof) {
                         r = 0;
@@ -215,6 +226,9 @@ static int raw_export_process(RawExport *e) {
 
 finish:
         if (r >= 0) {
+                if (isatty_safe(STDERR_FILENO))
+                        clear_progress_bar(/* prefix= */ NULL);
+
                 (void) copy_times(e->input_fd, e->output_fd, COPY_CRTIME);
                 (void) copy_xattr(e->input_fd, NULL, e->output_fd, NULL, 0);
         }

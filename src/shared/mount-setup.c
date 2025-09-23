@@ -1,44 +1,36 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <errno.h>
-#include <stdlib.h>
 #include <sys/mount.h>
-#include <sys/statvfs.h>
 #include <unistd.h>
 
 #include "alloc-util.h"
-#include "bus-util.h"
-#include "cgroup-setup.h"
-#include "cgroup-util.h"
 #include "conf-files.h"
 #include "dev-setup.h"
-#include "dirent-util.h"
-#include "efi-loader.h"
+#include "efivars.h"
+#include "errno-util.h"
 #include "fd-util.h"
 #include "fileio.h"
-#include "fs-util.h"
-#include "label.h"
+#include "label-util.h"
 #include "log.h"
-#include "macro.h"
 #include "mkdir-label.h"
 #include "mount-setup.h"
 #include "mount-util.h"
 #include "mountpoint-util.h"
-#include "nulstr-util.h"
 #include "path-util.h"
 #include "recurse-dir.h"
-#include "set.h"
 #include "smack-util.h"
+#include "string-util.h"
 #include "strv.h"
-#include "user-util.h"
+#include "time-util.h"
 #include "virt.h"
 
 typedef enum MountMode {
-        MNT_NONE           = 0,
-        MNT_FATAL          = 1 << 0,
-        MNT_IN_CONTAINER   = 1 << 1,
-        MNT_CHECK_WRITABLE = 1 << 2,
-        MNT_FOLLOW_SYMLINK = 1 << 3,
+        MNT_NONE              = 0,
+        MNT_FATAL             = 1 << 0,
+        MNT_IN_CONTAINER      = 1 << 1,
+        MNT_CHECK_WRITABLE    = 1 << 2,
+        MNT_FOLLOW_SYMLINK    = 1 << 3,
+        MNT_USRQUOTA_GRACEFUL = 1 << 4,
 } MountMode;
 
 typedef struct MountPoint {
@@ -47,9 +39,79 @@ typedef struct MountPoint {
         const char *type;
         const char *options;
         unsigned long flags;
-        bool (*condition_fn)(void);
         MountMode mode;
+        bool (*condition_fn)(void);
 } MountPoint;
+
+static bool cgroupfs_recursiveprot_supported(void) {
+        int r;
+
+        /* Added in kernel 5.7 */
+
+        r = mount_option_supported("cgroup2", "memory_recursiveprot", /* value = */ NULL);
+        if (r < 0)
+                log_debug_errno(r, "Failed to determine whether cgroupfs supports 'memory_recursiveprot' mount option, assuming not: %m");
+        else if (r == 0)
+                log_debug("'memory_recursiveprot' not supported by cgroupfs, not using mount option.");
+
+        return r > 0;
+}
+
+int mount_cgroupfs(const char *path) {
+        assert(path);
+
+        /* Mount a separate cgroupfs instance, taking all options we initial set into account. This is
+         * especially useful when cgroup namespace is *not* employed, since the kernel overrides all
+         * previous options if a new mount is established in initial cgns (c.f.
+         * https://github.com/torvalds/linux/blob/b69bb476dee99d564d65d418e9a20acca6f32c3f/kernel/cgroup/cgroup.c#L1984)
+         *
+         * The options shall be kept in sync with those in mount_table below. */
+
+        return mount_nofollow_verbose(LOG_ERR, "cgroup2", path, "cgroup2",
+                                      MS_NOSUID|MS_NOEXEC|MS_NODEV,
+                                      cgroupfs_recursiveprot_supported() ? "nsdelegate,memory_recursiveprot" : "nsdelegate");
+}
+
+static const MountPoint mount_table[] = {
+        { "proc",        "/proc",                     "proc",       NULL,                                       MS_NOSUID|MS_NOEXEC|MS_NODEV,
+          MNT_FATAL|MNT_IN_CONTAINER|MNT_FOLLOW_SYMLINK },
+        { "sysfs",       "/sys",                      "sysfs",      NULL,                                       MS_NOSUID|MS_NOEXEC|MS_NODEV,
+          MNT_FATAL|MNT_IN_CONTAINER },
+        { "devtmpfs",    "/dev",                      "devtmpfs",   "mode=0755" TMPFS_LIMITS_DEV,               MS_NOSUID|MS_STRICTATIME,
+          MNT_FATAL|MNT_IN_CONTAINER },
+        { "securityfs",  "/sys/kernel/security",      "securityfs", NULL,                                       MS_NOSUID|MS_NOEXEC|MS_NODEV,
+          MNT_NONE                   },
+#if ENABLE_SMACK
+        { "smackfs",     "/sys/fs/smackfs",           "smackfs",    "smackfsdef=*",                             MS_NOSUID|MS_NOEXEC|MS_NODEV,
+          MNT_FATAL, mac_smack_use   },
+        { "tmpfs",       "/dev/shm",                  "tmpfs",      "mode=01777,smackfsroot=*",                 MS_NOSUID|MS_NODEV|MS_STRICTATIME,
+          MNT_FATAL|MNT_USRQUOTA_GRACEFUL, mac_smack_use },
+#endif
+        { "tmpfs",       "/dev/shm",                  "tmpfs",      "mode=01777",                               MS_NOSUID|MS_NODEV|MS_STRICTATIME,
+          MNT_FATAL|MNT_IN_CONTAINER|MNT_USRQUOTA_GRACEFUL },
+        { "devpts",      "/dev/pts",                  "devpts",     "mode=" STRINGIFY(TTY_MODE) ",gid=" STRINGIFY(TTY_GID), MS_NOSUID|MS_NOEXEC,
+          MNT_IN_CONTAINER           },
+#if ENABLE_SMACK
+        { "tmpfs",       "/run",                      "tmpfs",      "mode=0755,smackfsroot=*" TMPFS_LIMITS_RUN, MS_NOSUID|MS_NODEV|MS_STRICTATIME,
+          MNT_FATAL, mac_smack_use   },
+#endif
+        { "tmpfs",       "/run",                      "tmpfs",      "mode=0755" TMPFS_LIMITS_RUN,               MS_NOSUID|MS_NODEV|MS_STRICTATIME,
+          MNT_FATAL|MNT_IN_CONTAINER },
+        { "cgroup2",     "/sys/fs/cgroup",            "cgroup2",    "nsdelegate,memory_recursiveprot",          MS_NOSUID|MS_NOEXEC|MS_NODEV,
+          MNT_FATAL|MNT_IN_CONTAINER|MNT_CHECK_WRITABLE, cgroupfs_recursiveprot_supported },
+        { "cgroup2",     "/sys/fs/cgroup",            "cgroup2",    "nsdelegate",                               MS_NOSUID|MS_NOEXEC|MS_NODEV,
+          MNT_FATAL|MNT_IN_CONTAINER|MNT_CHECK_WRITABLE },
+#if ENABLE_PSTORE
+        { "pstore",      "/sys/fs/pstore",            "pstore",     NULL,                                       MS_NOSUID|MS_NOEXEC|MS_NODEV,
+          MNT_NONE                   },
+#endif
+#if ENABLE_EFI
+        { "efivarfs",    "/sys/firmware/efi/efivars", "efivarfs",   NULL,                                       MS_NOSUID|MS_NOEXEC|MS_NODEV,
+          MNT_NONE, is_efi_boot      },
+#endif
+        { "bpf",         "/sys/fs/bpf",               "bpf",        "mode=0700",                                MS_NOSUID|MS_NOEXEC|MS_NODEV,
+          MNT_NONE                   },
+};
 
 /* The first three entries we might need before SELinux is up. The
  * fourth (securityfs) is needed by IMA to load a custom policy. The
@@ -61,67 +123,14 @@ typedef struct MountPoint {
 #define N_EARLY_MOUNT 4
 #endif
 
-static const MountPoint mount_table[] = {
-        { "proc",        "/proc",                     "proc",       NULL,                                       MS_NOSUID|MS_NOEXEC|MS_NODEV,
-          NULL,          MNT_FATAL|MNT_IN_CONTAINER|MNT_FOLLOW_SYMLINK },
-        { "sysfs",       "/sys",                      "sysfs",      NULL,                                       MS_NOSUID|MS_NOEXEC|MS_NODEV,
-          NULL,          MNT_FATAL|MNT_IN_CONTAINER },
-        { "devtmpfs",    "/dev",                      "devtmpfs",   "mode=0755" TMPFS_LIMITS_DEV,               MS_NOSUID|MS_STRICTATIME,
-          NULL,          MNT_FATAL|MNT_IN_CONTAINER },
-        { "securityfs",  "/sys/kernel/security",      "securityfs", NULL,                                       MS_NOSUID|MS_NOEXEC|MS_NODEV,
-          NULL,          MNT_NONE                   },
-#if ENABLE_SMACK
-        { "smackfs",     "/sys/fs/smackfs",           "smackfs",    "smackfsdef=*",                             MS_NOSUID|MS_NOEXEC|MS_NODEV,
-          mac_smack_use, MNT_FATAL                  },
-        { "tmpfs",       "/dev/shm",                  "tmpfs",      "mode=01777,smackfsroot=*",                 MS_NOSUID|MS_NODEV|MS_STRICTATIME,
-          mac_smack_use, MNT_FATAL                  },
-#endif
-        { "tmpfs",       "/dev/shm",                  "tmpfs",      "mode=01777",                               MS_NOSUID|MS_NODEV|MS_STRICTATIME,
-          NULL,          MNT_FATAL|MNT_IN_CONTAINER },
-        { "devpts",      "/dev/pts",                  "devpts",     "mode=0620,gid=" STRINGIFY(TTY_GID),        MS_NOSUID|MS_NOEXEC,
-          NULL,          MNT_IN_CONTAINER           },
-#if ENABLE_SMACK
-        { "tmpfs",       "/run",                      "tmpfs",      "mode=0755,smackfsroot=*" TMPFS_LIMITS_RUN, MS_NOSUID|MS_NODEV|MS_STRICTATIME,
-          mac_smack_use, MNT_FATAL                  },
-#endif
-        { "tmpfs",       "/run",                      "tmpfs",      "mode=0755" TMPFS_LIMITS_RUN,               MS_NOSUID|MS_NODEV|MS_STRICTATIME,
-          NULL,          MNT_FATAL|MNT_IN_CONTAINER },
-        { "cgroup2",     "/sys/fs/cgroup",            "cgroup2",    "nsdelegate,memory_recursiveprot",          MS_NOSUID|MS_NOEXEC|MS_NODEV,
-          cg_is_unified_wanted, MNT_IN_CONTAINER|MNT_CHECK_WRITABLE },
-        { "cgroup2",     "/sys/fs/cgroup",            "cgroup2",    "nsdelegate",                               MS_NOSUID|MS_NOEXEC|MS_NODEV,
-          cg_is_unified_wanted, MNT_IN_CONTAINER|MNT_CHECK_WRITABLE },
-        { "cgroup2",     "/sys/fs/cgroup",            "cgroup2",    NULL,                                       MS_NOSUID|MS_NOEXEC|MS_NODEV,
-          cg_is_unified_wanted, MNT_IN_CONTAINER|MNT_CHECK_WRITABLE },
-        { "tmpfs",       "/sys/fs/cgroup",            "tmpfs",      "mode=0755" TMPFS_LIMITS_SYS_FS_CGROUP,     MS_NOSUID|MS_NOEXEC|MS_NODEV|MS_STRICTATIME,
-          cg_is_legacy_wanted, MNT_FATAL|MNT_IN_CONTAINER },
-        { "cgroup2",     "/sys/fs/cgroup/unified",    "cgroup2",    "nsdelegate",                               MS_NOSUID|MS_NOEXEC|MS_NODEV,
-          cg_is_hybrid_wanted, MNT_IN_CONTAINER|MNT_CHECK_WRITABLE },
-        { "cgroup2",     "/sys/fs/cgroup/unified",    "cgroup2",    NULL,                                       MS_NOSUID|MS_NOEXEC|MS_NODEV,
-          cg_is_hybrid_wanted, MNT_IN_CONTAINER|MNT_CHECK_WRITABLE },
-        { "cgroup",      "/sys/fs/cgroup/systemd",    "cgroup",     "none,name=systemd,xattr",                  MS_NOSUID|MS_NOEXEC|MS_NODEV,
-          cg_is_legacy_wanted, MNT_IN_CONTAINER     },
-        { "cgroup",      "/sys/fs/cgroup/systemd",    "cgroup",     "none,name=systemd",                        MS_NOSUID|MS_NOEXEC|MS_NODEV,
-          cg_is_legacy_wanted, MNT_FATAL|MNT_IN_CONTAINER },
-#if ENABLE_PSTORE
-        { "pstore",      "/sys/fs/pstore",            "pstore",     NULL,                                       MS_NOSUID|MS_NOEXEC|MS_NODEV,
-          NULL,          MNT_NONE                   },
-#endif
-#if ENABLE_EFI
-        { "efivarfs",    "/sys/firmware/efi/efivars", "efivarfs",   NULL,                                       MS_NOSUID|MS_NOEXEC|MS_NODEV,
-          is_efi_boot,   MNT_NONE                   },
-#endif
-        { "bpf",         "/sys/fs/bpf",               "bpf",        "mode=0700",                                MS_NOSUID|MS_NOEXEC|MS_NODEV,
-          NULL,          MNT_NONE,                  },
-};
-
 assert_cc(N_EARLY_MOUNT <= ELEMENTSOF(mount_table));
 
 bool mount_point_is_api(const char *path) {
         /* Checks if this mount point is considered "API", and hence
          * should be ignored */
 
-        for (size_t i = 0; i < ELEMENTSOF(mount_table); i ++)
-                if (path_equal(path, mount_table[i].where))
+        FOREACH_ELEMENT(i, mount_table)
+                if (path_equal(path, i->where))
                         return true;
 
         return path_startswith(path, "/sys/fs/cgroup/");
@@ -152,8 +161,11 @@ static int mount_one(const MountPoint *p, bool relabel) {
         int r, priority;
 
         assert(p);
+        assert(p->what);
+        assert(p->where);
+        assert(p->type);
 
-        priority = (p->mode & MNT_FATAL) ? LOG_ERR : LOG_DEBUG;
+        priority = FLAGS_SET(p->mode, MNT_FATAL) ? LOG_ERR : LOG_DEBUG;
 
         if (p->condition_fn && !p->condition_fn())
                 return 0;
@@ -162,16 +174,15 @@ static int mount_one(const MountPoint *p, bool relabel) {
         if (relabel)
                 (void) label_fix(p->where, LABEL_IGNORE_ENOENT|LABEL_IGNORE_EROFS);
 
-        r = path_is_mount_point(p->where, NULL, AT_SYMLINK_FOLLOW);
+        r = path_is_mount_point_full(p->where, /* root = */ NULL, AT_SYMLINK_FOLLOW);
         if (r < 0 && r != -ENOENT) {
                 log_full_errno(priority, r, "Failed to determine whether %s is a mount point: %m", p->where);
-                return (p->mode & MNT_FATAL) ? r : 0;
+                return FLAGS_SET(p->mode, MNT_FATAL) ? r : 0;
         }
         if (r > 0)
                 return 0;
 
-        /* Skip securityfs in a container */
-        if (!(p->mode & MNT_IN_CONTAINER) && detect_container() > 0)
+        if (!FLAGS_SET(p->mode, MNT_IN_CONTAINER) && detect_container() > 0)
                 return 0;
 
         /* The access mode here doesn't really matter too much, since
@@ -181,180 +192,58 @@ static int mount_one(const MountPoint *p, bool relabel) {
         else
                 (void) mkdir_p(p->where, 0755);
 
-        log_debug("Mounting %s to %s of type %s with options %s.",
-                  p->what,
-                  p->where,
-                  p->type,
-                  strna(p->options));
+        _cleanup_free_ char *extend_options = NULL;
+        const char *o = p->options;
+        if (FLAGS_SET(p->mode, MNT_USRQUOTA_GRACEFUL)) {
+                r = mount_option_supported(p->type, "usrquota", /* value= */ NULL);
+                if (r < 0)
+                        log_full_errno(priority, r, "Unable to determine whether %s supports 'usrquota' mount option, assuming not: %m", p->type);
+                else if (r == 0)
+                        log_debug("Not enabling 'usrquota' on '%s' as kernel lacks support for it.", p->where);
+                else {
+                        if (!strextend_with_separator(&extend_options, ",", p->options ?: POINTER_MAX, "usrquota"))
+                                return log_oom();
 
-        if (FLAGS_SET(p->mode, MNT_FOLLOW_SYMLINK))
-                r = mount_follow_verbose(priority, p->what, p->where, p->type, p->flags, p->options);
-        else
-                r = mount_nofollow_verbose(priority, p->what, p->where, p->type, p->flags, p->options);
+                        o = extend_options;
+                }
+        }
+
+        r = mount_verbose_full(priority, p->what, p->where, p->type, p->flags, o, FLAGS_SET(p->mode, MNT_FOLLOW_SYMLINK));
         if (r < 0)
-                return (p->mode & MNT_FATAL) ? r : 0;
+                return FLAGS_SET(p->mode, MNT_FATAL) ? r : 0;
 
         /* Relabel again, since we now mounted something fresh here */
         if (relabel)
                 (void) label_fix(p->where, 0);
 
-        if (p->mode & MNT_CHECK_WRITABLE) {
+        if (FLAGS_SET(p->mode, MNT_CHECK_WRITABLE))
                 if (access(p->where, W_OK) < 0) {
                         r = -errno;
 
                         (void) umount2(p->where, UMOUNT_NOFOLLOW);
                         (void) rmdir(p->where);
 
-                        log_full_errno(priority, r, "Mount point %s not writable after mounting, undoing: %m", p->where);
-                        return (p->mode & MNT_FATAL) ? r : 0;
+                        log_full_errno(priority, r, "Mount point '%s' not writable after mounting, undoing: %m", p->where);
+                        return FLAGS_SET(p->mode, MNT_FATAL) ? r : 0;
                 }
-        }
 
         return 1;
 }
 
 static int mount_points_setup(size_t n, bool loaded_policy) {
-        int ret = 0, r;
+        int r = 0;
 
         assert(n <= ELEMENTSOF(mount_table));
 
-        FOREACH_ARRAY(mp, mount_table, n) {
-                r = mount_one(mp, loaded_policy);
-                if (r != 0 && ret >= 0)
-                        ret = r;
-        }
+        FOREACH_ARRAY(mp, mount_table, n)
+                RET_GATHER(r, mount_one(mp, loaded_policy));
 
-        return ret;
+        return r;
 }
 
 int mount_setup_early(void) {
         /* Do a minimal mount of /proc and friends to enable the most basic stuff, such as SELinux */
         return mount_points_setup(N_EARLY_MOUNT, /* loaded_policy= */ false);
-}
-
-static const char *join_with(const char *controller) {
-
-        static const char* const pairs[] = {
-                "cpu", "cpuacct",
-                "net_cls", "net_prio",
-                NULL
-        };
-
-        assert(controller);
-
-        /* This will lookup which controller to mount another controller with. Input is a controller name, and output
-         * is the other controller name. The function works both ways: you can input one and get the other, and input
-         * the other to get the one. */
-
-        STRV_FOREACH_PAIR(x, y, pairs) {
-                if (streq(controller, *x))
-                        return *y;
-                if (streq(controller, *y))
-                        return *x;
-        }
-
-        return NULL;
-}
-
-static int symlink_controller(const char *target, const char *alias) {
-        const char *a;
-        int r;
-
-        assert(target);
-        assert(alias);
-
-        a = strjoina("/sys/fs/cgroup/", alias);
-
-        r = symlink_idempotent(target, a, false);
-        if (r < 0)
-                return log_error_errno(r, "Failed to create symlink %s: %m", a);
-
-#if HAVE_SMACK_RUN_LABEL
-        const char *p;
-
-        p = strjoina("/sys/fs/cgroup/", target);
-
-        r = mac_smack_copy(a, p);
-        if (r < 0 && !ERRNO_IS_NOT_SUPPORTED(r))
-                return log_error_errno(r, "Failed to copy smack label from %s to %s: %m", p, a);
-#endif
-
-        return 0;
-}
-
-int mount_cgroup_controllers(void) {
-        _cleanup_set_free_ Set *controllers = NULL;
-        int r;
-
-        if (!cg_is_legacy_wanted())
-                return 0;
-
-        /* Mount all available cgroup controllers that are built into the kernel. */
-        r = cg_kernel_controllers(&controllers);
-        if (r < 0)
-                return log_error_errno(r, "Failed to enumerate cgroup controllers: %m");
-
-        for (;;) {
-                _cleanup_free_ char *options = NULL, *controller = NULL, *where = NULL;
-                const char *other_controller;
-                MountPoint p = {
-                        .what = "cgroup",
-                        .type = "cgroup",
-                        .flags = MS_NOSUID|MS_NOEXEC|MS_NODEV,
-                        .mode = MNT_IN_CONTAINER,
-                };
-
-                controller = set_steal_first(controllers);
-                if (!controller)
-                        break;
-
-                /* Check if we shall mount this together with another controller */
-                other_controller = join_with(controller);
-                if (other_controller) {
-                        _cleanup_free_ char *c = NULL;
-
-                        /* Check if the other controller is actually available in the kernel too */
-                        c = set_remove(controllers, other_controller);
-                        if (c) {
-
-                                /* Join the two controllers into one string, and maintain a stable ordering */
-                                if (strcmp(controller, other_controller) < 0)
-                                        options = strjoin(controller, ",", other_controller);
-                                else
-                                        options = strjoin(other_controller, ",", controller);
-                                if (!options)
-                                        return log_oom();
-                        }
-                }
-
-                /* The simple case, where there's only one controller to mount together */
-                if (!options)
-                        options = TAKE_PTR(controller);
-
-                where = path_join("/sys/fs/cgroup", options);
-                if (!where)
-                        return log_oom();
-
-                p.where = where;
-                p.options = options;
-
-                r = mount_one(&p, true);
-                if (r < 0)
-                        return r;
-
-                /* Create symlinks from the individual controller names, in case we have a joined mount */
-                if (controller)
-                        (void) symlink_controller(options, controller);
-                if (other_controller)
-                        (void) symlink_controller(options, other_controller);
-        }
-
-        /* Now that we mounted everything, let's make the tmpfs the cgroup file systems are mounted into read-only. */
-        (void) mount_nofollow("tmpfs", "/sys/fs/cgroup", "tmpfs",
-                              MS_REMOUNT|MS_NOSUID|MS_NOEXEC|MS_NODEV|MS_STRICTATIME|MS_RDONLY,
-                              "mode=0755" TMPFS_LIMITS_SYS_FS_CGROUP);
-
-        return 0;
 }
 
 #if HAVE_SELINUX || ENABLE_SMACK
@@ -376,8 +265,9 @@ static int relabel_cb(
                 return RECURSE_DIR_CONTINUE;
 
         case RECURSE_DIR_ENTER:
-                /* /run/initramfs is static data and big, no need to dynamically relabel its contents at boot... */
-                if (path_equal(path, "/run/initramfs"))
+                /* /run/initramfs/ + /run/nextroot/ are static data and big, no need to dynamically relabel
+                 * its contents at boot... */
+                if (PATH_STARTSWITH_SET(path, "/run/initramfs", "/run/nextroot"))
                         return RECURSE_DIR_SKIP_ENTRY;
 
                 _fallthrough_;
@@ -397,34 +287,6 @@ static int relabel_tree(const char *path) {
                 log_debug_errno(r, "Failed to recursively relabel '%s': %m", path);
 
         return r;
-}
-
-static int relabel_cgroup_filesystems(void) {
-        int r;
-        struct statfs st;
-
-        r = cg_all_unified();
-        if (r == 0) {
-                /* Temporarily remount the root cgroup filesystem to give it a proper label. Do this
-                   only when the filesystem has been already populated by a previous instance of systemd
-                   running from initrd. Otherwise don't remount anything and leave the filesystem read-write
-                   for the cgroup filesystems to be mounted inside. */
-                if (statfs("/sys/fs/cgroup", &st) < 0)
-                        return log_error_errno(errno, "Failed to determine mount flags for /sys/fs/cgroup: %m");
-
-                if (st.f_flags & ST_RDONLY)
-                        (void) mount_nofollow(NULL, "/sys/fs/cgroup", NULL, MS_REMOUNT, NULL);
-
-                (void) label_fix("/sys/fs/cgroup", 0);
-                (void) relabel_tree("/sys/fs/cgroup");
-
-                if (st.f_flags & ST_RDONLY)
-                        (void) mount_nofollow(NULL, "/sys/fs/cgroup", NULL, MS_REMOUNT|MS_RDONLY, NULL);
-
-        } else if (r < 0)
-                return log_error_errno(r, "Failed to determine whether we are in all unified mode: %m");
-
-        return 0;
 }
 
 static int relabel_extra(void) {
@@ -517,14 +379,12 @@ int mount_setup(bool loaded_policy, bool leave_propagation) {
                 FOREACH_STRING(i, "/dev", "/dev/shm", "/run")
                         (void) relabel_tree(i);
 
-                (void) relabel_cgroup_filesystems();
-
                 n_extra = relabel_extra();
 
                 after_relabel = now(CLOCK_MONOTONIC);
 
-                log_info("Relabeled /dev, /dev/shm, /run, /sys/fs/cgroup%s in %s.",
-                         n_extra > 0 ? ", additional files" : "",
+                log_info("Relabeled /dev/, /dev/shm/, /run/%s in %s.",
+                         n_extra > 0 ? ", and additional files" : "",
                          FORMAT_TIMESPAN(after_relabel - before_relabel, 0));
         }
 #endif

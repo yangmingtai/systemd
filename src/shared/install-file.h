@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-int fs_make_very_read_only(int fd);
+#include "forward.h"
 
 typedef enum InstallFileFlags {
         INSTALL_REPLACE    = 1 << 0, /* Replace an existing inode */

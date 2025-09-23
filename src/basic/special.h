@@ -14,6 +14,7 @@
 #define SPECIAL_HALT_TARGET "halt.target"
 #define SPECIAL_POWEROFF_TARGET "poweroff.target"
 #define SPECIAL_REBOOT_TARGET "reboot.target"
+#define SPECIAL_SOFT_REBOOT_TARGET "soft-reboot.target"
 #define SPECIAL_KEXEC_TARGET "kexec.target"
 #define SPECIAL_EXIT_TARGET "exit.target"
 #define SPECIAL_SUSPEND_TARGET "suspend.target"
@@ -46,6 +47,7 @@
 #define SPECIAL_TIME_SYNC_TARGET "time-sync.target"       /* LSB's $time */
 #define SPECIAL_TIME_SET_TARGET "time-set.target"
 #define SPECIAL_BASIC_TARGET "basic.target"
+#define SPECIAL_TPM2_TARGET "tpm2.target"
 
 /* LSB compatibility */
 #define SPECIAL_NETWORK_TARGET "network.target"           /* LSB's $network */
@@ -56,7 +58,7 @@
  * Rules regarding adding further high level targets like the above:
  *
  * - Be conservative, only add more of these when we really need
- *   them. We need strong usecases for further additions.
+ *   them. We need strong use cases for further additions.
  *
  * - When there can be multiple implementations running side-by-side,
  *   it needs to be a .target unit which can pull in all
@@ -82,8 +84,10 @@
 #define SPECIAL_FSCK_SERVICE "systemd-fsck@.service"
 #define SPECIAL_FSCK_ROOT_SERVICE "systemd-fsck-root.service"
 #define SPECIAL_FSCK_USR_SERVICE "systemd-fsck-usr.service"
-#define SPECIAL_QUOTACHECK_SERVICE "systemd-quotacheck.service"
-#define SPECIAL_QUOTAON_SERVICE "quotaon.service"
+#define SPECIAL_QUOTACHECK_SERVICE "systemd-quotacheck@.service"
+#define SPECIAL_QUOTACHECK_ROOT_SERVICE "systemd-quotacheck-root.service"
+#define SPECIAL_QUOTAON_SERVICE "quotaon@.service"
+#define SPECIAL_QUOTAON_ROOT_SERVICE "quotaon-root.service"
 #define SPECIAL_REMOUNT_FS_SERVICE "systemd-remount-fs.service"
 #define SPECIAL_VOLATILE_ROOT_SERVICE "systemd-volatile-root.service"
 #define SPECIAL_UDEVD_SERVICE "systemd-udevd.service"
@@ -91,6 +95,8 @@
 #define SPECIAL_GROWFS_ROOT_SERVICE "systemd-growfs-root.service"
 #define SPECIAL_PCRFS_SERVICE "systemd-pcrfs@.service"
 #define SPECIAL_PCRFS_ROOT_SERVICE "systemd-pcrfs-root.service"
+#define SPECIAL_VALIDATEFS_SERVICE "systemd-validatefs@.service"
+#define SPECIAL_HIBERNATE_RESUME_SERVICE "systemd-hibernate-resume.service"
 
 /* Services systemd relies on */
 #define SPECIAL_DBUS_SERVICE "dbus.service"

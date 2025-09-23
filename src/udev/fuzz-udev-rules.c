@@ -2,8 +2,9 @@
 
 #include <stdio.h>
 
+#include "chase.h"
+#include "conf-files.h"
 #include "fd-util.h"
-#include "fs-util.h"
 #include "fuzz.h"
 #include "tests.h"
 #include "tmpfile-util.h"
@@ -18,8 +19,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         if (outside_size_range(size, 0, 65536))
                 return 0;
 
-        if (!getenv("SYSTEMD_LOG_LEVEL"))
-                log_set_max_level(LOG_CRIT);
+        fuzz_setup_logging();
 
         assert_se(fmkostemp_safe(filename, "r+", &f) == 0);
         if (size != 0)
@@ -27,7 +27,11 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         fflush(f);
 
         assert_se(rules = udev_rules_new(RESOLVE_NAME_EARLY));
-        r = udev_rules_parse_file(rules, filename, /* extra_checks = */ false, NULL);
+
+        _cleanup_(conf_file_freep) ConfFile *c = NULL;
+        ASSERT_OK(conf_file_new(filename, /* root = */ NULL, CHASE_MUST_BE_REGULAR, &c));
+
+        r = udev_rules_parse_file(rules, c, /* extra_checks = */ false, /* ret = */ NULL);
         log_info_errno(r, "Parsing %s: %m", filename);
         assert_se(r >= 0 ||             /* OK */
                   r == -ENOBUFS);       /* line length exceeded */

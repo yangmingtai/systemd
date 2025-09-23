@@ -45,7 +45,7 @@ themselves. Services using the network should hence simply place an
 `After=network.target` stanza in their unit files, without
 `Wants=network.target` or `Requires=network.target`.
 
-## Network connectivity has been estabilished: `network-online.target`
+## Network connectivity has been established: `network-online.target`
 
 `network-online.target` is a target that actively waits until the network is
 "up", where the definition of "up" is defined by the network management
@@ -225,7 +225,7 @@ be (re-)established, but is instead started when the network has connectivity,
 and if the network goes away, it fails and relies on the system manager to
 restart it if appropriate.
 
-## Modyfing the meaning of `network-online.target`
+## Modifying the meaning of `network-online.target`
 
 As described above, the meaning of this target is defined first by which
 implementing services are enabled (`NetworkManager-wait-online.service`,
@@ -243,7 +243,7 @@ that matches various links, but also by settings like
 [systemd.network(5)](https://www.freedesktop.org/software/systemd/man/systemd.network.html).
 
 It is also possible to plug in additional checks for network state. For
-example, to delay `network-online.target` until some a specific host is
+example, to delay `network-online.target` until a specific host is
 reachable (the name can be resolved over DNS and the appropriate route has been
 established), the following simple service could be used:
 
@@ -252,11 +252,11 @@ established), the following simple service could be used:
 DefaultDependencies=no
 After=nss-lookup.target
 Before=network-online.target
-Type=oneshot
-RemainAfterExit=yes
 
 [Service]
-ExecStart=sh -c 'while ! ping -c 1 example.com; do sleep 1; done'
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=sh -c 'until ping -c 1 example.com; do sleep 1; done'
 
 [Install]
 WantedBy=network-online.target

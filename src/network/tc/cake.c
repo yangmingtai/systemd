@@ -3,10 +3,10 @@
 
 #include <linux/pkt_sched.h>
 
-#include "alloc-util.h"
+#include "sd-netlink.h"
+
 #include "cake.h"
-#include "conf-parser.h"
-#include "netlink-util.h"
+#include "log.h"
 #include "parse-util.h"
 #include "qdisc.h"
 #include "string-table.h"
@@ -150,7 +150,7 @@ int config_parse_cake_bandwidth(
                 void *data,
                 void *userdata) {
 
-        _cleanup_(qdisc_free_or_set_invalidp) QDisc *qdisc = NULL;
+        _cleanup_(qdisc_unref_or_set_invalidp) QDisc *qdisc = NULL;
         CommonApplicationsKeptEnhanced *c;
         Network *network = ASSERT_PTR(data);
         uint64_t k;
@@ -204,7 +204,7 @@ int config_parse_cake_overhead(
                 void *data,
                 void *userdata) {
 
-        _cleanup_(qdisc_free_or_set_invalidp) QDisc *qdisc = NULL;
+        _cleanup_(qdisc_unref_or_set_invalidp) QDisc *qdisc = NULL;
         CommonApplicationsKeptEnhanced *c;
         Network *network = ASSERT_PTR(data);
         int32_t v;
@@ -263,7 +263,7 @@ int config_parse_cake_mpu(
                 void *data,
                 void *userdata) {
 
-        _cleanup_(qdisc_free_or_set_invalidp) QDisc *qdisc = NULL;
+        _cleanup_(qdisc_unref_or_set_invalidp) QDisc *qdisc = NULL;
         CommonApplicationsKeptEnhanced *c;
         Network *network = ASSERT_PTR(data);
         uint32_t v;
@@ -321,7 +321,7 @@ int config_parse_cake_tristate(
                 void *data,
                 void *userdata) {
 
-        _cleanup_(qdisc_free_or_set_invalidp) QDisc *qdisc = NULL;
+        _cleanup_(qdisc_unref_or_set_invalidp) QDisc *qdisc = NULL;
         CommonApplicationsKeptEnhanced *c;
         Network *network = ASSERT_PTR(data);
         int *dest, r;
@@ -354,13 +354,7 @@ int config_parse_cake_tristate(
         else
                 assert_not_reached();
 
-        if (isempty(rvalue)) {
-                *dest = -1;
-                TAKE_PTR(qdisc);
-                return 0;
-        }
-
-        r = parse_boolean(rvalue);
+        r = parse_tristate(rvalue, dest);
         if (r < 0) {
                 log_syntax(unit, LOG_WARNING, filename, line, r,
                            "Failed to parse '%s=', ignoring assignment: %s",
@@ -368,7 +362,6 @@ int config_parse_cake_tristate(
                 return 0;
         }
 
-        *dest = r;
         TAKE_PTR(qdisc);
         return 0;
 }
@@ -393,7 +386,7 @@ int config_parse_cake_compensation_mode(
                 void *data,
                 void *userdata) {
 
-        _cleanup_(qdisc_free_or_set_invalidp) QDisc *qdisc = NULL;
+        _cleanup_(qdisc_unref_or_set_invalidp) QDisc *qdisc = NULL;
         CommonApplicationsKeptEnhanced *c;
         Network *network = ASSERT_PTR(data);
         CakeCompensationMode mode;
@@ -458,7 +451,7 @@ int config_parse_cake_flow_isolation_mode(
                 void *data,
                 void *userdata) {
 
-        _cleanup_(qdisc_free_or_set_invalidp) QDisc *qdisc = NULL;
+        _cleanup_(qdisc_unref_or_set_invalidp) QDisc *qdisc = NULL;
         CommonApplicationsKeptEnhanced *c;
         Network *network = ASSERT_PTR(data);
         CakeFlowIsolationMode mode;
@@ -520,7 +513,7 @@ int config_parse_cake_priority_queueing_preset(
                 void *data,
                 void *userdata) {
 
-        _cleanup_(qdisc_free_or_set_invalidp) QDisc *qdisc = NULL;
+        _cleanup_(qdisc_unref_or_set_invalidp) QDisc *qdisc = NULL;
         CommonApplicationsKeptEnhanced *c;
         CakePriorityQueueingPreset preset;
         Network *network = ASSERT_PTR(data);
@@ -572,7 +565,7 @@ int config_parse_cake_fwmark(
                 void *data,
                 void *userdata) {
 
-        _cleanup_(qdisc_free_or_set_invalidp) QDisc *qdisc = NULL;
+        _cleanup_(qdisc_unref_or_set_invalidp) QDisc *qdisc = NULL;
         CommonApplicationsKeptEnhanced *c;
         Network *network = ASSERT_PTR(data);
         uint32_t fwmark;
@@ -630,7 +623,7 @@ int config_parse_cake_rtt(
                 void *data,
                 void *userdata) {
 
-        _cleanup_(qdisc_free_or_set_invalidp) QDisc *qdisc = NULL;
+        _cleanup_(qdisc_unref_or_set_invalidp) QDisc *qdisc = NULL;
         CommonApplicationsKeptEnhanced *c;
         Network *network = ASSERT_PTR(data);
         usec_t t;
@@ -696,7 +689,7 @@ int config_parse_cake_ack_filter(
                 void *data,
                 void *userdata) {
 
-        _cleanup_(qdisc_free_or_set_invalidp) QDisc *qdisc = NULL;
+        _cleanup_(qdisc_unref_or_set_invalidp) QDisc *qdisc = NULL;
         CommonApplicationsKeptEnhanced *c;
         CakeAckFilter ack_filter;
         Network *network = ASSERT_PTR(data);

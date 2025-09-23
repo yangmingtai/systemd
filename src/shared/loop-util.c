@@ -4,10 +4,7 @@
 #include <valgrind/memcheck.h>
 #endif
 
-#include <errno.h>
 #include <fcntl.h>
-#include <linux/blkpg.h>
-#include <linux/fs.h>
 #include <linux/loop.h>
 #include <sys/file.h>
 #include <sys/ioctl.h>
@@ -24,17 +21,16 @@
 #include "env-util.h"
 #include "errno-util.h"
 #include "fd-util.h"
-#include "fs-util.h"
 #include "fileio.h"
+#include "fs-util.h"
 #include "loop-util.h"
-#include "missing_loop.h"
 #include "parse-util.h"
 #include "path-util.h"
 #include "random-util.h"
 #include "stat-util.h"
 #include "stdio-util.h"
 #include "string-util.h"
-#include "tmpfile-util.h"
+#include "time-util.h"
 
 static void cleanup_clear_loop_close(int *fd) {
         if (*fd < 0)
@@ -57,21 +53,6 @@ static int loop_is_bound(int fd) {
         return true; /* bound! */
 }
 
-static int get_current_uevent_seqnum(uint64_t *ret) {
-        _cleanup_free_ char *p = NULL;
-        int r;
-
-        r = read_full_virtual_file("/sys/kernel/uevent_seqnum", &p, NULL);
-        if (r < 0)
-                return log_debug_errno(r, "Failed to read current uevent sequence number: %m");
-
-        r = safe_atou64(strstrip(p), ret);
-        if (r < 0)
-                return log_debug_errno(r, "Failed to parse current uevent sequence number: %s", p);
-
-        return 0;
-}
-
 static int open_lock_fd(int primary_fd, int operation) {
         _cleanup_close_ int lock_fd = -EBADF;
 
@@ -88,7 +69,7 @@ static int open_lock_fd(int primary_fd, int operation) {
 }
 
 static int loop_configure_verify_direct_io(int fd, const struct loop_config *c) {
-        assert(fd);
+        assert(fd >= 0);
         assert(c);
 
         if (FLAGS_SET(c->info.lo_flags, LO_FLAGS_DIRECT_IO)) {
@@ -108,9 +89,16 @@ static int loop_configure_verify_direct_io(int fd, const struct loop_config *c) 
                  * check here if enabling direct IO worked, to make this easily debuggable however.
                  *
                  * (Should anyone really care and actually wants direct IO on old kernels: it might be worth
-                 * enabling direct IO with iteratively larger block sizes until it eventually works.) */
+                 * enabling direct IO with iteratively larger block sizes until it eventually works.)
+                 *
+                 * On older kernels (e.g.: 5.10) when this is attempted on a file stored on a dm-crypt
+                 * backed partition the kernel will start returning I/O errors when accessing the mounted
+                 * loop device, so return a recognizable error that causes the operation to be started
+                 * from scratch without the LO_FLAGS_DIRECT_IO flag. */
                 if (!FLAGS_SET(info.lo_flags, LO_FLAGS_DIRECT_IO))
-                        log_debug("Could not enable direct IO mode, proceeding in buffered IO mode.");
+                        return log_debug_errno(
+                                        SYNTHETIC_ERRNO(ENOANO),
+                                        "Could not enable direct IO mode, retrying in buffered IO mode.");
         }
 
         return 0;
@@ -142,8 +130,9 @@ static int loop_configure_verify(int fd, const struct loop_config *c) {
                  * effect hence. And if not use classic LOOP_SET_STATUS64. */
                 uint64_t z;
 
-                if (ioctl(fd, BLKGETSIZE64, &z) < 0)
-                        return -errno;
+                r = blockdev_get_device_size(fd, &z);
+                if (r < 0)
+                        return r;
 
                 if (z != c->info.lo_sizelimit) {
                         log_debug("LOOP_CONFIGURE is broken, doesn't honour .info.lo_sizelimit. Falling back to LOOP_SET_STATUS64.");
@@ -156,7 +145,7 @@ static int loop_configure_verify(int fd, const struct loop_config *c) {
                  * into the block device. Let's hence verify if things work correctly here
                  * before returning. */
 
-                r = blockdev_partscan_enabled(fd);
+                r = blockdev_partscan_enabled_fd(fd);
                 if (r < 0)
                         return r;
                 if (r == 0) {
@@ -203,24 +192,9 @@ static int loop_configure_fallback(int fd, const struct loop_config *c) {
 
                 /* Sleep some random time, but at least 10ms, at most 250ms. Increase the delay the more
                  * failed attempts we see */
-                (void) usleep(UINT64_C(10) * USEC_PER_MSEC +
+                (void) usleep_safe(UINT64_C(10) * USEC_PER_MSEC +
                               random_u64_range(UINT64_C(240) * USEC_PER_MSEC * n_attempts/64));
         }
-
-        /* Work around a kernel bug, where changing offset/size of the loopback device doesn't correctly
-         * invalidate the buffer cache. For details see:
-         *
-         *     https://android.googlesource.com/platform/system/apex/+/bef74542fbbb4cd629793f4efee8e0053b360570
-         *
-         * This was fixed in kernel 5.0, see:
-         *
-         *     https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/commit/?id=5db470e229e22b7eda6e23b5566e532c96fb5bc3
-         *
-         * We'll run the work-around here in the legacy LOOP_SET_STATUS64 codepath. In the LOOP_CONFIGURE
-         * codepath above it should not be necessary. */
-        if (c->info.lo_offset != 0 || c->info.lo_sizelimit != 0)
-                if (ioctl(fd, BLKFLSBUF, 0) < 0)
-                        log_debug_errno(errno, "Failed to issue BLKFLSBUF ioctl, ignoring: %m");
 
         /* If a block size is requested then try to configure it. If that doesn't work, ignore errors, but
          * afterwards, let's validate what is in effect, and if it doesn't match what we want, fail */
@@ -258,8 +232,7 @@ static int loop_configure(
         _cleanup_(cleanup_clear_loop_close) int loop_with_fd = -EBADF; /* This must be declared before lock_fd. */
         _cleanup_close_ int fd = -EBADF, lock_fd = -EBADF;
         _cleanup_free_ char *node = NULL;
-        uint64_t diskseq = 0, seqnum = UINT64_MAX;
-        usec_t timestamp = USEC_INFINITY;
+        uint64_t diskseq = 0;
         dev_t devno;
         int r;
 
@@ -319,24 +292,9 @@ static int loop_configure(
                                               "Removed partitions on the loopback block device.");
 
         if (!loop_configure_broken) {
-                /* Acquire uevent seqnum immediately before attaching the loopback device. This allows
-                 * callers to ignore all uevents with a seqnum before this one, if they need to associate
-                 * uevent with this attachment. Doing so isn't race-free though, as uevents that happen in
-                 * the window between this reading of the seqnum, and the LOOP_CONFIGURE call might still be
-                 * mistaken as originating from our attachment, even though might be caused by an earlier
-                 * use. But doing this at least shortens the race window a bit. */
-                r = get_current_uevent_seqnum(&seqnum);
-                if (r < 0)
-                        return log_device_debug_errno(dev, r, "Failed to get the current uevent seqnum: %m");
-
-                timestamp = now(CLOCK_MONOTONIC);
-
                 if (ioctl(fd, LOOP_CONFIGURE, c) < 0) {
-                        /* Do fallback only if LOOP_CONFIGURE is not supported, propagate all other
-                         * errors. Note that the kernel is weird: non-existing ioctls currently return EINVAL
-                         * rather than ENOTTY on loopback block devices. They should fix that in the kernel,
-                         * but in the meantime we accept both here. */
-                        if (!ERRNO_IS_NOT_SUPPORTED(errno) && errno != EINVAL)
+                        /* Do fallback only if LOOP_CONFIGURE is not supported, propagate all other errors. */
+                        if (!ERRNO_IS_IOCTL_NOT_SUPPORTED(errno))
                                 return log_device_debug_errno(dev, errno, "ioctl(LOOP_CONFIGURE) failed: %m");
 
                         loop_configure_broken = true;
@@ -362,13 +320,6 @@ static int loop_configure(
         }
 
         if (loop_configure_broken) {
-                /* Let's read the seqnum again, to shorten the window. */
-                r = get_current_uevent_seqnum(&seqnum);
-                if (r < 0)
-                        return log_device_debug_errno(dev, r, "Failed to get the current uevent seqnum: %m");
-
-                timestamp = now(CLOCK_MONOTONIC);
-
                 if (ioctl(fd, LOOP_SET_FD, c->fd) < 0)
                         return log_device_debug_errno(dev, errno, "ioctl(LOOP_SET_FD) failed: %m");
 
@@ -397,6 +348,11 @@ static int loop_configure(
                 assert_not_reached();
         }
 
+        uint64_t device_size;
+        r = blockdev_get_device_size(loop_with_fd, &device_size);
+        if (r < 0)
+                return log_device_debug_errno(dev, r, "Failed to get loopback device size: %m");
+
         LoopDevice *d = new(LoopDevice, 1);
         if (!d)
                 return log_oom_debug();
@@ -410,9 +366,9 @@ static int loop_configure(
                 .devno = devno,
                 .dev = TAKE_PTR(dev),
                 .diskseq = diskseq,
-                .uevent_seqnum_not_before = seqnum,
-                .timestamp_not_before = timestamp,
                 .sector_size = c->block_size,
+                .device_size = device_size,
+                .created = true,
         };
 
         *ret = TAKE_PTR(d);
@@ -431,7 +387,7 @@ static int loop_device_make_internal(
                 LoopDevice **ret) {
 
         _cleanup_(loop_device_unrefp) LoopDevice *d = NULL;
-        _cleanup_close_ int direct_io_fd = -EBADF, control = -EBADF;
+        _cleanup_close_ int reopened_fd = -EBADF, control = -EBADF;
         _cleanup_free_ char *backing_file = NULL;
         struct loop_config config;
         int r, f_flags;
@@ -479,16 +435,16 @@ static int loop_device_make_internal(
                  * Our intention here is that LO_FLAGS_DIRECT_IO is the primary knob, and O_DIRECT derived
                  * from that automatically. */
 
-                direct_io_fd = fd_reopen(fd, (FLAGS_SET(loop_flags, LO_FLAGS_DIRECT_IO) ? O_DIRECT : 0)|O_CLOEXEC|O_NONBLOCK|open_flags);
-                if (direct_io_fd < 0) {
+                reopened_fd = fd_reopen(fd, (FLAGS_SET(loop_flags, LO_FLAGS_DIRECT_IO) ? O_DIRECT : 0)|O_CLOEXEC|O_NONBLOCK|open_flags);
+                if (reopened_fd < 0) {
                         if (!FLAGS_SET(loop_flags, LO_FLAGS_DIRECT_IO))
-                                return log_debug_errno(errno, "Failed to reopen file descriptor without O_DIRECT: %m");
+                                return log_debug_errno(reopened_fd, "Failed to reopen file descriptor without O_DIRECT: %m");
 
                         /* Some file systems might not support O_DIRECT, let's gracefully continue without it then. */
-                        log_debug_errno(errno, "Failed to enable O_DIRECT for backing file descriptor for loopback device. Continuing without.");
+                        log_debug_errno(reopened_fd, "Failed to enable O_DIRECT for backing file descriptor for loopback device. Continuing without.");
                         loop_flags &= ~LO_FLAGS_DIRECT_IO;
                 } else
-                        fd = direct_io_fd; /* From now on, operate on our new O_DIRECT fd */
+                        fd = reopened_fd; /* From now on, operate on our new O_DIRECT fd */
         }
 
         control = open("/dev/loop-control", O_RDWR|O_CLOEXEC|O_NOCTTY|O_NONBLOCK);
@@ -541,7 +497,7 @@ static int loop_device_make_internal(
                 .block_size = sector_size,
                 .info = {
                         /* Use the specified flags, but configure the read-only flag from the open flags, and force autoclear */
-                        .lo_flags = (loop_flags & ~LO_FLAGS_READ_ONLY) | ((open_flags & O_ACCMODE) == O_RDONLY ? LO_FLAGS_READ_ONLY : 0) | LO_FLAGS_AUTOCLEAR,
+                        .lo_flags = (loop_flags & ~LO_FLAGS_READ_ONLY) | ((open_flags & O_ACCMODE_STRICT) == O_RDONLY ? LO_FLAGS_READ_ONLY : 0) | LO_FLAGS_AUTOCLEAR,
                         .lo_offset = offset,
                         .lo_sizelimit = size == UINT64_MAX ? 0 : size,
                 },
@@ -578,8 +534,9 @@ static int loop_device_make_internal(
                 /* -ENODEV or friends: Somebody might've gotten the same number from the kernel, used the
                  * device, and called LOOP_CTL_REMOVE on it. Let's retry with a new number.
                  * -EBUSY: a file descriptor is already bound to the loopback block device.
-                 * -EUCLEAN: some left-over partition devices that were cleaned up. */
-                if (!ERRNO_IS_DEVICE_ABSENT(r) && !IN_SET(r, -EBUSY, -EUCLEAN))
+                 * -EUCLEAN: some left-over partition devices that were cleaned up.
+                 * -ENOANO: we tried to use LO_FLAGS_DIRECT_IO but the kernel rejected it. */
+                if (!ERRNO_IS_DEVICE_ABSENT(r) && !IN_SET(r, -EBUSY, -EUCLEAN, -ENOANO))
                         return r;
 
                 /* OK, this didn't work, let's try again a bit later, but first release the lock on the
@@ -590,12 +547,29 @@ static int loop_device_make_internal(
                 if (++n_attempts >= 64) /* Give up eventually */
                         return -EBUSY;
 
+                /* If we failed to enable direct IO mode, let's retry without it. We restart the process as
+                 * on some combination of kernel version and storage filesystem, the kernel is very unhappy
+                 * about a failed DIRECT_IO enablement and throws I/O errors. */
+                if (r == -ENOANO && FLAGS_SET(config.info.lo_flags, LO_FLAGS_DIRECT_IO)) {
+                        config.info.lo_flags &= ~LO_FLAGS_DIRECT_IO;
+                        open_flags &= ~O_DIRECT;
+
+                        int non_direct_io_fd = fd_reopen(config.fd, O_CLOEXEC|O_NONBLOCK|open_flags);
+                        if (non_direct_io_fd < 0)
+                                return log_debug_errno(
+                                                non_direct_io_fd,
+                                                "Failed to reopen file descriptor without O_DIRECT: %m");
+
+                        safe_close(reopened_fd);
+                        fd = config.fd = /* For cleanups */ reopened_fd = non_direct_io_fd;
+                }
+
                 /* Wait some random time, to make collision less likely. Let's pick a random time in the
                  * range 0ms…250ms, linearly scaled by the number of failed attempts. */
                 usec = random_u64_range(UINT64_C(10) * USEC_PER_MSEC +
                                         UINT64_C(240) * USEC_PER_MSEC * n_attempts/64);
                 log_debug("Trying again after %s.", FORMAT_TIMESPAN(usec, USEC_PER_MSEC));
-                (void) usleep(usec);
+                (void) usleep_safe(usec);
         }
 
         d->backing_file = TAKE_PTR(backing_file);
@@ -677,21 +651,21 @@ int loop_device_make_by_path_at(
         direct_flags = FLAGS_SET(loop_flags, LO_FLAGS_DIRECT_IO) ? O_DIRECT : 0;
         rdwr_flags = open_flags >= 0 ? open_flags : O_RDWR;
 
-        fd = xopenat(dir_fd, path, basic_flags|direct_flags|rdwr_flags, 0);
+        fd = xopenat(dir_fd, path, basic_flags|direct_flags|rdwr_flags);
         if (fd < 0 && direct_flags != 0) /* If we had O_DIRECT on, and things failed with that, let's immediately try again without */
-                fd = xopenat(dir_fd, path, basic_flags|rdwr_flags, 0);
+                fd = xopenat(dir_fd, path, basic_flags|rdwr_flags);
         else
                 direct = direct_flags != 0;
         if (fd < 0) {
-                r = -errno;
+                r = fd;
 
                 /* Retry read-only? */
-                if (open_flags >= 0 || !(ERRNO_IS_PRIVILEGE(r) || r == -EROFS))
+                if (open_flags >= 0 || !ERRNO_IS_NEG_FS_WRITE_REFUSED(r))
                         return r;
 
-                fd = xopenat(dir_fd, path, basic_flags|direct_flags|O_RDONLY, 0);
+                fd = xopenat(dir_fd, path, basic_flags|direct_flags|O_RDONLY);
                 if (fd < 0 && direct_flags != 0) /* as above */
-                        fd = xopenat(dir_fd, path, basic_flags|O_RDONLY, 0);
+                        fd = xopenat(dir_fd, path, basic_flags|O_RDONLY);
                 else
                         direct = direct_flags != 0;
                 if (fd < 0)
@@ -817,16 +791,25 @@ static LoopDevice* loop_device_free(LoopDevice *d) {
         }
 
         /* Now that the block device is released, let's also try to remove it */
-        if (control >= 0)
-                for (unsigned n_attempts = 0;;) {
+        if (control >= 0) {
+                useconds_t delay = 5 * USEC_PER_MSEC;  /* A total delay of 5090 ms between 39 attempts,
+                                                        * (4*5 + 5*10 + 5*20 + … + 3*640) = 5090. */
+
+                for (unsigned attempt = 1;; attempt++) {
                         if (ioctl(control, LOOP_CTL_REMOVE, d->nr) >= 0)
                                 break;
-                        if (errno != EBUSY || ++n_attempts >= 64) {
+                        if (errno != EBUSY || attempt > 38) {
                                 log_debug_errno(errno, "Failed to remove device %s: %m", strna(d->node));
                                 break;
                         }
-                        (void) usleep(50 * USEC_PER_MSEC);
+                        if (attempt % 5 == 0) {
+                                log_debug("Device is still busy after %u attempts…", attempt);
+                                delay *= 2;
+                        }
+
+                        (void) usleep_safe(delay);
                 }
+        }
 
         free(d->node);
         sd_device_unref(d->dev);
@@ -910,6 +893,11 @@ int loop_device_open(
         if (r < 0)
                 return r;
 
+        uint64_t device_size;
+        r = blockdev_get_device_size(fd, &device_size);
+        if (r < 0)
+                return r;
+
         r = sd_device_get_devnum(dev, &devnum);
         if (r < 0)
                 return r;
@@ -939,9 +927,9 @@ int loop_device_open(
                 .relinquished = true, /* It's not ours, don't try to destroy it when this object is freed */
                 .devno = devnum,
                 .diskseq = diskseq,
-                .uevent_seqnum_not_before = UINT64_MAX,
-                .timestamp_not_before = USEC_INFINITY,
                 .sector_size = sector_size,
+                .device_size = device_size,
+                .created = false,
         };
 
         *ret = d;
@@ -1023,8 +1011,9 @@ static int resize_partition(int partition_fd, uint64_t offset, uint64_t size) {
                 return -EINVAL;
         current_offset *= 512U;
 
-        if (ioctl(partition_fd, BLKGETSIZE64, &current_size) < 0)
-                return -EINVAL;
+        r = blockdev_get_device_size(partition_fd, &current_size);
+        if (r < 0)
+                return r;
 
         if (size == UINT64_MAX && offset == UINT64_MAX)
                 return 0;
@@ -1150,8 +1139,8 @@ int loop_device_set_filename(LoopDevice *d, const char *name) {
          * which is a kernel generated string, subject to file system namespaces and such.
          *
          * .lo_file_name is useful since userspace can select it freely when creating a loopback block
-         * device, and we can use it for /dev/loop/by-ref/ symlinks, and similar, so that apps can recognize
-         * their own loopback files. */
+         * device, and we can use it for /dev/disk/by-loop-ref/ symlinks, and similar, so that apps can
+         * recognize their own loopback files. */
 
         if (name && strlen(name) >= sizeof(info.lo_file_name))
                 return -ENOBUFS;

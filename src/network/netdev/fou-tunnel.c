@@ -1,16 +1,13 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <linux/fou.h>
-#include <net/if.h>
-#include <netinet/in.h>
-#include <linux/ip.h>
+
+#include "sd-netlink.h"
 
 #include "conf-parser.h"
 #include "fou-tunnel.h"
-#include "ip-protocol-list.h"
 #include "netlink-util.h"
 #include "networkd-manager.h"
-#include "parse-util.h"
 #include "string-table.h"
 #include "string-util.h"
 
@@ -20,15 +17,12 @@ static const char* const fou_encap_type_table[_NETDEV_FOO_OVER_UDP_ENCAP_MAX] = 
 };
 
 DEFINE_STRING_TABLE_LOOKUP(fou_encap_type, FooOverUDPEncapType);
-DEFINE_CONFIG_PARSE_ENUM(config_parse_fou_encap_type, fou_encap_type, FooOverUDPEncapType,
-                         "Failed to parse Encapsulation=");
+DEFINE_CONFIG_PARSE_ENUM(config_parse_fou_encap_type, fou_encap_type, FooOverUDPEncapType);
 
 static int netdev_fill_fou_tunnel_message(NetDev *netdev, sd_netlink_message *m) {
-        FouTunnel *t;
+        FouTunnel *t = FOU(netdev);
         uint8_t encap_type;
         int r;
-
-        assert_se(t = FOU(netdev));
 
         r = sd_netlink_message_append_u16(m, FOU_ATTR_PORT, htobe16(t->port));
         if (r < 0)
@@ -91,6 +85,7 @@ static int netdev_create_fou_tunnel_message(NetDev *netdev, sd_netlink_message *
         int r;
 
         assert(netdev);
+        assert(netdev->manager);
 
         r = sd_genl_message_new(netdev->manager->genl, FOU_GENL_NAME, FOU_CMD_ADD, &m);
         if (r < 0)
@@ -128,8 +123,10 @@ static int netdev_fou_tunnel_create(NetDev *netdev) {
         _cleanup_(sd_netlink_message_unrefp) sd_netlink_message *m = NULL;
         int r;
 
-        assert(netdev);
         assert(FOU(netdev));
+
+        if (!netdev_is_managed(netdev))
+                return 0; /* Already detached, due to e.g. reloading .netdev files. */
 
         r = netdev_create_fou_tunnel_message(netdev, &m);
         if (r < 0)
@@ -141,52 +138,6 @@ static int netdev_fou_tunnel_create(NetDev *netdev) {
                 return log_netdev_error_errno(netdev, r, "Failed to create FooOverUDP tunnel: %m");
 
         netdev_ref(netdev);
-        return 0;
-}
-
-int config_parse_ip_protocol(
-                const char *unit,
-                const char *filename,
-                unsigned line,
-                const char *section,
-                unsigned section_line,
-                const char *lvalue,
-                int ltype,
-                const char *rvalue,
-                void *data,
-                void *userdata) {
-
-        uint8_t *ret = ASSERT_PTR(data);
-        unsigned protocol;
-        /* linux/fou.h defines the netlink field as one byte, so we need to reject protocols numbers that
-         * don't fit in one byte. */
-        int r;
-
-        assert(filename);
-        assert(section);
-        assert(lvalue);
-        assert(rvalue);
-
-        r = parse_ip_protocol(rvalue);
-        if (r >= 0)
-                protocol = r;
-        else {
-                r = safe_atou(rvalue, &protocol);
-                if (r < 0)
-                        log_syntax(unit, LOG_WARNING, filename, line, r,
-                                   "Failed to parse IP protocol '%s' for FooOverUDP tunnel, "
-                                   "ignoring assignment: %m", rvalue);
-                return 0;
-        }
-
-        if (protocol > UINT8_MAX) {
-                log_syntax(unit, LOG_WARNING, filename, line, 0,
-                           "IP protocol '%s' for FooOverUDP tunnel out of range, "
-                           "ignoring assignment: %m", rvalue);
-                return 0;
-        }
-
-        *ret = protocol;
         return 0;
 }
 
@@ -225,14 +176,9 @@ int config_parse_fou_tunnel_address(
 }
 
 static int netdev_fou_tunnel_verify(NetDev *netdev, const char *filename) {
-        FouTunnel *t;
-
-        assert(netdev);
         assert(filename);
 
-        t = FOU(netdev);
-
-        assert(t);
+        FouTunnel *t = FOU(netdev);
 
         switch (t->fou_encap_type) {
         case NETDEV_FOO_OVER_UDP_ENCAP_DIRECT:
@@ -263,13 +209,7 @@ static int netdev_fou_tunnel_verify(NetDev *netdev, const char *filename) {
 }
 
 static void fou_tunnel_init(NetDev *netdev) {
-        FouTunnel *t;
-
-        assert(netdev);
-
-        t = FOU(netdev);
-
-        assert(t);
+        FouTunnel *t = FOU(netdev);
 
         t->fou_encap_type = NETDEV_FOO_OVER_UDP_ENCAP_DIRECT;
 }

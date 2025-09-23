@@ -1,39 +1,43 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <getopt.h>
+#include <linux/vm_sockets.h>
 #include <locale.h>
-#include <stdbool.h>
-#include <stdint.h>
-#include <stdlib.h>
 #include <string.h>
 
 #include "sd-bus.h"
 #include "sd-id128.h"
+#include "sd-json.h"
 
 #include "alloc-util.h"
-#include "architecture.h"
 #include "build.h"
 #include "bus-common-errors.h"
 #include "bus-error.h"
+#include "bus-locator.h"
 #include "bus-map-properties.h"
+#include "bus-message-util.h"
+#include "bus-util.h"
+#include "errno-util.h"
 #include "format-table.h"
 #include "hostname-setup.h"
 #include "hostname-util.h"
-#include "json.h"
+#include "log.h"
 #include "main-func.h"
 #include "parse-argument.h"
+#include "polkit-agent.h"
 #include "pretty-print.h"
-#include "spawn-polkit-agent.h"
-#include "terminal-util.h"
+#include "runtime-scope.h"
+#include "string-util.h"
+#include "time-util.h"
 #include "verbs.h"
 
 static bool arg_ask_password = true;
 static BusTransport arg_transport = BUS_TRANSPORT_LOCAL;
-static char *arg_host = NULL;
+static const char *arg_host = NULL;
 static bool arg_transient = false;
 static bool arg_pretty = false;
 static bool arg_static = false;
-static JsonFormatFlags arg_json_format_flags = JSON_FORMAT_OFF;
+static sd_json_format_flags_t arg_json_format_flags = SD_JSON_FORMAT_OFF;
 
 typedef struct StatusInfo {
         const char *hostname;
@@ -41,6 +45,7 @@ typedef struct StatusInfo {
         const char *pretty_hostname;
         const char *icon_name;
         const char *chassis;
+        const char *chassis_asset_tag;
         const char *deployment;
         const char *location;
         const char *kernel_name;
@@ -48,6 +53,8 @@ typedef struct StatusInfo {
         const char *os_pretty_name;
         const char *os_cpe_name;
         usec_t os_support_end;
+        const char *os_image_id;
+        const char *os_image_version;
         const char *virtualization;
         const char *architecture;
         const char *home_url;
@@ -55,25 +62,32 @@ typedef struct StatusInfo {
         const char *hardware_model;
         const char *firmware_version;
         usec_t firmware_date;
+        sd_id128_t machine_id;
+        sd_id128_t boot_id;
+        const char *hardware_serial;
+        sd_id128_t product_uuid;
+        uint32_t vsock_cid;
+        const char *hardware_sku;
+        const char *hardware_version;
 } StatusInfo;
 
 static const char* chassis_string_to_glyph(const char *chassis) {
         if (streq_ptr(chassis, "laptop"))
-                return u8"💻"; /* Personal Computer */
+                return UTF8("💻"); /* Personal Computer */
         if (streq_ptr(chassis, "desktop"))
-                return u8"🖥️"; /* Desktop Computer */
+                return UTF8("🖥️"); /* Desktop Computer */
         if (streq_ptr(chassis, "server"))
-                return u8"🖳"; /* Old Personal Computer */
+                return UTF8("🖳"); /* Old Personal Computer */
         if (streq_ptr(chassis, "tablet"))
-                return u8"具"; /* Ideograph tool, implement; draw up, write, looks vaguely tabletty */
+                return UTF8("具"); /* Ideograph tool, implement; draw up, write, looks vaguely tabletty */
         if (streq_ptr(chassis, "watch"))
-                return u8"⌚"; /* Watch */
+                return UTF8("⌚"); /* Watch */
         if (streq_ptr(chassis, "handset"))
-                return u8"🕻"; /* Left Hand Telephone Receiver */
+                return UTF8("🕻"); /* Left Hand Telephone Receiver */
         if (streq_ptr(chassis, "vm"))
-                return u8"🖴"; /* Hard disk */
+                return UTF8("🖴"); /* Hard disk */
         if (streq_ptr(chassis, "container"))
-                return u8"☐"; /* Ballot Box  */
+                return UTF8("☐"); /* Ballot Box  */
         return NULL;
 }
 
@@ -84,19 +98,18 @@ static const char *os_support_end_color(usec_t n, usec_t eol) {
          * yellow. If more than a year is left, color green. In between just show in regular color. */
 
         if (n >= eol)
-                return ANSI_HIGHLIGHT_RED;
+                return ansi_highlight_red();
         left = eol - n;
         if (left < USEC_PER_MONTH)
-                return ANSI_HIGHLIGHT_YELLOW;
+                return ansi_highlight_yellow();
         if (left > USEC_PER_YEAR)
-                return ANSI_HIGHLIGHT_GREEN;
+                return ansi_highlight_green();
 
         return NULL;
 }
 
 static int print_status_info(StatusInfo *i) {
         _cleanup_(table_unrefp) Table *table = NULL;
-        sd_id128_t mid = {}, bid = {};
         TableCell *cell;
         int r;
 
@@ -111,6 +124,15 @@ static int print_status_info(StatusInfo *i) {
 
         table_set_ersatz_string(table, TABLE_ERSATZ_UNSET);
 
+        if (!isempty(i->hostname) &&
+            !streq_ptr(i->hostname, i->static_hostname)) {
+                r = table_add_many(table,
+                                   TABLE_FIELD, "Transient hostname",
+                                   TABLE_STRING, i->hostname);
+                if (r < 0)
+                        return table_log_add_error(r);
+        }
+
         r = table_add_many(table,
                            TABLE_FIELD, "Static hostname",
                            TABLE_STRING, i->static_hostname);
@@ -122,15 +144,6 @@ static int print_status_info(StatusInfo *i) {
                 r = table_add_many(table,
                                    TABLE_FIELD, "Pretty hostname",
                                    TABLE_STRING, i->pretty_hostname);
-                if (r < 0)
-                        return table_log_add_error(r);
-        }
-
-        if (!isempty(i->hostname) &&
-            !streq_ptr(i->hostname, i->static_hostname)) {
-                r = table_add_many(table,
-                                   TABLE_FIELD, "Transient hostname",
-                                   TABLE_STRING, i->hostname);
                 if (r < 0)
                         return table_log_add_error(r);
         }
@@ -157,6 +170,14 @@ static int print_status_info(StatusInfo *i) {
                         return table_log_add_error(r);
         }
 
+        if (!isempty(i->chassis_asset_tag)) {
+                r = table_add_many(table,
+                                   TABLE_FIELD, "Chassis Asset Tag",
+                                   TABLE_STRING, i->chassis_asset_tag);
+                if (r < 0)
+                        return table_log_add_error(r);
+        }
+
         if (!isempty(i->deployment)) {
                 r = table_add_many(table,
                                    TABLE_FIELD, "Deployment",
@@ -173,20 +194,34 @@ static int print_status_info(StatusInfo *i) {
                         return table_log_add_error(r);
         }
 
-        r = sd_id128_get_machine(&mid);
-        if (r >= 0) {
+        if (!sd_id128_is_null(i->machine_id)) {
                 r = table_add_many(table,
                                    TABLE_FIELD, "Machine ID",
-                                   TABLE_ID128, mid);
+                                   TABLE_ID128, i->machine_id);
                 if (r < 0)
                         return table_log_add_error(r);
         }
 
-        r = sd_id128_get_boot(&bid);
-        if (r >= 0) {
+        if (!sd_id128_is_null(i->boot_id)) {
                 r = table_add_many(table,
                                    TABLE_FIELD, "Boot ID",
-                                   TABLE_ID128, bid);
+                                   TABLE_ID128, i->boot_id);
+                if (r < 0)
+                        return table_log_add_error(r);
+        }
+
+        if (!sd_id128_is_null(i->product_uuid)) {
+                r = table_add_many(table,
+                                   TABLE_FIELD, "Product UUID",
+                                   TABLE_UUID, i->product_uuid);
+                if (r < 0)
+                        return table_log_add_error(r);
+        }
+
+        if (i->vsock_cid != VMADDR_CID_ANY) {
+                r = table_add_many(table,
+                                   TABLE_FIELD, "AF_VSOCK CID",
+                                   TABLE_UINT32, i->vsock_cid);
                 if (r < 0)
                         return table_log_add_error(r);
         }
@@ -216,7 +251,7 @@ static int print_status_info(StatusInfo *i) {
                         return table_log_add_error(r);
         }
 
-        if (i->os_support_end != USEC_INFINITY) {
+        if (timestamp_is_set(i->os_support_end)) {
                 usec_t n = now(CLOCK_REALTIME);
 
                 r = table_add_many(table,
@@ -225,6 +260,22 @@ static int print_status_info(StatusInfo *i) {
                                    TABLE_FIELD, n < i->os_support_end ? "OS Support Remaining" : "OS Support Expired",
                                    TABLE_TIMESPAN_DAY, n < i->os_support_end ? i->os_support_end - n : n - i->os_support_end,
                                    TABLE_SET_COLOR, os_support_end_color(n, i->os_support_end));
+                if (r < 0)
+                        return table_log_add_error(r);
+        }
+
+        if (!isempty(i->os_image_id)) {
+                r = table_add_many(table,
+                                   TABLE_FIELD, "OS Image",
+                                   TABLE_STRING, i->os_image_id);
+                if (r < 0)
+                        return table_log_add_error(r);
+        }
+
+        if (!isempty(i->os_image_version)) {
+                r = table_add_many(table,
+                                   TABLE_FIELD, "OS Image Version",
+                                   TABLE_STRING, i->os_image_version);
                 if (r < 0)
                         return table_log_add_error(r);
         }
@@ -264,6 +315,30 @@ static int print_status_info(StatusInfo *i) {
                         return table_log_add_error(r);
         }
 
+        if (!isempty(i->hardware_serial)) {
+                r = table_add_many(table,
+                                   TABLE_FIELD, "Hardware Serial",
+                                   TABLE_STRING, i->hardware_serial);
+                if (r < 0)
+                        return table_log_add_error(r);
+        }
+
+        if (!isempty(i->hardware_sku)) {
+                r = table_add_many(table,
+                                   TABLE_FIELD, "Hardware SKU",
+                                   TABLE_STRING, i->hardware_sku);
+                if (r < 0)
+                        return table_log_add_error(r);
+        }
+
+        if (!isempty(i->hardware_version)) {
+                r = table_add_many(table,
+                                   TABLE_FIELD, "Hardware Version",
+                                   TABLE_STRING, i->hardware_version);
+                if (r < 0)
+                        return table_log_add_error(r);
+        }
+
         if (!isempty(i->firmware_version)) {
                 r = table_add_many(table,
                                    TABLE_FIELD, "Firmware Version",
@@ -273,11 +348,22 @@ static int print_status_info(StatusInfo *i) {
         }
 
         if (timestamp_is_set(i->firmware_date)) {
+                usec_t n = now(CLOCK_REALTIME);
+
                 r = table_add_many(table,
                                    TABLE_FIELD, "Firmware Date",
                                    TABLE_TIMESTAMP_DATE, i->firmware_date);
                 if (r < 0)
                         return table_log_add_error(r);
+
+                if (i->firmware_date < n) {
+                        r = table_add_many(table,
+                                           TABLE_FIELD, "Firmware Age",
+                                           TABLE_TIMESPAN_DAY, n - i->firmware_date,
+                                           TABLE_SET_COLOR, n - i->firmware_date > USEC_PER_YEAR*2 ? ansi_highlight_yellow() : NULL);
+                        if (r < 0)
+                                return table_log_add_error(r);
+                }
         }
 
         r = table_print(table, NULL);
@@ -298,13 +384,7 @@ static int get_one_name(sd_bus *bus, const char* attr, char **ret) {
 
         /* This obtains one string property, and copy it if 'ret' is set, or print it otherwise. */
 
-        r = sd_bus_get_property(
-                        bus,
-                        "org.freedesktop.hostname1",
-                        "/org/freedesktop/hostname1",
-                        "org.freedesktop.hostname1",
-                        attr,
-                        &error, &reply, "s");
+        r = bus_get_property(bus, bus_hostname, attr, &error, &reply, "s");
         if (r < 0)
                 return log_error_errno(r, "Could not get property: %s", bus_error_message(&error, r));
 
@@ -327,32 +407,42 @@ static int get_one_name(sd_bus *bus, const char* attr, char **ret) {
 }
 
 static int show_all_names(sd_bus *bus) {
-        StatusInfo info = {};
-
-        static const struct bus_properties_map hostname_map[]  = {
-                { "Hostname",                  "s", NULL, offsetof(StatusInfo, hostname)         },
-                { "StaticHostname",            "s", NULL, offsetof(StatusInfo, static_hostname)  },
-                { "PrettyHostname",            "s", NULL, offsetof(StatusInfo, pretty_hostname)  },
-                { "IconName",                  "s", NULL, offsetof(StatusInfo, icon_name)        },
-                { "Chassis",                   "s", NULL, offsetof(StatusInfo, chassis)          },
-                { "Deployment",                "s", NULL, offsetof(StatusInfo, deployment)       },
-                { "Location",                  "s", NULL, offsetof(StatusInfo, location)         },
-                { "KernelName",                "s", NULL, offsetof(StatusInfo, kernel_name)      },
-                { "KernelRelease",             "s", NULL, offsetof(StatusInfo, kernel_release)   },
-                { "OperatingSystemPrettyName", "s", NULL, offsetof(StatusInfo, os_pretty_name)   },
-                { "OperatingSystemCPEName",    "s", NULL, offsetof(StatusInfo, os_cpe_name)      },
-                { "OperatingSystemSupportEnd", "t", NULL, offsetof(StatusInfo, os_support_end)   },
-                { "HomeURL",                   "s", NULL, offsetof(StatusInfo, home_url)         },
-                { "HardwareVendor",            "s", NULL, offsetof(StatusInfo, hardware_vendor)  },
-                { "HardwareModel",             "s", NULL, offsetof(StatusInfo, hardware_model)   },
-                { "FirmwareVersion",           "s", NULL, offsetof(StatusInfo, firmware_version) },
-                { "FirmwareDate",              "t", NULL, offsetof(StatusInfo, firmware_date)    },
-                {}
+        StatusInfo info = {
+                .vsock_cid = VMADDR_CID_ANY,
+                .os_support_end = USEC_INFINITY,
+                .firmware_date = USEC_INFINITY,
         };
 
-        static const struct bus_properties_map manager_map[] = {
-                { "Virtualization",            "s", NULL, offsetof(StatusInfo, virtualization)  },
-                { "Architecture",              "s", NULL, offsetof(StatusInfo, architecture)    },
+        static const struct bus_properties_map hostname_map[]  = {
+                { "Hostname",                    "s",  NULL,          offsetof(StatusInfo, hostname)         },
+                { "StaticHostname",              "s",  NULL,          offsetof(StatusInfo, static_hostname)  },
+                { "PrettyHostname",              "s",  NULL,          offsetof(StatusInfo, pretty_hostname)  },
+                { "IconName",                    "s",  NULL,          offsetof(StatusInfo, icon_name)        },
+                { "Chassis",                     "s",  NULL,          offsetof(StatusInfo, chassis)          },
+                { "ChassisAssetTag",             "s",  NULL,          offsetof(StatusInfo, chassis_asset_tag)},
+                { "Deployment",                  "s",  NULL,          offsetof(StatusInfo, deployment)       },
+                { "Location",                    "s",  NULL,          offsetof(StatusInfo, location)         },
+                { "KernelName",                  "s",  NULL,          offsetof(StatusInfo, kernel_name)      },
+                { "KernelRelease",               "s",  NULL,          offsetof(StatusInfo, kernel_release)   },
+                { "OperatingSystemPrettyName",   "s",  NULL,          offsetof(StatusInfo, os_pretty_name)   },
+                { "OperatingSystemCPEName",      "s",  NULL,          offsetof(StatusInfo, os_cpe_name)      },
+                { "OperatingSystemSupportEnd",   "t",  NULL,          offsetof(StatusInfo, os_support_end)   },
+                { "OperatingSystemImageID",      "s",  NULL,          offsetof(StatusInfo, os_image_id)      },
+                { "OperatingSystemImageVersion", "s",  NULL,          offsetof(StatusInfo, os_image_version) },
+                { "HomeURL",                     "s",  NULL,          offsetof(StatusInfo, home_url)         },
+                { "HardwareVendor",              "s",  NULL,          offsetof(StatusInfo, hardware_vendor)  },
+                { "HardwareModel",               "s",  NULL,          offsetof(StatusInfo, hardware_model)   },
+                { "HardwareSKU",                 "s",  NULL,          offsetof(StatusInfo, hardware_sku)     },
+                { "HardwareVersion",             "s",  NULL,          offsetof(StatusInfo, hardware_version) },
+                { "FirmwareVersion",             "s",  NULL,          offsetof(StatusInfo, firmware_version) },
+                { "FirmwareDate",                "t",  NULL,          offsetof(StatusInfo, firmware_date)    },
+                { "MachineID",                   "ay", bus_map_id128, offsetof(StatusInfo, machine_id)       },
+                { "BootID",                      "ay", bus_map_id128, offsetof(StatusInfo, boot_id)          },
+                { "VSockCID",                    "u",  NULL,          offsetof(StatusInfo, vsock_cid)        },
+                {}
+        }, manager_map[] = {
+                { "Virtualization",              "s",  NULL,          offsetof(StatusInfo, virtualization)   },
+                { "Architecture",                "s",  NULL,          offsetof(StatusInfo, architecture)     },
                 {}
         };
 
@@ -382,6 +472,57 @@ static int show_all_names(sd_bus *bus) {
         if (r < 0)
                 return log_error_errno(r, "Failed to query system properties: %s", bus_error_message(&error, r));
 
+        _cleanup_(sd_bus_message_unrefp) sd_bus_message *product_uuid_reply = NULL;
+        r = bus_call_method(bus,
+                            bus_hostname,
+                            "GetProductUUID",
+                            &error,
+                            &product_uuid_reply,
+                            "b",
+                            false);
+        if (r < 0) {
+                log_full_errno(sd_bus_error_has_names(
+                                               &error,
+                                               BUS_ERROR_NO_PRODUCT_UUID,
+                                               SD_BUS_ERROR_INTERACTIVE_AUTHORIZATION_REQUIRED,
+                                               SD_BUS_ERROR_UNKNOWN_METHOD) ? LOG_DEBUG : LOG_WARNING,
+                               r, "Failed to query product UUID, ignoring: %s", bus_error_message(&error, r));
+                sd_bus_error_free(&error);
+        } else {
+                r = bus_message_read_id128(product_uuid_reply, &info.product_uuid);
+                if (r < 0)
+                        return bus_log_parse_error(r);
+        }
+
+        _cleanup_(sd_bus_message_unrefp) sd_bus_message *hardware_serial_reply = NULL;
+        r = bus_call_method(bus,
+                            bus_hostname,
+                            "GetHardwareSerial",
+                            &error,
+                            &hardware_serial_reply,
+                            NULL);
+        if (r < 0)
+                log_full_errno(sd_bus_error_has_names(
+                                               &error,
+                                               BUS_ERROR_NO_HARDWARE_SERIAL,
+                                               SD_BUS_ERROR_INTERACTIVE_AUTHORIZATION_REQUIRED,
+                                               SD_BUS_ERROR_UNKNOWN_METHOD) ||
+                               ERRNO_IS_DEVICE_ABSENT(r) ? LOG_DEBUG : LOG_WARNING, /* old hostnamed used to send ENOENT/ENODEV back to client as is, handle that gracefully */
+                               r, "Failed to query hardware serial, ignoring: %s", bus_error_message(&error, r));
+        else {
+                r = sd_bus_message_read_basic(hardware_serial_reply, 's', &info.hardware_serial);
+                if (r < 0)
+                        return bus_log_parse_error(r);
+        }
+
+        /* For older version of hostnamed. */
+        if (!arg_host) {
+                if (sd_id128_is_null(info.machine_id))
+                        (void) sd_id128_get_machine(&info.machine_id);
+                if (sd_id128_is_null(info.boot_id))
+                        (void) sd_id128_get_boot(&info.boot_id);
+        }
+
         return print_status_info(&info);
 }
 
@@ -402,21 +543,13 @@ static int show_status(int argc, char **argv, void *userdata) {
         sd_bus *bus = userdata;
         int r;
 
-        if (arg_json_format_flags != JSON_FORMAT_OFF) {
+        if (sd_json_format_enabled(arg_json_format_flags)) {
                 _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
                 _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
-                _cleanup_(json_variant_unrefp) JsonVariant *v = NULL;
+                _cleanup_(sd_json_variant_unrefp) sd_json_variant *v = NULL;
                 const char *text = NULL;
 
-                r = sd_bus_call_method(
-                                bus,
-                                "org.freedesktop.hostname1",
-                                "/org/freedesktop/hostname1",
-                                "org.freedesktop.hostname1",
-                                "Describe",
-                                &error,
-                                &reply,
-                                NULL);
+                r = bus_call_method(bus, bus_hostname, "Describe", &error, &reply, NULL);
                 if (r < 0)
                         return log_error_errno(r, "Could not get description: %s", bus_error_message(&error, r));
 
@@ -424,11 +557,11 @@ static int show_status(int argc, char **argv, void *userdata) {
                 if (r < 0)
                         return bus_log_parse_error(r);
 
-                r = json_parse(text, 0, &v, NULL, NULL);
+                r = sd_json_parse(text, 0, &v, NULL, NULL);
                 if (r < 0)
                         return log_error_errno(r, "Failed to parse JSON: %m");
 
-                json_variant_dump(v, arg_json_format_flags, NULL, NULL);
+                sd_json_variant_dump(v, arg_json_format_flags, NULL, NULL);
                 return 0;
         }
 
@@ -438,24 +571,16 @@ static int show_status(int argc, char **argv, void *userdata) {
         return show_all_names(bus);
 }
 
-
 static int set_simple_string_internal(sd_bus *bus, sd_bus_error *error, const char *target, const char *method, const char *value) {
         _cleanup_(sd_bus_error_free) sd_bus_error e = SD_BUS_ERROR_NULL;
         int r;
 
-        polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
+        (void) polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
 
         if (!error)
                 error = &e;
 
-        r = sd_bus_call_method(
-                        bus,
-                        "org.freedesktop.hostname1",
-                        "/org/freedesktop/hostname1",
-                        "org.freedesktop.hostname1",
-                        method,
-                        error, NULL,
-                        "sb", value, arg_ask_password);
+        r = bus_call_method(bus, bus_hostname, method, error, NULL, "sb", value, arg_ask_password);
         if (r < 0)
                 return log_error_errno(r, "Could not set %s: %s", target, bus_error_message(error, r));
 
@@ -494,7 +619,7 @@ static int set_hostname(int argc, char **argv, void *userdata) {
                 /* If the passed hostname is already valid, then assume the user doesn't know anything about pretty
                  * hostnames, so let's unset the pretty hostname, and just set the passed hostname as static/dynamic
                  * hostname. */
-                if (implicit && hostname_is_valid(hostname, VALID_HOSTNAME_TRAILING_DOT))
+                if (implicit && hostname_is_valid(hostname, VALID_HOSTNAME_TRAILING_DOT|VALID_HOSTNAME_QUESTION_MARK))
                         p = ""; /* No pretty hostname (as it is redundant), just a static one */
                 else
                         p = hostname; /* Use the passed name as pretty hostname */
@@ -585,16 +710,16 @@ static int help(void) {
         if (r < 0)
                 return log_oom();
 
-        printf("%s [OPTIONS...] COMMAND ...\n\n"
-               "%sQuery or change system hostname.%s\n"
-               "\nCommands:\n"
+        printf("%1$s [OPTIONS...] COMMAND ...\n\n"
+               "%2$sQuery or change system hostname.%3$s\n"
+               "\n%4$sCommands:%5$s\n"
                "  status                 Show current hostname settings\n"
                "  hostname [NAME]        Get/set system hostname\n"
                "  icon-name [NAME]       Get/set icon name for host\n"
                "  chassis [NAME]         Get/set chassis type for host\n"
                "  deployment [NAME]      Get/set deployment environment for host\n"
                "  location [NAME]        Get/set location for host\n"
-               "\nOptions:\n"
+               "\n%4$sOptions:%5$s\n"
                "  -h --help              Show this help\n"
                "     --version           Show package version\n"
                "     --no-ask-password   Do not prompt for password\n"
@@ -605,9 +730,12 @@ static int help(void) {
                "     --pretty            Only set pretty hostname\n"
                "     --json=pretty|short|off\n"
                "                         Generate JSON output\n"
-               "\nSee the %s for details.\n",
+               "  -j                     Same as --json=pretty on tty, --json=short otherwise\n"
+               "\nSee the %6$s for details.\n",
                program_invocation_short_name,
                ansi_highlight(),
+               ansi_normal(),
+               ansi_underline(),
                ansi_normal(),
                link);
 
@@ -647,7 +775,7 @@ static int parse_argv(int argc, char *argv[]) {
         assert(argc >= 0);
         assert(argv);
 
-        while ((c = getopt_long(argc, argv, "hH:M:", options, NULL)) >= 0)
+        while ((c = getopt_long(argc, argv, "hH:M:j", options, NULL)) >= 0)
 
                 switch (c) {
 
@@ -663,8 +791,9 @@ static int parse_argv(int argc, char *argv[]) {
                         break;
 
                 case 'M':
-                        arg_transport = BUS_TRANSPORT_MACHINE;
-                        arg_host = optarg;
+                        r = parse_machine_argument(optarg, &arg_host, &arg_transport);
+                        if (r < 0)
+                                return r;
                         break;
 
                 case ARG_TRANSIENT:
@@ -688,6 +817,10 @@ static int parse_argv(int argc, char *argv[]) {
                         if (r <= 0)
                                 return r;
 
+                        break;
+
+                case 'j':
+                        arg_json_format_flags = SD_JSON_FORMAT_PRETTY_AUTO|SD_JSON_FORMAT_COLOR_AUTO;
                         break;
 
                 case '?':
@@ -734,7 +867,7 @@ static int run(int argc, char *argv[]) {
 
         r = bus_connect_transport(arg_transport, arg_host, RUNTIME_SCOPE_SYSTEM, &bus);
         if (r < 0)
-                return bus_log_connect_error(r, arg_transport);
+                return bus_log_connect_error(r, arg_transport, RUNTIME_SCOPE_SYSTEM);
 
         return hostnamectl_main(bus, argc, argv);
 }

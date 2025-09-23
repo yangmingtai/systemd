@@ -1,32 +1,29 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
+#include "sd-bus.h"
+
 #include "alloc-util.h"
 #include "bus-internal.h"
 #include "bus-match.h"
 #include "env-util.h"
-#include "fd-util.h"
-#include "fileio.h"
 #include "fuzz.h"
+#include "memstream-util.h"
 
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
-        _cleanup_free_ char *out = NULL; /* out should be freed after g */
-        size_t out_size;
-        _cleanup_fclose_ FILE *g = NULL;
+        _cleanup_(memstream_done) MemStream m = {};
         _cleanup_(sd_bus_unrefp) sd_bus *bus = NULL;
+        FILE *g = NULL;
         int r;
 
         if (outside_size_range(size, 0, 65536))
                 return 0;
 
-        /* We don't want to fill the logs with messages about parse errors.
-         * Disable most logging if not running standalone */
-        if (!getenv("SYSTEMD_LOG_LEVEL"))
-                log_set_max_level(LOG_CRIT);
+        fuzz_setup_logging();
 
         r = sd_bus_new(&bus);
         assert_se(r >= 0);
 
-        struct bus_match_node root = {
+        _cleanup_(bus_match_free) BusMatchNode root = {
                 .type = BUS_MATCH_ROOT,
         };
 
@@ -38,7 +35,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         };
 
         if (getenv_bool("SYSTEMD_FUZZ_OUTPUT") <= 0)
-                assert_se(g = open_memstream_unlocked(&out, &out_size));
+                assert_se(g = memstream_init(&m));
 
         for (size_t offset = 0; offset < size; ) {
                 _cleanup_free_ char *line = NULL;
@@ -53,7 +50,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
 
                 offset = end ? (size_t) (end - (char*) data + 1) : size;
 
-                struct bus_match_component *components;
+                BusMatchComponent *components;
                 size_t n_components;
                 r = bus_match_parse(line, &components, &n_components);
                 if (IN_SET(r, -EINVAL, -ENOMEM)) {

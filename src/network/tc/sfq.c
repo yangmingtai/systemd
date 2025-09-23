@@ -2,11 +2,9 @@
  * Copyright © 2019 VMware, Inc. */
 
 #include <linux/pkt_sched.h>
+#include "sd-netlink.h"
 
-#include "alloc-util.h"
-#include "conf-parser.h"
-#include "netlink-util.h"
-#include "parse-util.h"
+#include "log.h"
 #include "qdisc.h"
 #include "sfq.h"
 #include "string-util.h"
@@ -32,7 +30,7 @@ static int stochastic_fairness_queueing_fill_message(Link *link, QDisc *qdisc, s
         return 0;
 }
 
-int config_parse_stochastic_fairness_queueing_perturb_period(
+int config_parse_sfq_perturb_period(
                 const char *unit,
                 const char *filename,
                 unsigned line,
@@ -44,7 +42,7 @@ int config_parse_stochastic_fairness_queueing_perturb_period(
                 void *data,
                 void *userdata) {
 
-        _cleanup_(qdisc_free_or_set_invalidp) QDisc *qdisc = NULL;
+        _cleanup_(qdisc_unref_or_set_invalidp) QDisc *qdisc = NULL;
         StochasticFairnessQueueing *sfq;
         Network *network = ASSERT_PTR(data);
         int r;

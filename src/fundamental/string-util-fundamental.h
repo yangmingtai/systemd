@@ -8,7 +8,25 @@
 #  include <string.h>
 #endif
 
+#include "assert-fundamental.h"
 #include "macro-fundamental.h"
+
+/* What is interpreted as whitespace? */
+#define WHITESPACE          " \t\n\r"
+#define NEWLINE             "\n\r"
+#define QUOTES              "\"\'"
+#define COMMENTS            "#;"
+#define GLOB_CHARS          "*?["
+#define DIGITS              "0123456789"
+#define LOWERCASE_LETTERS   "abcdefghijklmnopqrstuvwxyz"
+#define UPPERCASE_LETTERS   "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+#define LETTERS             LOWERCASE_LETTERS UPPERCASE_LETTERS
+#define ALPHANUMERICAL      LETTERS DIGITS
+#define HEXDIGITS           DIGITS "abcdefABCDEF"
+#define LOWERCASE_HEXDIGITS DIGITS "abcdef"
+#define URI_RESERVED        ":/?#[]@!$&'()*+;="         /* [RFC3986] */
+#define URI_UNRESERVED      ALPHANUMERICAL "-._~"       /* [RFC3986] */
+#define URI_VALID           URI_RESERVED URI_UNRESERVED /* [RFC3986] */
 
 #if SD_BOOT
 #  define strlen strlen16
@@ -16,6 +34,8 @@
 #  define strncmp strncmp16
 #  define strcasecmp strcasecmp16
 #  define strncasecmp strncasecmp16
+#  define strspn strspn16
+#  define strcspn strcspn16
 #  define STR_C(str)       (L ## str)
 typedef char16_t sd_char;
 #else
@@ -59,8 +79,8 @@ static inline size_t strlen_ptr(const sd_char *s) {
 
 sd_char *startswith(const sd_char *s, const sd_char *prefix) _pure_;
 sd_char *startswith_no_case(const sd_char *s, const sd_char *prefix) _pure_;
-sd_char *endswith(const sd_char *s, const sd_char *postfix) _pure_;
-sd_char *endswith_no_case(const sd_char *s, const sd_char *postfix) _pure_;
+sd_char *endswith(const sd_char *s, const sd_char *suffix) _pure_;
+sd_char *endswith_no_case(const sd_char *s, const sd_char *suffix) _pure_;
 
 static inline bool isempty(const sd_char *a) {
         return !a || a[0] == '\0';
@@ -72,6 +92,10 @@ static inline const sd_char *strempty(const sd_char *s) {
 
 static inline const sd_char *yes_no(bool b) {
         return b ? STR_C("yes") : STR_C("no");
+}
+
+static inline const sd_char *on_off(bool b) {
+        return b ? STR_C("on") : STR_C("off");
 }
 
 static inline const sd_char* comparison_operator(int result) {
@@ -95,12 +119,6 @@ static inline void *memory_startswith(const void *p, size_t sz, const sd_char *t
 
         return (uint8_t*) p + n;
 }
-
-#define _STRV_FOREACH(s, l, i)                                          \
-        for (typeof(*(l)) *s, *i = (l); (s = i) && *i; i++)
-
-#define STRV_FOREACH(s, l)                      \
-        _STRV_FOREACH(s, l, UNIQ_T(i, UNIQ))
 
 static inline bool ascii_isdigit(sd_char a) {
         /* A pure ASCII, locale independent version of isdigit() */

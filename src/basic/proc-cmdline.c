@@ -1,15 +1,13 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <stdbool.h>
-#include <stddef.h>
+#include <stdlib.h>
 
 #include "alloc-util.h"
-#include "efivars.h"
 #include "extract-word.h"
 #include "fileio.h"
 #include "getopt-defs.h"
 #include "initrd-util.h"
-#include "macro.h"
+#include "log.h"
 #include "parse-util.h"
 #include "proc-cmdline.h"
 #include "process-util.h"
@@ -17,63 +15,95 @@
 #include "strv.h"
 #include "virt.h"
 
-int proc_cmdline_filter_pid1_args(
-                char **argv,   /* input, may be reordered by this function. */
-                char ***ret) {
-
+int proc_cmdline_filter_pid1_args(char **argv, char ***ret) {
         enum {
                 COMMON_GETOPT_ARGS,
                 SYSTEMD_GETOPT_ARGS,
                 SHUTDOWN_GETOPT_ARGS,
         };
-
         static const struct option options[] = {
                 COMMON_GETOPT_OPTIONS,
                 SYSTEMD_GETOPT_OPTIONS,
                 SHUTDOWN_GETOPT_OPTIONS,
-                {}
         };
+        static const char *short_options = SYSTEMD_GETOPT_SHORT_OPTIONS;
 
-        int saved_optind, saved_opterr, saved_optopt, argc;
-        char *saved_optarg;
-        char **filtered;
-        size_t idx;
+        _cleanup_strv_free_ char **filtered = NULL;
+        int state, r;
 
         assert(argv);
         assert(ret);
 
-        /* Backup global variables. */
-        saved_optind = optind;
-        saved_opterr = opterr;
-        saved_optopt = optopt;
-        saved_optarg = optarg;
-
-        /* Resetting to 0 forces the invocation of an internal initialization routine of getopt_long()
-         * that checks for GNU extensions in optstring ('-' or '+' at the beginning). Here, we do not use
-         * the GNU extensions, but might be used previously. Hence, we need to always reset it. */
-        optind = 0;
-
-        /* Do not print an error message. */
-        opterr = 0;
+        /* Currently, we do not support '-', '+', and ':' at the beginning. */
+        assert(!IN_SET(short_options[0], '-', '+', ':'));
 
         /* Filter out all known options. */
-        argc = strv_length(argv);
-        while (getopt_long(argc, argv, SYSTEMD_GETOPT_SHORT_OPTIONS, options, NULL) >= 0)
-                ;
+        state = no_argument;
+        STRV_FOREACH(p, strv_skip(argv, 1)) {
+                int prev_state = state;
+                const char *a = *p;
 
-        idx = optind;
+                /* Reset the state for the next step. */
+                state = no_argument;
 
-        /* Restore global variables. */
-        optind = saved_optind;
-        opterr = saved_opterr;
-        optopt = saved_optopt;
-        optarg = saved_optarg;
+                if (prev_state == required_argument ||
+                    (prev_state == optional_argument && a[0] != '-'))
+                        /* Handled as an argument of the previous option, filtering out the string. */
+                        continue;
 
-        filtered = strv_copy(strv_skip(argv, idx));
-        if (!filtered)
-                return -ENOMEM;
+                if (a[0] != '-') {
+                        /* Not an option, accepting the string. */
+                        r = strv_extend(&filtered, a);
+                        if (r < 0)
+                                return r;
+                        continue;
+                }
 
-        *ret = filtered;
+                if (a[1] == '-') {
+                        if (a[2] == '\0') {
+                                /* "--" is specified, accepting remaining strings. */
+                                r = strv_extend_strv(&filtered, strv_skip(p, 1), /* filter_duplicates = */ false);
+                                if (r < 0)
+                                        return r;
+                                break;
+                        }
+
+                        /* long option, e.g. --foo */
+                        FOREACH_ELEMENT(option, options) {
+                                const char *q = startswith(a + 2, option->name);
+                                if (!q || !IN_SET(q[0], '=', '\0'))
+                                        continue;
+
+                                /* Found matching option, updating the state if necessary. */
+                                if (q[0] == '\0' && option->has_arg == required_argument)
+                                        state = required_argument;
+
+                                break;
+                        }
+                        continue;
+                }
+
+                /* short option(s), e.g. -x or -xyz */
+                while (a && *++a != '\0')
+                        for (const char *q = short_options; *q != '\0'; q++) {
+                                if (*q != *a)
+                                        continue;
+
+                                /* Found matching short option. */
+
+                                if (q[1] == ':') {
+                                        /* An argument is required or optional, and remaining part
+                                         * is handled as argument if exists. */
+                                        state = a[1] != '\0' ? no_argument :
+                                                q[2] == ':' ? optional_argument : required_argument;
+
+                                        a = NULL; /* Not necessary to parse remaining part. */
+                                }
+                                break;
+                        }
+        }
+
+        *ret = TAKE_PTR(filtered);
         return 0;
 }
 
@@ -84,21 +114,13 @@ int proc_cmdline(char **ret) {
 
         /* For testing purposes it is sometimes useful to be able to override what we consider /proc/cmdline to be */
         e = secure_getenv("SYSTEMD_PROC_CMDLINE");
-        if (e) {
-                char *m;
-
-                m = strdup(e);
-                if (!m)
-                        return -ENOMEM;
-
-                *ret = m;
-                return 0;
-        }
+        if (e)
+                return strdup_to(ret, e);
 
         if (detect_container() > 0)
-                return get_process_cmdline(1, SIZE_MAX, 0, ret);
-        else
-                return read_one_line_file("/proc/cmdline", ret);
+                return pid_get_cmdline(1, SIZE_MAX, 0, ret);
+
+        return read_full_file("/proc/cmdline", ret, /* ret_size= */  NULL);
 }
 
 static int proc_cmdline_strv_internal(char ***ret, bool filter_pid1_args) {
@@ -115,7 +137,7 @@ static int proc_cmdline_strv_internal(char ***ret, bool filter_pid1_args) {
         if (detect_container() > 0) {
                 _cleanup_strv_free_ char **args = NULL;
 
-                r = get_process_cmdline_strv(1, /* flags = */ 0, &args);
+                r = pid_get_cmdline_strv(1, /* flags = */ 0, &args);
                 if (r < 0)
                         return r;
 
@@ -128,7 +150,7 @@ static int proc_cmdline_strv_internal(char ***ret, bool filter_pid1_args) {
         } else {
                 _cleanup_free_ char *s = NULL;
 
-                r = read_one_line_file("/proc/cmdline", &s);
+                r = read_full_file("/proc/cmdline", &s, NULL);
                 if (r < 0)
                         return r;
 
@@ -165,10 +187,6 @@ static int proc_cmdline_parse_strv(char **args, proc_cmdline_parse_t parse_item,
 
         assert(parse_item);
 
-        /* The PROC_CMDLINE_VALUE_OPTIONAL flag doesn't really make sense for proc_cmdline_parse(), let's
-         * make this clear. */
-        assert(!FLAGS_SET(flags, PROC_CMDLINE_VALUE_OPTIONAL));
-
         STRV_FOREACH(word, args) {
                 char *key, *value;
 
@@ -194,27 +212,9 @@ int proc_cmdline_parse(proc_cmdline_parse_t parse_item, void *data, ProcCmdlineF
 
         assert(parse_item);
 
-        /* We parse the EFI variable first, because later settings have higher priority. */
-
-        if (!FLAGS_SET(flags, PROC_CMDLINE_IGNORE_EFI_OPTIONS)) {
-                _cleanup_free_ char *line = NULL;
-
-                r = systemd_efi_options_variable(&line);
-                if (r < 0) {
-                        if (r != -ENODATA)
-                                log_debug_errno(r, "Failed to get SystemdOptions EFI variable, ignoring: %m");
-                } else {
-                        r = strv_split_full(&args, line, NULL, EXTRACT_UNQUOTE|EXTRACT_RELAX|EXTRACT_RETAIN_ESCAPE);
-                        if (r < 0)
-                                return r;
-
-                        r = proc_cmdline_parse_strv(args, parse_item, data, flags);
-                        if (r < 0)
-                                return r;
-
-                        args = strv_free(args);
-                }
-        }
+        /* The PROC_CMDLINE_VALUE_OPTIONAL and PROC_CMDLINE_TRUE_WHEN_MISSING flags don't really make sense
+         * for proc_cmdline_parse(), let's make this clear. */
+        assert(!(flags & (PROC_CMDLINE_VALUE_OPTIONAL|PROC_CMDLINE_TRUE_WHEN_MISSING)));
 
         r = proc_cmdline_strv_internal(&args, /* filter_pid1_args = */ true);
         if (r < 0)
@@ -229,7 +229,7 @@ static bool relaxed_equal_char(char a, char b) {
                 (a == '-' && b == '_');
 }
 
-char *proc_cmdline_key_startswith(const char *s, const char *prefix) {
+char* proc_cmdline_key_startswith(const char *s, const char *prefix) {
         assert(s);
         assert(prefix);
 
@@ -302,11 +302,9 @@ static int cmdline_get_key(char **args, const char *key, ProcCmdlineFlags flags,
 
 int proc_cmdline_get_key(const char *key, ProcCmdlineFlags flags, char **ret_value) {
         _cleanup_strv_free_ char **args = NULL;
-        _cleanup_free_ char *line = NULL, *v = NULL;
         int r;
 
-        /* Looks for a specific key on the kernel command line and (with lower priority) the EFI variable.
-         * Supports three modes:
+        /* Looks for a specific key on the kernel command line. Supports three modes:
          *
          * a) The "ret_value" parameter is used. In this case a parameter beginning with the "key" string followed by
          *    "=" is searched for, and the value following it is returned in "ret_value".
@@ -319,6 +317,9 @@ int proc_cmdline_get_key(const char *key, ProcCmdlineFlags flags, char **ret_val
          *
          * In all three cases, > 0 is returned if the key is found, 0 if not. */
 
+        /* PROC_CMDLINE_TRUE_WHEN_MISSING doesn't really make sense for proc_cmdline_get_key(). */
+        assert(!FLAGS_SET(flags, PROC_CMDLINE_TRUE_WHEN_MISSING));
+
         if (isempty(key))
                 return -EINVAL;
 
@@ -329,48 +330,20 @@ int proc_cmdline_get_key(const char *key, ProcCmdlineFlags flags, char **ret_val
         if (r < 0)
                 return r;
 
-        if (FLAGS_SET(flags, PROC_CMDLINE_IGNORE_EFI_OPTIONS)) /* Shortcut */
-                return cmdline_get_key(args, key, flags, ret_value);
-
-        r = cmdline_get_key(args, key, flags, ret_value ? &v : NULL);
-        if (r < 0)
-                return r;
-        if (r > 0) {
-                if (ret_value)
-                        *ret_value = TAKE_PTR(v);
-
-                return r;
-        }
-
-        r = systemd_efi_options_variable(&line);
-        if (r == -ENODATA) {
-                if (ret_value)
-                        *ret_value = NULL;
-
-                return false; /* Not found */
-        }
-        if (r < 0)
-                return r;
-
-        args = strv_free(args);
-        r = strv_split_full(&args, line, NULL, EXTRACT_UNQUOTE|EXTRACT_RELAX|EXTRACT_RETAIN_ESCAPE);
-        if (r < 0)
-                return r;
-
         return cmdline_get_key(args, key, flags, ret_value);
 }
 
-int proc_cmdline_get_bool(const char *key, bool *ret) {
+int proc_cmdline_get_bool(const char *key, ProcCmdlineFlags flags, bool *ret) {
         _cleanup_free_ char *v = NULL;
         int r;
 
         assert(ret);
 
-        r = proc_cmdline_get_key(key, PROC_CMDLINE_VALUE_OPTIONAL, &v);
+        r = proc_cmdline_get_key(key, (flags & ~PROC_CMDLINE_TRUE_WHEN_MISSING) | PROC_CMDLINE_VALUE_OPTIONAL, &v);
         if (r < 0)
                 return r;
         if (r == 0) { /* key not specified at all */
-                *ret = false;
+                *ret = FLAGS_SET(flags, PROC_CMDLINE_TRUE_WHEN_MISSING);
                 return 0;
         }
 
@@ -421,36 +394,14 @@ static int cmdline_get_key_ap(ProcCmdlineFlags flags, char* const* args, va_list
 
 int proc_cmdline_get_key_many_internal(ProcCmdlineFlags flags, ...) {
         _cleanup_strv_free_ char **args = NULL;
-        int r, ret = 0;
+        int r;
         va_list ap;
 
-        /* The PROC_CMDLINE_VALUE_OPTIONAL flag doesn't really make sense for proc_cmdline_get_key_many(), let's make
-         * this clear. */
-        assert(!FLAGS_SET(flags, PROC_CMDLINE_VALUE_OPTIONAL));
+        /* The PROC_CMDLINE_VALUE_OPTIONAL and PROC_CMDLINE_TRUE_WHEN_MISSING flags don't really make sense
+         * for proc_cmdline_get_key_many, let's make this clear. */
+        assert(!(flags & (PROC_CMDLINE_VALUE_OPTIONAL|PROC_CMDLINE_TRUE_WHEN_MISSING)));
 
         /* This call may clobber arguments on failure! */
-
-        if (!FLAGS_SET(flags, PROC_CMDLINE_IGNORE_EFI_OPTIONS)) {
-                _cleanup_free_ char *line = NULL;
-
-                r = systemd_efi_options_variable(&line);
-                if (r < 0 && r != -ENODATA)
-                        log_debug_errno(r, "Failed to get SystemdOptions EFI variable, ignoring: %m");
-                if (r >= 0) {
-                        r = strv_split_full(&args, line, NULL, EXTRACT_UNQUOTE|EXTRACT_RELAX|EXTRACT_RETAIN_ESCAPE);
-                        if (r < 0)
-                                return r;
-
-                        va_start(ap, flags);
-                        r = cmdline_get_key_ap(flags, args, ap);
-                        va_end(ap);
-                        if (r < 0)
-                                return r;
-
-                        ret = r;
-                        args = strv_free(args);
-                }
-        }
 
         r = proc_cmdline_strv(&args);
         if (r < 0)
@@ -459,8 +410,17 @@ int proc_cmdline_get_key_many_internal(ProcCmdlineFlags flags, ...) {
         va_start(ap, flags);
         r = cmdline_get_key_ap(flags, args, ap);
         va_end(ap);
-        if (r < 0)
-                return r;
 
-        return ret + r;
+        return r;
+}
+
+bool proc_cmdline_value_missing(const char *key, const char *value) {
+        assert(key);
+
+        if (!value) {
+                log_warning("Missing argument for %s= kernel command line switch, ignoring.", key);
+                return true;
+        }
+
+        return false;
 }

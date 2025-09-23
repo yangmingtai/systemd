@@ -16,29 +16,64 @@ permissions:
 jobs:
   build:
     name: Lint Code Base
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     concurrency:
       group: ${{ github.workflow }}-${{ github.ref }}
       cancel-in-progress: true
 
     steps:
       - name: Repo checkout
-        uses: actions/checkout@8e5e7e5ab8b370d6c329ec480221332ada57f0ab
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           # We need a full repo clone
           fetch-depth: 0
 
       - name: Lint Code Base
-        uses: github/super-linter/slim@45fc0d88288beee4701c62761281edfee85655d7
+        uses: super-linter/super-linter/slim@12150456a73e248bdc94d0794898f94e23127c88
         env:
           DEFAULT_BRANCH: main
           MULTI_STATUS: false
-          # Excludes:
-          #   - man/.* - all snippets in man pages (false positives due to
-          #              missing shebangs)
-          #   - .*\.(in|SKELETON) - all template/skeleton files
-          #                         except kernel-install
-          FILTER_REGEX_EXCLUDE: .*/(man/.*|([^k]|k(k|ek)*([^ek]|e[^kr]))*(k(k|ek)*e?)?\.(in|SKELETON))$
           VALIDATE_ALL_CODEBASE: false
-          VALIDATE_BASH: true
           VALIDATE_GITHUB_ACTIONS: true
+          LINTER_RULES_PATH: .github/linters
+          GITHUB_ACTIONS_CONFIG_FILE: actionlint.yml
+
+      - uses: systemd/mkosi@d45142e329550abc9c6fc63c1f1f86e5286d3d67
+
+      - name: Check that tabs are not used in Python code
+        run: sh -c '! git grep -P "\\t" -- src/core/generate-bpf-delegate-configs.py src/boot/generate-hwids-section.py src/ukify/ukify.py test/integration-tests/integration-test-wrapper.py'
+
+      - name: Build tools tree
+        run: |
+          tee mkosi/mkosi.local.conf <<EOF
+          [Build]
+          ToolsTreeDistribution=fedora
+          ToolsTreeRelease=rawhide
+          EOF
+
+          mkosi -f box -- true
+
+      - name: Run mypy
+        run: |
+          mkosi box -- mypy --version
+          mkosi box -- mypy src/core/generate-bpf-delegate-configs.py src/boot/generate-hwids-section.py src/test/generate-sym-test.py src/ukify/ukify.py test/integration-tests/integration-test-wrapper.py
+
+      - name: Run ruff format
+        run: |
+          mkosi box -- ruff --version
+          if ! mkosi box -- ruff format --check src/core/generate-bpf-delegate-configs.py src/boot/generate-hwids-section.py src/test/generate-sym-test.py src/ukify/ukify.py test/integration-tests/integration-test-wrapper.py
+          then
+              echo "Please run 'ruff format' on the above files or apply the diffs below manually"
+              mkosi box -- ruff format --check --quiet --diff src/core/generate-bpf-delegate-configs.py src/boot/generate-hwids-section.py src/test/generate-sym-test.py src/ukify/ukify.py test/integration-tests/integration-test-wrapper.py
+          fi
+
+      - name: Run ruff check
+        run: |
+          mkosi box -- ruff --version
+          mkosi box -- ruff check src/core/generate-bpf-delegate-configs.py src/boot/generate-hwids-section.py src/test/generate-sym-test.py src/ukify/ukify.py test/integration-tests/integration-test-wrapper.py
+
+      - name: Configure meson
+        run: mkosi box -- env CC=clang CXX=clang++ meson setup -Dlocalegen-path=/usr/bin/locale-gen -Dcompat-mutable-uid-boundaries=true build
+
+      - name: Run clang-tidy
+        run: mkosi box -- meson test -C build --suite=clang-tidy --print-errorlogs --no-stdsplit

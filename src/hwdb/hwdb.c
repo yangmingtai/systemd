@@ -2,15 +2,13 @@
 
 #include <getopt.h>
 
-#include "sd-hwdb.h"
-
 #include "alloc-util.h"
 #include "build.h"
 #include "hwdb-util.h"
+#include "label-util.h"
+#include "log.h"
 #include "main-func.h"
 #include "pretty-print.h"
-#include "selinux-util.h"
-#include "terminal-util.h"
 #include "verbs.h"
 
 static const char *arg_hwdb_bin_dir = NULL;
@@ -22,6 +20,9 @@ static int verb_query(int argc, char *argv[], void *userdata) {
 }
 
 static int verb_update(int argc, char *argv[], void *userdata) {
+        if (hwdb_bypass())
+                return 0;
+
         return hwdb_update(arg_root, arg_hwdb_bin_dir, arg_strict, false);
 }
 
@@ -117,14 +118,13 @@ static int hwdb_main(int argc, char *argv[]) {
 static int run(int argc, char *argv[]) {
         int r;
 
-        log_parse_environment();
-        log_open();
+        log_setup();
 
         r = parse_argv(argc, argv);
         if (r <= 0)
                 return r;
 
-        r = mac_selinux_init();
+        r = mac_init();
         if (r < 0)
                 return r;
 

@@ -1,18 +1,15 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <errno.h>
 #include <getopt.h>
 #include <sys/epoll.h>
 #include <unistd.h>
 
-#include "alloc-util.h"
 #include "devnum-util.h"
 #include "fd-util.h"
 #include "libudev-list-internal.h"
-#include "libudev-util.h"
 #include "log.h"
 #include "main-func.h"
-#include "stdio-util.h"
+#include "libudev-util.h"
 #include "string-util.h"
 #include "tests.h"
 #include "version.h"
@@ -91,7 +88,7 @@ static void print_device(struct udev_device *device) {
 }
 
 static void test_device(struct udev *udev, const char *syspath) {
-        _cleanup_(udev_device_unrefp) struct udev_device *device;
+        _cleanup_(udev_device_unrefp) struct udev_device *device = NULL;
 
         log_info("/* %s, device %s */", __func__, syspath);
         device = udev_device_new_from_syspath(udev, syspath);
@@ -102,7 +99,7 @@ static void test_device(struct udev *udev, const char *syspath) {
 }
 
 static void test_device_parents(struct udev *udev, const char *syspath) {
-        _cleanup_(udev_device_unrefp) struct udev_device *device;
+        _cleanup_(udev_device_unrefp) struct udev_device *device = NULL;
         struct udev_device *device_parent;
 
         log_info("/* %s, device %s */", __func__, syspath);
@@ -171,8 +168,8 @@ static int enumerate_print_list(struct udev_enumerate *enumerate) {
 }
 
 static void test_monitor(struct udev *udev) {
-        _cleanup_(udev_monitor_unrefp) struct udev_monitor *udev_monitor;
-        _cleanup_close_ int fd_ep;
+        _cleanup_(udev_monitor_unrefp) struct udev_monitor *udev_monitor = NULL;
+        _cleanup_close_ int fd_ep = -EBADF;
         int fd_udev;
         struct epoll_event ep_udev = {
                 .events = EPOLLIN,
@@ -338,6 +335,9 @@ static void test_hwdb(struct udev *udev, const char *modalias) {
         hwdb = udev_hwdb_new(udev);
         if (!hwdb)
                 log_warning_errno(errno, "Failed to open hwdb: %m");
+
+        SAVE_ASSERT_RETURN_IS_CRITICAL;
+        log_set_assert_return_is_critical(hwdb);
 
         udev_list_entry_foreach(entry, udev_hwdb_get_properties_list_entry(hwdb, modalias, 0))
                 log_info("'%s'='%s'", udev_list_entry_get_name(entry), udev_list_entry_get_value(entry));

@@ -4,7 +4,6 @@
 #include <linux/rfkill.h>
 #include <poll.h>
 #include <sys/stat.h>
-#include <sys/types.h>
 #include <unistd.h>
 
 #include "sd-daemon.h"
@@ -12,17 +11,18 @@
 
 #include "alloc-util.h"
 #include "device-util.h"
+#include "errno-util.h"
 #include "escape.h"
 #include "fd-util.h"
 #include "fileio.h"
 #include "io-util.h"
 #include "list.h"
 #include "main-func.h"
-#include "mkdir.h"
 #include "parse-util.h"
 #include "reboot-util.h"
 #include "string-table.h"
 #include "string-util.h"
+#include "time-util.h"
 #include "udev-util.h"
 
 /* Note that any write is delayed until exit and the rfkill state will not be
@@ -140,7 +140,7 @@ static int load_state(Context *c, const struct rfkill_event *event) {
         assert(c->rfkill_fd >= 0);
         assert(event);
 
-        if (shall_restore_state() == 0)
+        if (!shall_restore_state())
                 return 0;
 
         r = determine_state_file(event, &state_file);
@@ -257,8 +257,7 @@ static void context_save_and_clear(Context *c) {
 
         assert(c);
 
-        while ((i = c->write_queue)) {
-                LIST_REMOVE(queue, c->write_queue, i);
+        while ((i = LIST_POP(queue, c->write_queue))) {
                 (void) save_state_write_one(i);
                 write_queue_item_free(i);
         }
@@ -292,7 +291,7 @@ static int run(int argc, char *argv[]) {
                                 return 0;
                         }
 
-                        return log_error_errno(errno, "Failed to open /dev/rfkill: %m");
+                        return log_error_errno(errno, "Failed to open %s: %m", "/dev/rfkill");
                 }
         } else {
                 c.rfkill_fd = SD_LISTEN_FDS_START;
@@ -369,7 +368,6 @@ static int run(int argc, char *argv[]) {
 
                 default:
                         log_debug("Unknown event %u from /dev/rfkill for index %u and type %s, ignoring.", event.op, event.idx, type);
-                        break;
                 }
         }
 

@@ -1,26 +1,22 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
+#include "sd-bus.h"
+
 #include "alloc-util.h"
-#include "bus-dump.h"
 #include "bus-message.h"
 #include "env-util.h"
-#include "fd-util.h"
-#include "fileio.h"
 #include "fuzz.h"
+#include "memstream-util.h"
 
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
-        _cleanup_free_ char *out = NULL; /* out should be freed after g */
-        size_t out_size;
-        _cleanup_fclose_ FILE *g = NULL;
+        _cleanup_(memstream_done) MemStream ms = {};
         _cleanup_(sd_bus_unrefp) sd_bus *bus = NULL;
         _cleanup_(sd_bus_message_unrefp) sd_bus_message *m = NULL;
         _cleanup_free_ void *buffer = NULL;
+        FILE *g = NULL;
         int r;
 
-        /* We don't want to fill the logs with messages about parse errors.
-         * Disable most logging if not running standalone */
-        if (!getenv("SYSTEMD_LOG_LEVEL"))
-                log_set_max_level(LOG_CRIT);
+        fuzz_setup_logging();
 
         r = sd_bus_new(&bus);
         assert_se(r >= 0);
@@ -34,9 +30,13 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         TAKE_PTR(buffer);
 
         if (getenv_bool("SYSTEMD_FUZZ_OUTPUT") <= 0)
-                assert_se(g = open_memstream_unlocked(&out, &out_size));
+                assert_se(g = memstream_init(&ms));
 
-        sd_bus_message_dump(m, g ?: stdout, SD_BUS_MESSAGE_DUMP_WITH_HEADER);
+        (void) sd_bus_message_dump(m, g, SD_BUS_MESSAGE_DUMP_WITH_HEADER);
+
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *v = NULL;
+        if (sd_bus_message_dump_json(m, SD_BUS_MESSAGE_DUMP_WITH_HEADER, &v) >= 0)
+                (void) sd_json_variant_dump(v, SD_JSON_FORMAT_PRETTY | SD_JSON_FORMAT_COLOR_AUTO, g, NULL);
 
         r = sd_bus_message_rewind(m, true);
         assert_se(r >= 0);

@@ -1,14 +1,10 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <errno.h>
-#include <limits.h>
+#include <linux/magic.h>
 #include <mqueue.h>
 #include <netinet/in.h>
 #include <poll.h>
-#include <stdarg.h>
-#include <stddef.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <sys/stat.h>
 #include <sys/un.h>
 #include <unistd.h>
@@ -16,11 +12,16 @@
 #include "sd-daemon.h"
 
 #include "alloc-util.h"
+#include "errno-util.h"
+#include "extract-word.h"
 #include "fd-util.h"
 #include "fs-util.h"
 #include "io-util.h"
+#include "iovec-util.h"
+#include "log.h"
 #include "parse-util.h"
 #include "path-util.h"
+#include "pidfd-util.h"
 #include "process-util.h"
 #include "socket-util.h"
 #include "stat-util.h"
@@ -29,7 +30,7 @@
 
 #define SNDBUF_SIZE (8*1024*1024)
 
-static void unsetenv_all(bool unset_environment) {
+static void unsetenv_listen(bool unset_environment) {
         if (!unset_environment)
                 return;
 
@@ -75,7 +76,7 @@ _public_ int sd_listen_fds(int unset_environment) {
                 goto finish;
         }
 
-        for (int fd = SD_LISTEN_FDS_START; fd < SD_LISTEN_FDS_START + n; fd ++) {
+        for (int fd = SD_LISTEN_FDS_START; fd < SD_LISTEN_FDS_START + n; fd++) {
                 r = fd_cloexec(fd, true);
                 if (r < 0)
                         goto finish;
@@ -84,25 +85,25 @@ _public_ int sd_listen_fds(int unset_environment) {
         r = n;
 
 finish:
-        unsetenv_all(unset_environment);
+        unsetenv_listen(unset_environment);
         return r;
 }
 
-_public_ int sd_listen_fds_with_names(int unset_environment, char ***names) {
+_public_ int sd_listen_fds_with_names(int unset_environment, char ***ret_names) {
         _cleanup_strv_free_ char **l = NULL;
         bool have_names;
         int n_names = 0, n_fds;
         const char *e;
         int r;
 
-        if (!names)
+        if (!ret_names)
                 return sd_listen_fds(unset_environment);
 
         e = getenv("LISTEN_FDNAMES");
         if (e) {
                 n_names = strv_split_full(&l, e, ":", EXTRACT_DONT_COALESCE_SEPARATORS);
                 if (n_names < 0) {
-                        unsetenv_all(unset_environment);
+                        unsetenv_listen(unset_environment);
                         return n_names;
                 }
 
@@ -123,8 +124,7 @@ _public_ int sd_listen_fds_with_names(int unset_environment, char ***names) {
                         return r;
         }
 
-        *names = TAKE_PTR(l);
-
+        *ret_names = TAKE_PTR(l);
         return n_fds;
 }
 
@@ -180,10 +180,10 @@ _public_ int sd_is_special(int fd, const char *path) {
 
                 if (S_ISREG(st_fd.st_mode) && S_ISREG(st_path.st_mode))
                         return stat_inode_same(&st_path, &st_fd);
-                else if (S_ISCHR(st_fd.st_mode) && S_ISCHR(st_path.st_mode))
+                if (S_ISCHR(st_fd.st_mode) && S_ISCHR(st_path.st_mode))
                         return st_path.st_rdev == st_fd.st_rdev;
-                else
-                        return 0;
+
+                return 0;
         }
 
         return 1;
@@ -399,9 +399,12 @@ _public_ int sd_is_socket_unix(int fd, int type, int listening, const char *path
 
 _public_ int sd_is_mq(int fd, const char *path) {
         struct mq_attr attr;
+        int r;
 
         /* Check that the fd is valid */
-        assert_return(fcntl(fd, F_GETFD) >= 0, -errno);
+        r = fd_validate(fd);
+        if (r < 0)
+                return r;
 
         if (mq_getattr(fd, &attr) < 0) {
                 if (errno == EBADF)
@@ -450,12 +453,11 @@ static int vsock_bind_privileged_port(int fd) {
         return r;
 }
 
-_public_ int sd_pid_notify_with_fds(
+static int pid_notify_with_fds_internal(
                 pid_t pid,
-                int unset_environment,
                 const char *state,
                 const int *fds,
-                unsigned n_fds) {
+                size_t n_fds) {
 
         SocketAddress address;
         struct iovec iovec;
@@ -465,22 +467,18 @@ _public_ int sd_pid_notify_with_fds(
                 .msg_name = &address.sockaddr,
         };
         _cleanup_close_ int fd = -EBADF;
-        struct cmsghdr *cmsg = NULL;
-        const char *e;
-        bool send_ucred;
-        int r;
+        int type, r;
 
-        if (!state) {
-                r = -EINVAL;
-                goto finish;
-        }
+        assert_return(state, -EINVAL);
+        assert_return(fds || n_fds == 0, -EINVAL);
 
-        if (n_fds > 0 && !fds) {
-                r = -EINVAL;
-                goto finish;
-        }
+        /* Let's make sure the multiplications below don't overflow, and also return a recognizable error in
+         * case the caller tries to send more fds than the kernel limit. The kernel would return EINVAL which
+         * is not too useful I'd say. */
+        if (n_fds > SCM_MAX_FD)
+                return -E2BIG;
 
-        e = getenv("NOTIFY_SOCKET");
+        const char *e = getenv("NOTIFY_SOCKET");
         if (!e)
                 return 0;
 
@@ -489,58 +487,59 @@ _public_ int sd_pid_notify_with_fds(
         if (r == -EPROTO)
                 r = socket_address_parse_vsock(&address, e);
         if (r < 0)
-                goto finish;
+                return r;
         msghdr.msg_namelen = address.size;
 
         /* If we didn't get an address (which is a normal pattern when specifying VSOCK tuples) error out,
          * we always require a specific CID. */
-        if (address.sockaddr.vm.svm_family == AF_VSOCK && address.sockaddr.vm.svm_cid == VMADDR_CID_ANY) {
-                r = -EINVAL;
-                goto finish;
-        }
+        if (address.sockaddr.vm.svm_family == AF_VSOCK && address.sockaddr.vm.svm_cid == VMADDR_CID_ANY)
+                return -EINVAL;
+
+        type = address.type == 0 ? SOCK_DGRAM : address.type;
 
         /* At the time of writing QEMU does not yet support AF_VSOCK + SOCK_DGRAM and returns
          * ENODEV. Fallback to SOCK_SEQPACKET in that case. */
-        fd = socket(address.sockaddr.sa.sa_family, SOCK_DGRAM|SOCK_CLOEXEC, 0);
+        fd = socket(address.sockaddr.sa.sa_family, type|SOCK_CLOEXEC, 0);
         if (fd < 0) {
-                if (!(ERRNO_IS_NOT_SUPPORTED(errno) || errno == ENODEV) || address.sockaddr.sa.sa_family != AF_VSOCK) {
-                        r = -errno;
-                        goto finish;
-                }
+                if (!(ERRNO_IS_NOT_SUPPORTED(errno) || errno == ENODEV) || address.sockaddr.sa.sa_family != AF_VSOCK || address.type > 0)
+                        return log_debug_errno(errno, "Failed to open %s notify socket to '%s': %m", socket_address_type_to_string(type), e);
 
-                fd = socket(address.sockaddr.sa.sa_family, SOCK_SEQPACKET|SOCK_CLOEXEC, 0);
-                if (fd < 0) {
-                        r = -errno;
-                        goto finish;
+                type = SOCK_SEQPACKET;
+                fd = socket(address.sockaddr.sa.sa_family, type|SOCK_CLOEXEC, 0);
+                if (fd < 0 && ERRNO_IS_NOT_SUPPORTED(errno)) {
+                        type = SOCK_STREAM;
+                        fd = socket(address.sockaddr.sa.sa_family, type|SOCK_CLOEXEC, 0);
                 }
+                if (fd < 0)
+                        return log_debug_errno(errno, "Failed to open %s socket to '%s': %m", socket_address_type_to_string(type), e);
+        }
 
+        if (address.sockaddr.sa.sa_family == AF_VSOCK) {
                 r = vsock_bind_privileged_port(fd);
                 if (r < 0 && !ERRNO_IS_PRIVILEGE(r))
-                        goto finish;
+                        return log_debug_errno(r, "Failed to bind socket to privileged port: %m");
+        }
 
-                if (connect(fd, &address.sockaddr.sa, address.size) < 0) {
-                        r = -errno;
-                        goto finish;
-                }
+        if (IN_SET(type, SOCK_STREAM, SOCK_SEQPACKET)) {
+                if (connect(fd, &address.sockaddr.sa, address.size) < 0)
+                        return log_debug_errno(errno, "Failed to connect socket to '%s': %m", e);
 
                 msghdr.msg_name = NULL;
                 msghdr.msg_namelen = 0;
-        } else if (address.sockaddr.sa.sa_family == AF_VSOCK) {
-                r = vsock_bind_privileged_port(fd);
-                if (r < 0 && !ERRNO_IS_PRIVILEGE(r))
-                        goto finish;
         }
 
         (void) fd_inc_sndbuf(fd, SNDBUF_SIZE);
 
         iovec = IOVEC_MAKE_STRING(state);
 
-        send_ucred =
+        bool send_ucred =
                 (pid != 0 && pid != getpid_cached()) ||
                 getuid() != geteuid() ||
                 getgid() != getegid();
 
         if (n_fds > 0 || send_ucred) {
+                struct cmsghdr *cmsg;
+
                 /* CMSG_SPACE(0) may return value different than zero, which results in miscalculated controllen. */
                 msghdr.msg_controllen =
                         (n_fds > 0 ? CMSG_SPACE(sizeof(int) * n_fds) : 0) +
@@ -574,53 +573,96 @@ _public_ int sd_pid_notify_with_fds(
                 }
         }
 
-        /* First try with fake ucred data, as requested */
-        if (sendmsg(fd, &msghdr, MSG_NOSIGNAL) >= 0) {
-                r = 1;
-                goto finish;
-        }
+        ssize_t n;
 
-        /* If that failed, try with our own ucred instead */
-        if (send_ucred) {
-                msghdr.msg_controllen -= CMSG_SPACE(sizeof(struct ucred));
-                if (msghdr.msg_controllen == 0)
+        do {
+                /* First try with fake ucred data, as requested */
+                n = sendmsg(fd, &msghdr, MSG_NOSIGNAL);
+                if (n < 0) {
+                        if (!send_ucred)
+                                return log_debug_errno(errno, "Failed to send notify message to '%s': %m", e);
+
+                        /* If that failed, try with our own ucred instead */
+                        msghdr.msg_controllen -= CMSG_SPACE(sizeof(struct ucred));
+                        if (msghdr.msg_controllen == 0)
+                                msghdr.msg_control = NULL;
+
+                        n = 0;
+                        send_ucred = false;
+                } else {
+                        /* Unless we're using SOCK_STREAM, we expect to write all the contents immediately. */
+                        if (type != SOCK_STREAM && (size_t) n < iovec_total_size(msghdr.msg_iov, msghdr.msg_iovlen))
+                                return -EIO;
+
+                        /* Make sure we only send fds and ucred once, even if we're using SOCK_STREAM. */
                         msghdr.msg_control = NULL;
-
-                if (sendmsg(fd, &msghdr, MSG_NOSIGNAL) >= 0) {
-                        r = 1;
-                        goto finish;
+                        msghdr.msg_controllen = 0;
                 }
+        } while (!iovec_increment(msghdr.msg_iov, msghdr.msg_iovlen, n));
+
+        if (address.sockaddr.sa.sa_family == AF_VSOCK && IN_SET(type, SOCK_STREAM, SOCK_SEQPACKET)) {
+                /* For AF_VSOCK, we need to close the socket to signal the end of the message. */
+                if (shutdown(fd, SHUT_WR) < 0)
+                        return log_debug_errno(errno, "Failed to shutdown notify socket: %m");
+
+                char c;
+                n = recv(fd, &c, sizeof(c), MSG_NOSIGNAL);
+                if (n < 0)
+                        return log_debug_errno(errno, "Failed to wait for EOF on notify socket: %m");
+                if (n > 0)
+                        return log_debug_errno(SYNTHETIC_ERRNO(EPROTO), "Unexpectedly received data on notify socket.");
         }
 
-        r = -errno;
+        return 1;
+}
 
-finish:
-        if (unset_environment)
-                assert_se(unsetenv("NOTIFY_SOCKET") == 0);
+static void unsetenv_notify(bool unset_environment) {
+        if (!unset_environment)
+                return;
 
+        assert_se(unsetenv("NOTIFY_SOCKET") == 0);
+}
+
+_public_ int sd_pid_notify_with_fds(
+                pid_t pid,
+                int unset_environment,
+                const char *state,
+                const int *fds,
+                unsigned n_fds) {
+
+        int r;
+
+        r = pid_notify_with_fds_internal(pid, state, fds, n_fds);
+        unsetenv_notify(unset_environment);
         return r;
 }
 
 _public_ int sd_pid_notify_barrier(pid_t pid, int unset_environment, uint64_t timeout) {
-        _cleanup_close_pair_ int pipe_fd[2] = PIPE_EBADF;
+        _cleanup_close_pair_ int pipe_fd[2] = EBADF_PAIR;
         int r;
 
-        if (pipe2(pipe_fd, O_CLOEXEC) < 0)
-                return -errno;
+        r = RET_NERRNO(pipe2(pipe_fd, O_CLOEXEC));
+        if (r < 0)
+                goto finish;
 
-        r = sd_pid_notify_with_fds(pid, unset_environment, "BARRIER=1", &pipe_fd[1], 1);
+        r = pid_notify_with_fds_internal(pid, "BARRIER=1", &pipe_fd[1], 1);
         if (r <= 0)
-                return r;
+                goto finish;
 
         pipe_fd[1] = safe_close(pipe_fd[1]);
 
         r = fd_wait_for_event(pipe_fd[0], 0 /* POLLHUP is implicit */, timeout);
         if (r < 0)
-                return r;
-        if (r == 0)
-                return -ETIMEDOUT;
+                goto finish;
+        if (r == 0) {
+                r = -ETIMEDOUT;
+                goto finish;
+        }
 
-        return 1;
+        r = 1;
+finish:
+        unsetenv_notify(unset_environment);
+        return r;
 }
 
 _public_ int sd_notify_barrier(int unset_environment, uint64_t timeout) {
@@ -646,11 +688,17 @@ _public_ int sd_pid_notifyf(pid_t pid, int unset_environment, const char *format
                 r = vasprintf(&p, format, ap);
                 va_end(ap);
 
-                if (r < 0 || !p)
-                        return -ENOMEM;
+                if (r < 0) {
+                        r = -ENOMEM;
+                        goto finish;
+                }
         }
 
-        return sd_pid_notify(pid, unset_environment, p);
+        r = pid_notify_with_fds_internal(pid, p, /* fds= */ NULL, /* n_fds= */ 0);
+
+finish:
+        unsetenv_notify(unset_environment);
+        return r;
 }
 
 _public_ int sd_notifyf(int unset_environment, const char *format, ...) {
@@ -664,11 +712,17 @@ _public_ int sd_notifyf(int unset_environment, const char *format, ...) {
                 r = vasprintf(&p, format, ap);
                 va_end(ap);
 
-                if (r < 0 || !p)
-                        return -ENOMEM;
+                if (r < 0) {
+                        r = -ENOMEM;
+                        goto finish;
+                }
         }
 
-        return sd_pid_notify(0, unset_environment, p);
+        r = pid_notify_with_fds_internal(/* pid= */ 0, p, /* fds= */ NULL, /* n_fds= */ 0);
+
+finish:
+        unsetenv_notify(unset_environment);
+        return r;
 }
 
 _public_ int sd_pid_notifyf_with_fds(
@@ -680,13 +734,6 @@ _public_ int sd_pid_notifyf_with_fds(
         _cleanup_free_ char *p = NULL;
         int r;
 
-        /* Paranoia check: we traditionally used 'unsigned' as array size, but we nowadays more correctly use
-         * 'size_t'. sd_pid_notifyf_with_fds() and sd_pid_notify_with_fds() are from different eras, hence
-         * differ in this. Let's catch resulting incompatibilites early, even though they are pretty much
-         * theoretic only */
-        if (n_fds > UINT_MAX)
-                return -E2BIG;
-
         if (format) {
                 va_list ap;
 
@@ -694,35 +741,73 @@ _public_ int sd_pid_notifyf_with_fds(
                 r = vasprintf(&p, format, ap);
                 va_end(ap);
 
-                if (r < 0 || !p)
-                        return -ENOMEM;
+                if (r < 0) {
+                        r = -ENOMEM;
+                        goto finish;
+                }
         }
 
-        return sd_pid_notify_with_fds(pid, unset_environment, p, fds, n_fds);
+        r = pid_notify_with_fds_internal(pid, p, fds, n_fds);
+
+finish:
+        unsetenv_notify(unset_environment);
+        return r;
+}
+
+_public_ int sd_pidfd_get_inode_id(int pidfd, uint64_t *ret) {
+        int r;
+
+        assert_return(pidfd >= 0, -EBADF);
+
+        /* Are pidfds backed by pidfs where the unique inode id is relevant? Note that the pidfd
+         * passed to us is extrinsic and hence cannot be trusted to initialize our "have_pidfs" cache,
+         * instead pidfd_check_pidfs() will allocate one internally. */
+        r = pidfd_check_pidfs(/* pid_fd = */ -EBADF);
+        if (r <= 0)
+                return -EOPNOTSUPP;
+
+        r = fd_is_fs_type(pidfd, PID_FS_MAGIC);
+        if (r < 0)
+                return r;
+        if (r == 0)
+                return -EBADF; /* pidfs is definitely around, so it's the fd that's of invalid type */
+
+        return pidfd_get_inode_id_impl(pidfd, ret);
 }
 
 _public_ int sd_booted(void) {
-        /* We test whether the runtime unit file directory has been
-         * created. This takes place in mount-setup.c, so is
-         * guaranteed to happen very early during boot. */
+        int r;
 
-        if (laccess("/run/systemd/system/", F_OK) >= 0)
+        /* We test whether the runtime unit file directory has been created. This takes place in mount-setup.c,
+         * so is guaranteed to happen very early during boot. */
+
+        r = access_nofollow("/run/systemd/system/", F_OK);
+        if (r >= 0)
                 return true;
-
-        if (errno == ENOENT)
+        if (r == -ENOENT)
                 return false;
 
-        return -errno;
+        return r;
+}
+
+static void unsetenv_watchdog(bool unset_environment) {
+        if (!unset_environment)
+                return;
+
+        assert_se(unsetenv("WATCHDOG_USEC") == 0);
+        assert_se(unsetenv("WATCHDOG_PID") == 0);
 }
 
 _public_ int sd_watchdog_enabled(int unset_environment, uint64_t *usec) {
         const char *s, *p = ""; /* p is set to dummy value to do unsetting */
         uint64_t u;
-        int r = 0;
+        int r;
 
         s = getenv("WATCHDOG_USEC");
-        if (!s)
+        if (!s) {
+                r = 0;
                 goto finish;
+        }
 
         r = safe_atou64(s, &u);
         if (r < 0)
@@ -753,10 +838,6 @@ _public_ int sd_watchdog_enabled(int unset_environment, uint64_t *usec) {
         r = 1;
 
 finish:
-        if (unset_environment && s)
-                assert_se(unsetenv("WATCHDOG_USEC") == 0);
-        if (unset_environment && p)
-                assert_se(unsetenv("WATCHDOG_PID") == 0);
-
+        unsetenv_watchdog(unset_environment);
         return r;
 }

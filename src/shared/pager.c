@@ -1,11 +1,7 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <errno.h>
-#include <stddef.h>
-#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <sys/prctl.h>
 #include <unistd.h>
 
 #include "sd-login.h"
@@ -17,10 +13,8 @@
 #include "io-util.h"
 #include "locale-util.h"
 #include "log.h"
-#include "macro.h"
 #include "pager.h"
 #include "process-util.h"
-#include "rlimit-util.h"
 #include "signal-util.h"
 #include "string-util.h"
 #include "strv.h"
@@ -82,8 +76,24 @@ static int no_quit_on_interrupt(int exe_name_fd, const char *less_opts) {
         return r;
 }
 
+static bool running_with_escalated_privileges(void) {
+        int r;
+
+        if (getenv("SUDO_UID"))
+                return true;
+
+        uid_t uid;
+        r = sd_pid_get_owner_uid(0, &uid);
+        if (r < 0) {
+                log_debug_errno(r, "sd_pid_get_owner_uid() failed, enabling pager secure mode: %m");
+                return true;
+        }
+
+        return uid != geteuid();
+}
+
 void pager_open(PagerFlags flags) {
-        _cleanup_close_pair_ int fd[2] = PIPE_EBADF, exe_name_pipe[2] = PIPE_EBADF;
+        _cleanup_close_pair_ int fd[2] = EBADF_PAIR, exe_name_pipe[2] = EBADF_PAIR;
         _cleanup_strv_free_ char **pager_args = NULL;
         _cleanup_free_ char *l = NULL;
         const char *pager, *less_opts;
@@ -175,18 +185,11 @@ void pager_open(PagerFlags flags) {
                  * pager. If they didn't, use secure mode when under euid is changed. If $SYSTEMD_PAGERSECURE
                  * wasn't explicitly set, and we autodetect the need for secure mode, only use the pager we
                  * know to be good. */
-                int use_secure_mode = getenv_bool_secure("SYSTEMD_PAGERSECURE");
+                int use_secure_mode = secure_getenv_bool("SYSTEMD_PAGERSECURE");
                 bool trust_pager = use_secure_mode >= 0;
-                if (use_secure_mode == -ENXIO) {
-                        uid_t uid;
-
-                        r = sd_pid_get_owner_uid(0, &uid);
-                        if (r < 0)
-                                log_debug_errno(r, "sd_pid_get_owner_uid() failed, enabling pager secure mode: %m");
-
-                        use_secure_mode = r < 0 || uid != geteuid();
-
-                } else if (use_secure_mode < 0) {
+                if (use_secure_mode == -ENXIO)
+                        use_secure_mode = running_with_escalated_privileges();
+                else if (use_secure_mode < 0) {
                         log_warning_errno(use_secure_mode, "Unable to parse $SYSTEMD_PAGERSECURE, assuming true: %m");
                         use_secure_mode = true;
                 }
@@ -204,7 +207,7 @@ void pager_open(PagerFlags flags) {
                                                   * secure mode. Thus, start the pager specified through
                                                   * envvars only when $SYSTEMD_PAGERSECURE was explicitly set
                                                   * as well. */
-                        r = loop_write(exe_name_pipe[1], pager_args[0], strlen(pager_args[0]) + 1, false);
+                        r = loop_write(exe_name_pipe[1], pager_args[0], strlen(pager_args[0]) + 1);
                         if (r < 0) {
                                 log_error_errno(r, "Failed to write pager name to socket: %m");
                                 _exit(EXIT_FAILURE);
@@ -225,7 +228,7 @@ void pager_open(PagerFlags flags) {
                         if (use_secure_mode && !STR_IN_SET(pagers[i], "less", "(built-in)"))
                                 continue;
 
-                        r = loop_write(exe_name_pipe[1], pagers[i], strlen(pagers[i]) + 1, false);
+                        r = loop_write(exe_name_pipe[1], pagers[i], strlen(pagers[i]) + 1);
                         if (r < 0) {
                                 log_error_errno(r, "Failed to write pager name to socket: %m");
                                 _exit(EXIT_FAILURE);
@@ -316,7 +319,7 @@ int show_man_page(const char *desc, bool null_stdio) {
         } else
                 args[1] = desc;
 
-        r = safe_fork("(man)", FORK_RESET_SIGNALS|FORK_DEATHSIG|(null_stdio ? FORK_REARRANGE_STDIO : 0)|FORK_RLIMIT_NOFILE_SAFE|FORK_LOG, &pid);
+        r = safe_fork("(man)", FORK_RESET_SIGNALS|FORK_DEATHSIG_SIGTERM|(null_stdio ? FORK_REARRANGE_STDIO : 0)|FORK_RLIMIT_NOFILE_SAFE|FORK_LOG, &pid);
         if (r < 0)
                 return r;
         if (r == 0) {

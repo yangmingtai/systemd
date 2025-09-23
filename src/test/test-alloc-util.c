@@ -1,10 +1,8 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <malloc.h>
-#include <stdint.h>
 
 #include "alloc-util.h"
-#include "macro.h"
 #include "memory-util.h"
 #include "random-util.h"
 #include "tests.h"
@@ -23,8 +21,8 @@ TEST(alloca) {
 }
 
 TEST(GREEDY_REALLOC) {
-        _cleanup_free_ int *a = NULL, *b = NULL;
-        size_t i, j;
+        _cleanup_free_ int *a = NULL, *b = NULL, *c = NULL;
+        size_t i, j, n_c = 0;
 
         /* Give valgrind a chance to verify our realloc() operations */
 
@@ -53,6 +51,45 @@ TEST(GREEDY_REALLOC) {
 
         for (j = 30; j < i / 2; j += 7)
                 assert_se(b[j] == (int) j);
+
+        size_t n_from = 10;
+        int from[n_from];
+        for (i = 0; i < 2048; i++) {
+                for (j = 0; j < n_from; j++)
+                        from[j] = n_from * i + j;
+
+                _cleanup_free_ int *before = NULL;
+                size_t n_before = 0;
+                assert_se(GREEDY_REALLOC_APPEND(before, n_before, c, n_c));
+                assert_se(before);
+                assert_se(n_before == n_c);
+                assert_se(memcmp_safe(c, before, n_c) == 0);
+
+                assert_se(GREEDY_REALLOC_APPEND(c, n_c, from, n_from));
+                assert_se(n_c == n_before + n_from);
+                assert_se(MALLOC_ELEMENTSOF(c) >= n_c);
+                assert_se(MALLOC_SIZEOF_SAFE(c) >= n_c * sizeof(int));
+                assert_se(memcmp_safe(c, before, n_before) == 0);
+                assert_se(memcmp_safe(&c[n_before], from, n_from) == 0);
+
+                before = mfree(before);
+                assert_se(!before);
+                n_before = 0;
+                assert_se(GREEDY_REALLOC_APPEND(before, n_before, c, n_c));
+                assert_se(before);
+                assert_se(n_before == n_c);
+                assert_se(memcmp_safe(c, before, n_c) == 0);
+
+                assert_se(GREEDY_REALLOC_APPEND(c, n_c, NULL, 0));
+                assert_se(c);
+                assert_se(n_c == n_before);
+                assert_se(MALLOC_ELEMENTSOF(c) >= n_c);
+                assert_se(MALLOC_SIZEOF_SAFE(c) >= n_c * sizeof(int));
+                assert_se(memcmp_safe(c, before, n_c) == 0);
+        }
+
+        for (j = 0; j < i * n_from; j++)
+                assert_se(c[j] == (int) j);
 }
 
 TEST(memdup_multiply_and_greedy_realloc) {
@@ -61,7 +98,7 @@ TEST(memdup_multiply_and_greedy_realloc) {
         size_t i;
         int *p;
 
-        dup = memdup_suffix0_multiply(org, sizeof(int), 3);
+        dup = memdup_suffix0_multiply(org, 3, sizeof(int));
         assert_se(dup);
         assert_se(dup[0] == 1);
         assert_se(dup[1] == 2);
@@ -69,7 +106,7 @@ TEST(memdup_multiply_and_greedy_realloc) {
         assert_se(((uint8_t*) dup)[sizeof(int) * 3] == 0);
         free(dup);
 
-        dup = memdup_multiply(org, sizeof(int), 3);
+        dup = memdup_multiply(org, 3, sizeof(int));
         assert_se(dup);
         assert_se(dup[0] == 1);
         assert_se(dup[1] == 2);

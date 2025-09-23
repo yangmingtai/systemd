@@ -4,13 +4,14 @@
 set -eux
 set -o pipefail
 
-# default to Debian testing
 DISTRO="${DISTRO:-debian}"
-RELEASE="${RELEASE:-bullseye}"
-BRANCH="${BRANCH:-upstream-ci}"
+RELEASE="${RELEASE:-bookworm}"
+SALSA_URL="${SALSA_URL:-https://salsa.debian.org/systemd-team/systemd.git}"
+BRANCH="${BRANCH:-debian/master}"
 ARCH="${ARCH:-amd64}"
 CONTAINER="${RELEASE}-${ARCH}"
-CACHE_DIR="${SEMAPHORE_CACHE_DIR:-/tmp}"
+CACHE_DIR=/var/tmp
+TMPDIR=/var/tmp
 AUTOPKGTEST_DIR="${CACHE_DIR}/autopkgtest"
 # semaphore cannot expose these, but useful for interactive/local runs
 ARTIFACTS_DIR=/tmp/artifacts
@@ -22,15 +23,26 @@ create_container() {
     sudo lxc-create -n "$CONTAINER" -t download -- -d "$DISTRO" -r "$RELEASE" -a "$ARCH"
 
     # unconfine the container, otherwise some tests fail
-    echo 'lxc.apparmor.profile = unconfined' | sudo tee -a "/var/lib/lxc/$CONTAINER/config"
+    #
+    # disable automatic cgroup setup, instead let pid1 figure it out in mount_setup().
+    # This is especially important to ensure we get unified cgroup hierarchy
+    #
+    # FIXME: remove cgroup workarounds once the host runs on unified hierarchy
+    sudo tee "/var/lib/lxc/$CONTAINER/config.systemd_upstream" <<EOF
+lxc.apparmor.profile = unconfined
+lxc.mount.auto =
+lxc.mount.auto = proc:mixed sys:mixed
+lxc.init.cmd = /sbin/init systemd.unified_cgroup_hierarchy=1
+EOF
 
-    sudo lxc-start -n "$CONTAINER"
+    sudo lxc-start -n "$CONTAINER" --define "lxc.include=/var/lib/lxc/$CONTAINER/config.systemd_upstream"
 
     # enable source repositories so that apt-get build-dep works
     sudo lxc-attach -n "$CONTAINER" -- sh -ex <<EOF
 sed 's/^deb/deb-src/' /etc/apt/sources.list >>/etc/apt/sources.list.d/sources.list
+echo "deb http://deb.debian.org/debian $RELEASE-backports main" >/etc/apt/sources.list.d/backports.list
 # We might attach the console too soon
-while ! systemctl --quiet --wait is-system-running; do sleep 1; done
+until systemctl --quiet --wait is-system-running; do sleep 1; done
 # Manpages database trigger takes a lot of time and is not useful in a CI
 echo 'man-db man-db/auto-update boolean false' | debconf-set-selections
 # Speed up dpkg, image is thrown away after the test
@@ -43,7 +55,9 @@ apt-get -q --allow-releaseinfo-change update
 apt-get -y dist-upgrade
 apt-get install -y eatmydata
 # The following four are needed as long as these deps are not covered by Debian's own packaging
-apt-get install -y fdisk tree libfdisk-dev libp11-kit-dev libssl-dev libpwquality-dev rpm
+apt-get install -y tree libpwquality-dev rpm libcurl4-openssl-dev libarchive-dev
+# autopkgtest doesn't consider backports
+apt-get install -y -t $RELEASE-backports debhelper
 apt-get purge --auto-remove -y unattended-upgrades
 systemctl unmask systemd-networkd
 systemctl enable systemd-networkd
@@ -69,7 +83,7 @@ for phase in "${PHASES[@]}"; do
         ;;
         RUN)
             # add current debian/ packaging
-            git fetch --depth=1 https://salsa.debian.org/systemd-team/systemd.git "$BRANCH"
+            git fetch --depth=1 "$SALSA_URL" "$BRANCH"
             git checkout FETCH_HEAD debian
 
             # craft changelog
@@ -90,7 +104,7 @@ EOF
             # disable autopkgtests which are not for upstream
             sed -i '/# NOUPSTREAM/ q' debian/tests/control
             # enable more unit tests
-            sed -i '/^CONFFLAGS =/ s/=/= --werror -Dtests=unsafe -Dsplit-usr=true -Dslow-tests=true -Dfuzz-tests=true -Dman=true /' debian/rules
+            sed -i '/^CONFFLAGS =/ s/=/= --werror /' debian/rules
             # no orig tarball
             echo '1.0' >debian/source/format
 
@@ -100,10 +114,14 @@ EOF
             # now build the package and run the tests
             rm -rf "$ARTIFACTS_DIR"
             # autopkgtest exits with 2 for "some tests skipped", accept that
-            sudo "$AUTOPKGTEST_DIR/runner/autopkgtest" --env DEB_BUILD_OPTIONS=noudeb \
-                                                       --env TEST_UPSTREAM=1 ../systemd_*.dsc \
+            sudo TMPDIR=/var/tmp "$AUTOPKGTEST_DIR/runner/autopkgtest" --env DEB_BUILD_OPTIONS="noudeb nostrip nodoc optimize=-lto" \
+                                                       --env DPKG_DEB_COMPRESSOR_TYPE="none" \
+                                                       --env DEB_BUILD_PROFILES="pkg.systemd.upstream noudeb nodoc" \
+                                                       --env TEST_UPSTREAM=1 \
+                                                       ../systemd_*.dsc \
                                                        -o "$ARTIFACTS_DIR" \
                                                        -- lxc -s "$CONTAINER" \
+                                                           --define "lxc.include=/var/lib/lxc/$CONTAINER/config.systemd_upstream" \
                 || [ $? -eq 2 ]
         ;;
         *)

@@ -1,42 +1,37 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include <linux/nl80211.h>
-
-#include "sd-bus.h"
-#include "sd-device.h"
+#include "sd-dhcp-lease.h"
 #include "sd-lldp-tx.h"
 
 #include "bridge.h"
-#include "condition.h"
-#include "conf-parser.h"
-#include "hashmap.h"
+#include "firewall-util.h"
 #include "ipoib.h"
 #include "net-condition.h"
-#include "netdev.h"
+#include "network-util.h"
 #include "networkd-bridge-vlan.h"
 #include "networkd-dhcp-common.h"
+#include "networkd-dhcp-server.h"
 #include "networkd-dhcp4.h"
 #include "networkd-dhcp6.h"
+#include "networkd-dns.h"
+#include "networkd-forward.h"
 #include "networkd-ipv6ll.h"
 #include "networkd-lldp-rx.h"
 #include "networkd-ndisc.h"
 #include "networkd-radv.h"
 #include "networkd-sysctl.h"
-#include "networkd-util.h"
-#include "ordered-set.h"
 #include "resolve-util.h"
-#include "socket-netlink.h"
 
 typedef enum KeepConfiguration {
-        KEEP_CONFIGURATION_NO            = 0,
-        KEEP_CONFIGURATION_DHCP_ON_START = 1 << 0,
-        KEEP_CONFIGURATION_DHCP_ON_STOP  = 1 << 1,
-        KEEP_CONFIGURATION_DHCP          = KEEP_CONFIGURATION_DHCP_ON_START | KEEP_CONFIGURATION_DHCP_ON_STOP,
-        KEEP_CONFIGURATION_STATIC        = 1 << 2,
-        KEEP_CONFIGURATION_YES           = KEEP_CONFIGURATION_DHCP | KEEP_CONFIGURATION_STATIC,
+        KEEP_CONFIGURATION_NO               = 0,
+        KEEP_CONFIGURATION_DYNAMIC_ON_START = 1 << 0,
+        KEEP_CONFIGURATION_DYNAMIC_ON_STOP  = 1 << 1,
+        KEEP_CONFIGURATION_DYNAMIC          = KEEP_CONFIGURATION_DYNAMIC_ON_START | KEEP_CONFIGURATION_DYNAMIC_ON_STOP,
+        KEEP_CONFIGURATION_STATIC           = 1 << 2,
+        KEEP_CONFIGURATION_YES              = KEEP_CONFIGURATION_DYNAMIC | KEEP_CONFIGURATION_STATIC,
         _KEEP_CONFIGURATION_MAX,
-        _KEEP_CONFIGURATION_INVALID = -EINVAL,
+        _KEEP_CONFIGURATION_INVALID         = -EINVAL,
 } KeepConfiguration;
 
 typedef enum ActivationPolicy {
@@ -50,15 +45,13 @@ typedef enum ActivationPolicy {
         _ACTIVATION_POLICY_INVALID = -EINVAL,
 } ActivationPolicy;
 
-typedef struct Manager Manager;
-
 typedef struct NetworkDHCPServerEmitAddress {
         bool emit;
         struct in_addr *addresses;
         size_t n_addresses;
 } NetworkDHCPServerEmitAddress;
 
-struct Network {
+typedef struct Network {
         Manager *manager;
 
         unsigned n_ref;
@@ -109,9 +102,20 @@ struct Network {
         char **bind_carrier;
         bool default_route_on_device;
         AddressFamily ip_masquerade;
+        usec_t ipv4_dad_timeout_usec;
+
+        /* Protocol independent settings */
+        UseDomains use_domains;
+
+        /* For backward compatibility, only applied to DHCPv4 and DHCPv6. */
+        UseDomains compat_dhcp_use_domains;
+        int compat_dhcp_use_dns;
+        int compat_dhcp_use_ntp;
 
         /* DHCP Client Support */
         AddressFamily dhcp;
+        struct in_addr dhcp_request_address;
+        bool dhcp_use_bootp;
         DHCPClientIdentifier dhcp_client_identifier;
         DUID dhcp_duid;
         uint32_t dhcp_iaid;
@@ -126,58 +130,69 @@ struct Network {
         bool dhcp_route_metric_set;
         uint32_t dhcp_route_table;
         bool dhcp_route_table_set;
-        uint32_t dhcp_fallback_lease_lifetime;
+        usec_t dhcp_fallback_lease_lifetime_usec;
         uint32_t dhcp_route_mtu;
         uint16_t dhcp_client_port;
+        uint16_t dhcp_port;
         int dhcp_critical;
         int dhcp_ip_service_type;
         int dhcp_socket_priority;
         bool dhcp_socket_priority_set;
         bool dhcp_anonymize;
         bool dhcp_send_hostname;
+        bool dhcp_send_hostname_set;
         int dhcp_broadcast;
-        bool dhcp_use_dns;
-        bool dhcp_use_dns_set;
+        int dhcp_ipv6_only_mode;
+        int dhcp_use_rapid_commit;
+        int dhcp_use_dns;
+        int dhcp_use_dnr;
         bool dhcp_routes_to_dns;
-        bool dhcp_use_ntp;
-        bool dhcp_use_ntp_set;
+        int dhcp_use_ntp;
         bool dhcp_routes_to_ntp;
         bool dhcp_use_sip;
+        bool dhcp_use_captive_portal;
         bool dhcp_use_mtu;
         bool dhcp_use_routes;
         int dhcp_use_gateway;
         bool dhcp_quickack;
+        uint32_t dhcp_initial_congestion_window;
+        uint32_t dhcp_advertised_receive_window;
         bool dhcp_use_timezone;
         bool dhcp_use_hostname;
         bool dhcp_use_6rd;
+        uint8_t dhcp_6rd_prefix_route_type;
         bool dhcp_send_release;
         bool dhcp_send_decline;
-        DHCPUseDomains dhcp_use_domains;
-        bool dhcp_use_domains_set;
+        UseDomains dhcp_use_domains;
         Set *dhcp_deny_listed_ip;
         Set *dhcp_allow_listed_ip;
         Set *dhcp_request_options;
         OrderedHashmap *dhcp_client_send_options;
         OrderedHashmap *dhcp_client_send_vendor_options;
         char *dhcp_netlabel;
+        NFTSetContext dhcp_nft_set_context;
 
         /* DHCPv6 Client support */
         bool dhcp6_use_address;
         bool dhcp6_use_pd_prefix;
-        bool dhcp6_use_dns;
-        bool dhcp6_use_dns_set;
+        bool dhcp6_send_hostname;
+        bool dhcp6_send_hostname_set;
+        int dhcp6_use_dns;
+        int dhcp6_use_dnr;
         bool dhcp6_use_hostname;
-        bool dhcp6_use_ntp;
-        bool dhcp6_use_ntp_set;
+        int dhcp6_use_ntp;
+        bool dhcp6_use_sip;
+        bool dhcp6_use_captive_portal;
         bool dhcp6_use_rapid_commit;
-        DHCPUseDomains dhcp6_use_domains;
-        bool dhcp6_use_domains_set;
+        UseDomains dhcp6_use_domains;
         uint32_t dhcp6_iaid;
         bool dhcp6_iaid_set;
         bool dhcp6_iaid_set_explicitly;
         DUID dhcp6_duid;
         uint8_t dhcp6_pd_prefix_length;
         struct in6_addr dhcp6_pd_prefix_hint;
+        uint8_t dhcp6_pd_prefix_route_type;
+        char *dhcp6_hostname;
         char *dhcp6_mudurl;
         char **dhcp6_user_class;
         char **dhcp6_vendor_class;
@@ -187,12 +202,14 @@ struct Network {
         Set *dhcp6_request_options;
         char *dhcp6_netlabel;
         bool dhcp6_send_release;
+        NFTSetContext dhcp6_nft_set_context;
 
         /* DHCP Server Support */
         bool dhcp_server;
         bool dhcp_server_bind_to_interface;
         unsigned char dhcp_server_address_prefixlen;
-        struct in_addr dhcp_server_address;
+        struct in_addr dhcp_server_address_in_addr;
+        const Address *dhcp_server_address;
         int dhcp_server_uplink_index;
         char *dhcp_server_uplink_name;
         struct in_addr dhcp_server_relay_target;
@@ -211,6 +228,9 @@ struct Network {
         struct in_addr dhcp_server_boot_server_address;
         char *dhcp_server_boot_server_name;
         char *dhcp_server_boot_filename;
+        usec_t dhcp_server_ipv6_only_preferred_usec;
+        bool dhcp_server_rapid_commit;
+        DHCPServerPersistLeases dhcp_server_persist_leases;
 
         /* link-local addressing support */
         AddressFamily link_local;
@@ -223,6 +243,9 @@ struct Network {
         RADVPrefixDelegation router_prefix_delegation;
         usec_t router_lifetime_usec;
         uint8_t router_preference;
+        usec_t router_reachable_usec;
+        usec_t router_retransmit_usec;
+        uint8_t router_hop_limit;
         bool router_managed;
         bool router_other_information;
         bool router_emit_dns;
@@ -233,6 +256,10 @@ struct Network {
         OrderedSet *router_search_domains;
         int router_uplink_index;
         char *router_uplink_name;
+        /* Mobile IPv6 Home Agent */
+        bool router_home_agent_information;
+        uint16_t router_home_agent_preference;
+        usec_t home_agent_lifetime_usec;
 
         /* DHCP Prefix Delegation support */
         int dhcp_pd;
@@ -245,6 +272,7 @@ struct Network {
         int dhcp_pd_uplink_index;
         char *dhcp_pd_uplink_name;
         char *dhcp_pd_netlabel;
+        NFTSetContext dhcp_pd_nft_set_context;
 
         /* Bridge Support */
         int use_bpdu;
@@ -262,12 +290,14 @@ struct Network {
         uint32_t cost;
         uint16_t priority;
         MulticastRouter multicast_router;
+        int bridge_locked;
+        int bridge_mac_authentication_bypass;
+        int bridge_vlan_tunnel;
 
         /* Bridge VLAN */
-        bool use_br_vlan;
-        uint16_t pvid;
-        uint32_t br_vid_bitmap[BRIDGE_VLAN_BITMAP_LEN];
-        uint32_t br_untagged_bitmap[BRIDGE_VLAN_BITMAP_LEN];
+        uint16_t bridge_vlan_pvid;
+        uint32_t bridge_vlan_bitmap[BRIDGE_VLAN_BITMAP_LEN];
+        uint32_t bridge_vlan_untagged_bitmap[BRIDGE_VLAN_BITMAP_LEN];
 
         /* CAN support */
         uint32_t can_bitrate;
@@ -295,36 +325,48 @@ struct Network {
         int ipoib_umcast;
 
         /* sysctl settings */
-        AddressFamily ip_forward;
+        int ip_forwarding[2];
         int ipv4_accept_local;
         int ipv4_route_localnet;
         int ipv6_dad_transmits;
-        int ipv6_hop_limit;
+        uint8_t ipv6_hop_limit;
+        usec_t ipv6_retransmission_time;
         int proxy_arp;
+        int proxy_arp_pvlan;
         uint32_t ipv6_mtu;
         IPv6PrivacyExtensions ipv6_privacy_extensions;
+        IPReversePathFilter ipv4_rp_filter;
+        IPv4ForceIgmpVersion ipv4_force_igmp_version;
         int ipv6_proxy_ndp;
         Set *ipv6_proxy_ndp_addresses;
+        int mpls_input;
 
-        /* IPv6 accept RA */
-        int ipv6_accept_ra;
-        bool ipv6_accept_ra_use_dns;
-        bool ipv6_accept_ra_use_gateway;
-        bool ipv6_accept_ra_use_route_prefix;
-        bool ipv6_accept_ra_use_autonomous_prefix;
-        bool ipv6_accept_ra_use_onlink_prefix;
-        bool ipv6_accept_ra_use_mtu;
-        bool ipv6_accept_ra_quickack;
+        /* NDisc support */
+        int ndisc;
+        int ndisc_use_dnr;
+        bool ndisc_use_redirect;
+        int ndisc_use_dns;
+        bool ndisc_use_gateway;
+        bool ndisc_use_route_prefix;
+        bool ndisc_use_autonomous_prefix;
+        bool ndisc_use_onlink_prefix;
+        bool ndisc_use_mtu;
+        bool ndisc_use_hop_limit;
+        bool ndisc_use_reachable_time;
+        bool ndisc_use_retransmission_time;
+        bool ndisc_quickack;
+        bool ndisc_use_captive_portal;
+        bool ndisc_use_pref64;
         bool active_slave;
         bool primary_slave;
-        DHCPUseDomains ipv6_accept_ra_use_domains;
-        IPv6AcceptRAStartDHCP6Client ipv6_accept_ra_start_dhcp6_client;
-        uint32_t ipv6_accept_ra_route_table;
-        bool ipv6_accept_ra_route_table_set;
-        uint32_t ipv6_accept_ra_route_metric_high;
-        uint32_t ipv6_accept_ra_route_metric_medium;
-        uint32_t ipv6_accept_ra_route_metric_low;
-        bool ipv6_accept_ra_route_metric_set;
+        UseDomains ndisc_use_domains;
+        IPv6AcceptRAStartDHCP6Client ndisc_start_dhcp6_client;
+        uint32_t ndisc_route_table;
+        bool ndisc_route_table_set;
+        uint32_t ndisc_route_metric_high;
+        uint32_t ndisc_route_metric_medium;
+        uint32_t ndisc_route_metric_low;
+        bool ndisc_route_metric_set;
         Set *ndisc_deny_listed_router;
         Set *ndisc_allow_listed_router;
         Set *ndisc_deny_listed_prefix;
@@ -333,6 +375,7 @@ struct Network {
         Set *ndisc_allow_listed_route_prefix;
         Set *ndisc_tokens;
         char *ndisc_netlabel;
+        NFTSetContext ndisc_nft_set_context;
 
         /* LLDP support */
         LLDPMode lldp_mode; /* LLDP reception */
@@ -341,13 +384,14 @@ struct Network {
 
         OrderedHashmap *addresses_by_section;
         Hashmap *routes_by_section;
-        Hashmap *nexthops_by_section;
+        OrderedHashmap *nexthops_by_section;
         Hashmap *bridge_fdb_entries_by_section;
         Hashmap *bridge_mdb_entries_by_section;
-        Hashmap *neighbors_by_section;
+        OrderedHashmap *neighbors_by_section;
         Hashmap *address_labels_by_section;
         Hashmap *prefixes_by_section;
         Hashmap *route_prefixes_by_section;
+        Hashmap *pref64_prefixes_by_section;
         Hashmap *rules_by_section;
         Hashmap *dhcp_static_leases_by_section;
         Hashmap *qdiscs_by_section;
@@ -367,13 +411,13 @@ struct Network {
 
         /* NTP */
         char **ntp;
-};
+} Network;
 
 Network *network_ref(Network *network);
 Network *network_unref(Network *network);
 DEFINE_TRIVIAL_CLEANUP_FUNC(Network*, network_unref);
 
-int network_load(Manager *manager, OrderedHashmap **networks);
+int network_load(Manager *manager, OrderedHashmap **ret);
 int network_reload(Manager *manager);
 int network_load_one(Manager *manager, OrderedHashmap **networks, const char *filename);
 int network_verify(Network *network);
@@ -387,11 +431,6 @@ bool network_has_static_ipv6_configurations(Network *network);
 
 CONFIG_PARSER_PROTOTYPE(config_parse_stacked_netdev);
 CONFIG_PARSER_PROTOTYPE(config_parse_tunnel);
-CONFIG_PARSER_PROTOTYPE(config_parse_domains);
-CONFIG_PARSER_PROTOTYPE(config_parse_dns);
-CONFIG_PARSER_PROTOTYPE(config_parse_timezone);
-CONFIG_PARSER_PROTOTYPE(config_parse_dnssec_negative_trust_anchors);
-CONFIG_PARSER_PROTOTYPE(config_parse_ntp);
 CONFIG_PARSER_PROTOTYPE(config_parse_required_for_online);
 CONFIG_PARSER_PROTOTYPE(config_parse_required_family_for_online);
 CONFIG_PARSER_PROTOTYPE(config_parse_keep_configuration);

@@ -10,27 +10,29 @@
 ACTION=="remove", GOTO="systemd_end"
 
 SUBSYSTEM=="tty", KERNEL=="tty[a-zA-Z]*|hvc*|xvc*|hvsi*|ttysclp*|sclp_line*|3270/tty[0-9]*", TAG+="systemd"
+# Exclude 8250 serial ports with a zero IO port, as they are not usable until "setserial /dev/ttySxxx port …" is invoked.
+SUBSYSTEM=="tty", KERNEL=="ttyS*", DRIVERS=="serial8250", ATTR{port}=="0x0", ATTR{iomem_base}=="0x0", ENV{SYSTEMD_READY}="0"
 KERNEL=="vport*", TAG+="systemd"
+
+SUBSYSTEM=="ptp", TAG+="systemd"
+
+SUBSYSTEM=="mtd", TAG+="systemd"
 
 SUBSYSTEM=="ubi", TAG+="systemd"
 
 SUBSYSTEM=="block", TAG+="systemd"
 
-# We can't make any conclusions about suspended DM devices so let's just import previous SYSTEMD_READY state and skip other rules
-SUBSYSTEM=="block", ENV{DM_SUSPENDED}=="1", IMPORT{db}="SYSTEMD_READY", GOTO="systemd_end"
-SUBSYSTEM=="block", ACTION=="add", ENV{DM_UDEV_DISABLE_OTHER_RULES_FLAG}=="1", ENV{SYSTEMD_READY}="0"
+# When a dm device is first created, it's just an empty container. Ignore it.
+# DM_NAME is not set in this case, but it's set on spurious "add" events that occur later.
+SUBSYSTEM=="block", ACTION=="add", KERNEL=="dm-*", ENV{DM_NAME}!="?*", ENV{SYSTEMD_READY}="0"
+
+# DM_UDEV_DISABLE_OTHER_RULES_FLAG==1 means that the device shouldn't be probed.
+# Import previous SYSTEMD_READY state.
+SUBSYSTEM=="block", ENV{DM_UDEV_DISABLE_OTHER_RULES_FLAG}=="1", ENV{SYSTEMD_READY}=="", IMPORT{db}="SYSTEMD_READY"
 
 # Ignore encrypted devices with no identified superblock on it, since
 # we are probably still calling mke2fs or mkswap on it.
 SUBSYSTEM=="block", ENV{DM_UUID}=="CRYPT-*", ENV{ID_PART_TABLE_TYPE}=="", ENV{ID_FS_USAGE}=="", ENV{SYSTEMD_READY}="0"
-
-# Explicitly set SYSTEMD_READY=1 for DM devices that don't have it set yet, so that we always have something to import above
-SUBSYSTEM=="block", ENV{DM_UUID}=="?*", ENV{SYSTEMD_READY}=="", ENV{SYSTEMD_READY}="1"
-
-# add symlink to GPT root disk
-SUBSYSTEM=="block", ENV{ID_PART_GPT_AUTO_ROOT}=="1", ENV{ID_FS_TYPE}!="crypto_LUKS", SYMLINK+="gpt-auto-root"
-SUBSYSTEM=="block", ENV{ID_PART_GPT_AUTO_ROOT}=="1", ENV{ID_FS_TYPE}=="crypto_LUKS", SYMLINK+="gpt-auto-root-luks"
-SUBSYSTEM=="block", ENV{DM_UUID}=="CRYPT-*", ENV{DM_NAME}=="root", SYMLINK+="gpt-auto-root"
 
 # Ignore raid devices that are not yet assembled and started
 SUBSYSTEM=="block", ENV{DEVTYPE}=="disk", KERNEL=="md*", TEST!="md/array_state", ENV{SYSTEMD_READY}="0"
@@ -54,21 +56,24 @@ SUBSYSTEM=="bluetooth", TAG+="systemd", ENV{SYSTEMD_ALIAS}+="/sys/subsystem/blue
   ENV{SYSTEMD_WANTS}+="bluetooth.target", ENV{SYSTEMD_USER_WANTS}+="bluetooth.target"
 
 ENV{ID_SMARTCARD_READER}=="?*", TAG+="systemd", ENV{SYSTEMD_WANTS}+="smartcard.target", ENV{SYSTEMD_USER_WANTS}+="smartcard.target"
+TAG=="security-device", TAG+="systemd"
 SUBSYSTEM=="sound", KERNEL=="controlC*", TAG+="systemd", ENV{SYSTEMD_WANTS}+="sound.target", ENV{SYSTEMD_USER_WANTS}+="sound.target"
 
 SUBSYSTEM=="printer", TAG+="systemd", ENV{SYSTEMD_WANTS}+="printer.target", ENV{SYSTEMD_USER_WANTS}+="printer.target"
 SUBSYSTEM=="usb", KERNEL=="lp*", TAG+="systemd", ENV{SYSTEMD_WANTS}+="printer.target", ENV{SYSTEMD_USER_WANTS}+="printer.target"
 SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ENV{ID_USB_INTERFACES}=="*:0701??:*", TAG+="systemd", ENV{SYSTEMD_WANTS}+="printer.target", ENV{SYSTEMD_USER_WANTS}+="printer.target"
 
-SUBSYSTEM=="udc", ACTION=="add", TAG+="systemd", ENV{SYSTEMD_WANTS}+="usb-gadget.target"
+SUBSYSTEM=="udc", TAG+="systemd", ENV{SYSTEMD_WANTS}+="usb-gadget.target"
 
 # Apply sysctl variables to network devices (and only to those) as they appear.
-ACTION=="add", SUBSYSTEM=="net", KERNEL!="lo", RUN+="{{ROOTLIBEXECDIR}}/systemd-sysctl --prefix=/net/ipv4/conf/$name --prefix=/net/ipv4/neigh/$name --prefix=/net/ipv6/conf/$name --prefix=/net/ipv6/neigh/$name"
+ACTION=="add", SUBSYSTEM=="net", KERNEL!="lo", RUN+="{{LIBEXECDIR}}/systemd-sysctl --prefix=/net/ipv4/conf/$name --prefix=/net/ipv4/neigh/$name --prefix=/net/ipv6/conf/$name --prefix=/net/ipv6/neigh/$name"
 
+{% if ENABLE_BACKLIGHT %}
 # Pull in backlight save/restore for all backlight devices and
 # keyboard backlights
 SUBSYSTEM=="backlight", TAG+="systemd", IMPORT{builtin}="path_id", ENV{SYSTEMD_WANTS}+="systemd-backlight@backlight:$name.service"
-SUBSYSTEM=="leds", KERNEL=="*kbd_backlight", TAG+="systemd", IMPORT{builtin}="path_id", ENV{SYSTEMD_WANTS}+="systemd-backlight@leds:$name.service"
+SUBSYSTEM=="leds", KERNEL=="*kbd_backlight*", TAG+="systemd", IMPORT{builtin}="path_id", ENV{SYSTEMD_WANTS}+="systemd-backlight@leds:$name.service"
+{% endif %}
 
 # Pull in rfkill save/restore for all rfkill devices
 SUBSYSTEM=="rfkill", ENV{SYSTEMD_RFKILL}="1"
@@ -78,5 +83,10 @@ SUBSYSTEM=="misc", KERNEL=="rfkill", TAG+="systemd", ENV{SYSTEMD_WANTS}+="system
 # Asynchronously mount file systems implemented by these modules as soon as they are loaded.
 SUBSYSTEM=="module", KERNEL=="fuse", TAG+="systemd", ENV{SYSTEMD_WANTS}+="sys-fs-fuse-connections.mount"
 SUBSYSTEM=="module", KERNEL=="configfs", TAG+="systemd", ENV{SYSTEMD_WANTS}+="sys-kernel-config.mount"
+
+# Pull in tpm2.target whenever the full-blown /dev/tpmrm* shows up (and also
+# tag the version without resource manager, so that we can sync on it).
+SUBSYSTEM=="tpmrm", KERNEL=="tpmrm[0-9]*", TAG+="systemd", ENV{SYSTEMD_WANTS}+="tpm2.target"
+SUBSYSTEM=="tpm", KERNEL=="tpm[0-9]*", TAG+="systemd"
 
 LABEL="systemd_end"

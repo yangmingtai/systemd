@@ -1,16 +1,18 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
+#include <fnmatch.h>
 #include <stdio.h>
-#include <stdlib.h>
+#include <unistd.h>
 
+#include "sd-daemon.h"
 #include "sd-id128.h"
 
-#include "alloc-util.h"
 #include "all-units.h"
-#include "glob-util.h"
+#include "alloc-util.h"
+#include "fd-util.h"
 #include "format-util.h"
-#include "hostname-util.h"
-#include "macro.h"
+#include "glob-util.h"
+#include "hostname-setup.h"
 #include "manager.h"
 #include "path-util.h"
 #include "rm-rf.h"
@@ -19,10 +21,10 @@
 #include "string-util.h"
 #include "tests.h"
 #include "tmpfile-util.h"
+#include "unit.h"
 #include "unit-def.h"
 #include "unit-name.h"
 #include "unit-printf.h"
-#include "unit.h"
 #include "user-util.h"
 
 static char *runtime_dir = NULL;
@@ -92,7 +94,7 @@ static void test_unit_name_replace_instance_one(const char *pattern, const char 
         _cleanup_free_ char *t = NULL;
         assert_se(unit_name_replace_instance(pattern, repl, &t) == ret);
         puts(strna(t));
-        assert_se(streq_ptr(t, expected));
+        ASSERT_STREQ(t, expected);
 }
 
 TEST(unit_name_replace_instance) {
@@ -112,7 +114,7 @@ static void test_unit_name_from_path_one(const char *path, const char *suffix, c
 
         assert_se(unit_name_from_path(path, suffix, &t) == ret);
         puts(strna(t));
-        assert_se(streq_ptr(t, expected));
+        ASSERT_STREQ(t, expected);
 
         if (t) {
                 _cleanup_free_ char *k = NULL;
@@ -159,7 +161,7 @@ static void test_unit_name_from_path_instance_one(const char *pattern, const cha
 
         assert_se(unit_name_from_path_instance(pattern, path, suffix, &t) == ret);
         puts(strna(t));
-        assert_se(streq_ptr(t, expected));
+        ASSERT_STREQ(t, expected);
 
         if (t) {
                 _cleanup_free_ char *k = NULL, *v = NULL;
@@ -185,7 +187,7 @@ static void test_unit_name_to_path_one(const char *unit, const char *path, int r
         _cleanup_free_ char *p = NULL;
 
         assert_se(unit_name_to_path(unit, &p) == ret);
-        assert_se(streq_ptr(path, p));
+        ASSERT_STREQ(path, p);
 }
 
 TEST(unit_name_to_path) {
@@ -201,10 +203,14 @@ TEST(unit_name_to_path) {
 
 static void test_unit_name_mangle_one(bool allow_globs, const char *pattern, const char *expect, int ret) {
         _cleanup_free_ char *t = NULL;
+        int r;
 
-        assert_se(unit_name_mangle(pattern, (allow_globs * UNIT_NAME_MANGLE_GLOB) | UNIT_NAME_MANGLE_WARN, &t) == ret);
+        r = unit_name_mangle(pattern, (allow_globs * UNIT_NAME_MANGLE_GLOB) | UNIT_NAME_MANGLE_WARN, &t);
+        log_debug("%s: %s -> %d, %s", __func__, pattern, r, strnull(t));
+
+        assert_se(r == ret);
         puts(strna(t));
-        assert_se(streq_ptr(t, expect));
+        ASSERT_STREQ(t, expect);
 
         if (t) {
                 _cleanup_free_ char *k = NULL;
@@ -213,7 +219,7 @@ static void test_unit_name_mangle_one(bool allow_globs, const char *pattern, con
                           (allow_globs && string_is_glob(t)));
 
                 assert_se(unit_name_mangle(t, (allow_globs * UNIT_NAME_MANGLE_GLOB) | UNIT_NAME_MANGLE_WARN, &k) == 0);
-                assert_se(streq_ptr(t, k));
+                ASSERT_STREQ(t, k);
         }
 }
 
@@ -232,6 +238,48 @@ TEST(unit_name_mangle) {
         test_unit_name_mangle_one(true, "foo", "foo.service", 1);
         test_unit_name_mangle_one(true, "foo*", "foo*", 0);
         test_unit_name_mangle_one(true, "ü*", "\\xc3\\xbc*", 1);
+}
+
+static void test_unit_name_mangle_with_suffix_one(const char *arg, int expected, const char *expected_name) {
+        _cleanup_free_ char *s = NULL;
+        int r;
+
+        r = unit_name_mangle_with_suffix(arg, NULL, 0, ".service", &s);
+        log_debug("%s: %s -> %d, %s", __func__, arg, r, strnull(s));
+
+        assert_se(r == expected);
+        ASSERT_STREQ(s, expected_name);
+}
+
+TEST(unit_name_mangle_with_suffix) {
+        test_unit_name_mangle_with_suffix_one("", -EINVAL, NULL);
+
+        test_unit_name_mangle_with_suffix_one("/dev", 1, "dev.mount");
+        test_unit_name_mangle_with_suffix_one("/../dev", 1, "dev.mount");
+        test_unit_name_mangle_with_suffix_one("/../dev/.", 1, "dev.mount");
+        /* We don't skip the last '..', and it makes this an invalid device or mount name */
+        test_unit_name_mangle_with_suffix_one("/.././dev/..", 1, "-..-.-dev-...service");
+        test_unit_name_mangle_with_suffix_one("/.././dev", 1, "dev.mount");
+        test_unit_name_mangle_with_suffix_one("/./.././../dev/", 1, "dev.mount");
+
+        test_unit_name_mangle_with_suffix_one("/dev/sda", 1, "dev-sda.device");
+        test_unit_name_mangle_with_suffix_one("/dev/sda5", 1, "dev-sda5.device");
+
+        test_unit_name_mangle_with_suffix_one("/sys", 1, "sys.mount");
+        test_unit_name_mangle_with_suffix_one("/../sys", 1, "sys.mount");
+        test_unit_name_mangle_with_suffix_one("/../sys/.", 1, "sys.mount");
+        /* We don't skip the last '..', and it makes this an invalid device or mount name */
+        test_unit_name_mangle_with_suffix_one("/.././sys/..", 1, "-..-.-sys-...service");
+        test_unit_name_mangle_with_suffix_one("/.././sys", 1, "sys.mount");
+        test_unit_name_mangle_with_suffix_one("/./.././../sys/", 1, "sys.mount");
+
+        test_unit_name_mangle_with_suffix_one("/proc", 1, "proc.mount");
+        test_unit_name_mangle_with_suffix_one("/../proc", 1, "proc.mount");
+        test_unit_name_mangle_with_suffix_one("/../proc/.", 1, "proc.mount");
+        /* We don't skip the last '..', and it makes this an invalid device or mount name */
+        test_unit_name_mangle_with_suffix_one("/.././proc/..", 1, "-..-.-proc-...service");
+        test_unit_name_mangle_with_suffix_one("/.././proc", 1, "proc.mount");
+        test_unit_name_mangle_with_suffix_one("/./.././../proc/", 1, "proc.mount");
 }
 
 TEST_RET(unit_printf, .sd_booted = true) {
@@ -453,11 +501,11 @@ TEST(unit_name_change_suffix) {
         char *t;
 
         assert_se(unit_name_change_suffix("foo.mount", ".service", &t) == 0);
-        assert_se(streq(t, "foo.service"));
+        ASSERT_STREQ(t, "foo.service");
         free(t);
 
         assert_se(unit_name_change_suffix("foo@stuff.service", ".socket", &t) == 0);
-        assert_se(streq(t, "foo@stuff.socket"));
+        ASSERT_STREQ(t, "foo@stuff.socket");
         free(t);
 }
 
@@ -465,15 +513,15 @@ TEST(unit_name_build) {
         char *t;
 
         assert_se(unit_name_build("foo", "bar", ".service", &t) == 0);
-        assert_se(streq(t, "foo@bar.service"));
+        ASSERT_STREQ(t, "foo@bar.service");
         free(t);
 
         assert_se(unit_name_build("fo0-stUff_b", "bar", ".mount", &t) == 0);
-        assert_se(streq(t, "fo0-stUff_b@bar.mount"));
+        ASSERT_STREQ(t, "fo0-stUff_b@bar.mount");
         free(t);
 
         assert_se(unit_name_build("foo", NULL, ".service", &t) == 0);
-        assert_se(streq(t, "foo.service"));
+        ASSERT_STREQ(t, "foo.service");
         free(t);
 }
 
@@ -517,7 +565,7 @@ TEST(build_subslice) {
         free(b);
         assert_se(slice_build_subslice(a, "foobar", &b) >= 0);
         free(a);
-        assert_se(streq(b, "foo-bar-barfoo-foobar.slice"));
+        ASSERT_STREQ(b, "foo-bar-barfoo-foobar.slice");
         free(b);
 
         assert_se(slice_build_subslice("foo.service", "bar", &a) < 0);
@@ -528,7 +576,7 @@ static void test_build_parent_slice_one(const char *name, const char *expect, in
         _cleanup_free_ char *s = NULL;
 
         assert_se(slice_build_parent_slice(name, &s) == ret);
-        assert_se(streq_ptr(s, expect));
+        ASSERT_STREQ(s, expect);
 }
 
 TEST(build_parent_slice) {
@@ -556,17 +604,17 @@ TEST(unit_name_to_instance) {
 
         r = unit_name_to_instance("foo@bar.service", &instance);
         assert_se(r == UNIT_NAME_INSTANCE);
-        assert_se(streq(instance, "bar"));
+        ASSERT_STREQ(instance, "bar");
         free(instance);
 
         r = unit_name_to_instance("foo@.service", &instance);
         assert_se(r == UNIT_NAME_TEMPLATE);
-        assert_se(streq(instance, ""));
+        ASSERT_STREQ(instance, "");
         free(instance);
 
         r = unit_name_to_instance("fo0-stUff_b@b.service", &instance);
         assert_se(r == UNIT_NAME_INSTANCE);
-        assert_se(streq(instance, "b"));
+        ASSERT_STREQ(instance, "b");
         free(instance);
 
         r = unit_name_to_instance("foo.service", &instance);
@@ -583,11 +631,11 @@ TEST(unit_name_to_instance) {
 }
 
 TEST(unit_name_escape) {
-        _cleanup_free_ char *r;
+        _cleanup_free_ char *r = NULL;
 
         r = unit_name_escape("ab+-c.a/bc@foo.service");
         assert_se(r);
-        assert_se(streq(r, "ab\\x2b\\x2dc.a-bc\\x40foo.service"));
+        ASSERT_STREQ(r, "ab\\x2b\\x2dc.a-bc\\x40foo.service");
 }
 
 static void test_u_n_t_one(const char *name, const char *expected, int ret) {
@@ -595,7 +643,7 @@ static void test_u_n_t_one(const char *name, const char *expected, int ret) {
 
         assert_se(unit_name_template(name, &f) == ret);
         printf("got: %s, expected: %s\n", strna(f), strna(expected));
-        assert_se(streq_ptr(f, expected));
+        ASSERT_STREQ(f, expected);
 }
 
 TEST(unit_name_template) {
@@ -607,7 +655,7 @@ static void test_unit_name_path_unescape_one(const char *name, const char *path,
         _cleanup_free_ char *p = NULL;
 
         assert_se(unit_name_path_unescape(name, &p) == ret);
-        assert_se(streq_ptr(path, p));
+        ASSERT_STREQ(path, p);
 }
 
 TEST(unit_name_path_unescape) {
@@ -629,7 +677,7 @@ static void test_unit_name_to_prefix_one(const char *input, int ret, const char 
         _cleanup_free_ char *k = NULL;
 
         assert_se(unit_name_to_prefix(input, &k) == ret);
-        assert_se(streq_ptr(k, output));
+        ASSERT_STREQ(k, output);
 }
 
 TEST(unit_name_to_prefix) {
@@ -649,7 +697,7 @@ static void test_unit_name_from_dbus_path_one(const char *input, int ret, const 
         _cleanup_free_ char *k = NULL;
 
         assert_se(unit_name_from_dbus_path(input, &k) == ret);
-        assert_se(streq_ptr(k, output));
+        ASSERT_STREQ(k, output);
 }
 
 TEST(unit_name_from_dbus_path) {
@@ -793,7 +841,6 @@ TEST(unit_name_from_dbus_path) {
         test_unit_name_from_dbus_path_one("/org/freedesktop/systemd1/unit/polkit_2eservice", 0, "polkit.service");
         test_unit_name_from_dbus_path_one("/org/freedesktop/systemd1/unit/proc_2dsys_2dfs_2dbinfmt_5fmisc_2eautomount", 0, "proc-sys-fs-binfmt_misc.automount");
         test_unit_name_from_dbus_path_one("/org/freedesktop/systemd1/unit/proc_2dsys_2dfs_2dbinfmt_5fmisc_2emount", 0, "proc-sys-fs-binfmt_misc.mount");
-        test_unit_name_from_dbus_path_one("/org/freedesktop/systemd1/unit/rc_2dlocal_2eservice", 0, "rc-local.service");
         test_unit_name_from_dbus_path_one("/org/freedesktop/systemd1/unit/remote_2dcryptsetup_2etarget", 0, "remote-cryptsetup.target");
         test_unit_name_from_dbus_path_one("/org/freedesktop/systemd1/unit/remote_2dfs_2dpre_2etarget", 0, "remote-fs-pre.target");
         test_unit_name_from_dbus_path_one("/org/freedesktop/systemd1/unit/remote_2dfs_2etarget", 0, "remote-fs.target");
@@ -888,8 +935,6 @@ TEST(unit_name_from_dbus_path) {
         test_unit_name_from_dbus_path_one("/org/freedesktop/systemd1/unit/systemd_2dfirstboot_2eservice", 0, "systemd-firstboot.service");
         test_unit_name_from_dbus_path_one("/org/freedesktop/systemd1/unit/systemd_2dfsck_2droot_2eservice", 0, SPECIAL_FSCK_ROOT_SERVICE);
         test_unit_name_from_dbus_path_one("/org/freedesktop/systemd1/unit/systemd_2dhwdb_2dupdate_2eservice", 0, "systemd-hwdb-update.service");
-        test_unit_name_from_dbus_path_one("/org/freedesktop/systemd1/unit/systemd_2dinitctl_2eservice", 0, "systemd-initctl.service");
-        test_unit_name_from_dbus_path_one("/org/freedesktop/systemd1/unit/systemd_2dinitctl_2esocket", 0, "systemd-initctl.socket");
         test_unit_name_from_dbus_path_one("/org/freedesktop/systemd1/unit/systemd_2djournal_2dcatalog_2dupdate_2eservice", 0, "systemd-journal-catalog-update.service");
         test_unit_name_from_dbus_path_one("/org/freedesktop/systemd1/unit/systemd_2djournal_2dflush_2eservice", 0, "systemd-journal-flush.service");
         test_unit_name_from_dbus_path_one("/org/freedesktop/systemd1/unit/systemd_2djournald_2daudit_2esocket", 0, "systemd-journald-audit.socket");
@@ -918,7 +963,6 @@ TEST(unit_name_from_dbus_path) {
         test_unit_name_from_dbus_path_one("/org/freedesktop/systemd1/unit/systemd_2dudevd_2dkernel_2esocket", 0, "systemd-udevd-kernel.socket");
         test_unit_name_from_dbus_path_one("/org/freedesktop/systemd1/unit/systemd_2dudevd_2eservice", 0, "systemd-udevd.service");
         test_unit_name_from_dbus_path_one("/org/freedesktop/systemd1/unit/systemd_2dupdate_2ddone_2eservice", 0, "systemd-update-done.service");
-        test_unit_name_from_dbus_path_one("/org/freedesktop/systemd1/unit/systemd_2dupdate_2dutmp_2drunlevel_2eservice", 0, "systemd-update-utmp-runlevel.service");
         test_unit_name_from_dbus_path_one("/org/freedesktop/systemd1/unit/systemd_2dupdate_2dutmp_2eservice", 0, "systemd-update-utmp.service");
         test_unit_name_from_dbus_path_one("/org/freedesktop/systemd1/unit/systemd_2duser_2dsessions_2eservice", 0, "systemd-user-sessions.service");
         test_unit_name_from_dbus_path_one("/org/freedesktop/systemd1/unit/systemd_2dvconsole_2dsetup_2eservice", 0, "systemd-vconsole-setup.service");

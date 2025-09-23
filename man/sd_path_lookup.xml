@@ -1,6 +1,6 @@
 <?xml version='1.0'?>
 <!DOCTYPE refentry PUBLIC "-//OASIS//DTD DocBook XML V4.5//EN"
-  "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd">
+  "http://www.oasis-open.org/docbook/xml/4.5/docbookx.dtd">
 <!-- SPDX-License-Identifier: LGPL-2.1-or-later -->
 
 <refentry id="sd_path_lookup" xmlns:xi="http://www.w3.org/2001/XInclude">
@@ -55,6 +55,7 @@
 
         <constant>SD_PATH_USER_CONFIGURATION</constant>,
         <constant>SD_PATH_USER_RUNTIME</constant>,
+        <constant>SD_PATH_USER_STATE_PRIVATE</constant>,
         <constant>SD_PATH_USER_STATE_CACHE</constant>,
 
         <constant>SD_PATH_USER</constant>,
@@ -168,13 +169,17 @@
         <varlistentry>
           <term><constant>-EOPNOTSUPP</constant></term>
 
-          <listitem><para>Unknown identifier <parameter>type</parameter>.</para></listitem>
+          <listitem><para>Unknown identifier <parameter>type</parameter>.</para>
+
+          <xi:include href="version-info.xml" xpointer="v246"/></listitem>
         </varlistentry>
 
         <varlistentry>
           <term><constant>-EINVAL</constant></term>
 
-          <listitem><para>Output argument is <constant>NULL</constant>.</para></listitem>
+          <listitem><para>Output argument is <constant>NULL</constant>.</para>
+
+          <xi:include href="version-info.xml" xpointer="v246"/></listitem>
         </varlistentry>
 
         <varlistentry>
@@ -182,13 +187,17 @@
 
           <listitem><para>Query failed because of an undefined environment variable (e.g. for
           <constant>SD_PATH_USER_RUNTIME</constant> when <varname>$XDG_RUNTIME_DIR</varname> is not
-          defined).</para></listitem>
+          defined).</para>
+
+          <xi:include href="version-info.xml" xpointer="v246"/></listitem>
         </varlistentry>
 
         <varlistentry>
           <term><constant>-ENOMEM</constant></term>
 
-          <listitem><para>Memory allocation failed.</para></listitem>
+          <listitem><para>Memory allocation failed.</para>
+
+          <xi:include href="version-info.xml" xpointer="v246"/></listitem>
         </varlistentry>
       </variablelist>
     </refsect2>
@@ -210,11 +219,18 @@
   <xi:include href="libsystemd-pkgconfig.xml" />
 
   <refsect1>
-    <title>See Also</title>
+    <title>History</title>
+    <para><function>sd_path_lookup()</function> and
+    <function>sd_path_lookup_strv()</function> were added in version 246.</para>
+  </refsect1>
 
-    <para>
-      <citerefentry><refentrytitle>systemd-path</refentrytitle><manvolnum>1</manvolnum></citerefentry>
-    </para>
+  <refsect1>
+    <title>See Also</title>
+    <para><simplelist type="inline">
+      <member><citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>sd-path</refentrytitle><manvolnum>3</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>systemd-path</refentrytitle><manvolnum>1</manvolnum></citerefentry></member>
+    </simplelist></para>
   </refsect1>
 
 </refentry>

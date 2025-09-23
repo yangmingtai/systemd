@@ -1,16 +1,14 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <errno.h>
 #include <net/if_arp.h>
-#include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
 
 #include "alloc-util.h"
-#include "dhcp-internal.h"
-#include "dhcp-protocol.h"
-#include "macro.h"
+#include "dhcp-option.h"
+#include "dhcp-packet.h"
 #include "memory-util.h"
+#include "tests.h"
 
 struct option_desc {
         uint8_t sname[64];
@@ -89,7 +87,7 @@ static void test_message_init(void) {
         message = malloc0(len);
 
         assert_se(dhcp_message_init(message, BOOTREQUEST, 0x12345678,
-                                    DHCP_DISCOVER, ARPHRD_ETHER, ETH_ALEN, (uint8_t[16]){},
+                                    ARPHRD_ETHER, ETH_ALEN, (uint8_t[16]){}, DHCP_DISCOVER,
                                     optlen, &optoffset) >= 0);
 
         assert_se(message->xid == htobe32(0x12345678));
@@ -361,18 +359,19 @@ static void test_option_set(void) {
 }
 
 int main(int argc, char *argv[]) {
+        test_setup_logging(LOG_DEBUG);
+
         test_invalid_buffer_length();
         test_message_init();
 
         test_options(NULL);
 
-        for (unsigned i = 0; i < ELEMENTSOF(option_tests); i++)
-                test_options(&option_tests[i]);
+        FOREACH_ELEMENT(desc, option_tests)
+                test_options(desc);
 
         test_option_set();
 
-        for (unsigned i = 0; i < ELEMENTSOF(option_tests); i++) {
-                struct option_desc *desc = &option_tests[i];
+        FOREACH_ELEMENT(desc, option_tests) {
                 if (!desc->success || desc->snamelen > 0 || desc->filelen > 0)
                         continue;
                 test_option_removal(desc);

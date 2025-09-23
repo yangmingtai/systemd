@@ -5,19 +5,19 @@
 #include <sys/xattr.h>
 
 #include "alloc-util.h"
+#include "curl-util.h"
 #include "fd-util.h"
 #include "format-util.h"
-#include "gcrypt-util.h"
 #include "hexdecoct.h"
-#include "import-util.h"
 #include "io-util.h"
-#include "machine-pool.h"
+#include "log.h"
 #include "parse-util.h"
 #include "pull-common.h"
 #include "pull-job.h"
 #include "string-util.h"
 #include "strv.h"
 #include "sync-util.h"
+#include "time-util.h"
 #include "xattr-util.h"
 
 void pull_job_close_disk_fd(PullJob *j) {
@@ -42,11 +42,7 @@ PullJob* pull_job_unref(PullJob *j) {
         import_compress_free(&j->compress);
 
         if (j->checksum_ctx)
-#if PREFER_OPENSSL
                 EVP_MD_CTX_free(j->checksum_ctx);
-#else
-                gcry_md_close(j->checksum_ctx);
-#endif
 
         free(j->url);
         free(j->etag);
@@ -107,11 +103,7 @@ static int pull_job_restart(PullJob *j, const char *new_url) {
         import_compress_free(&j->compress);
 
         if (j->checksum_ctx) {
-#if PREFER_OPENSSL
                 EVP_MD_CTX_free(j->checksum_ctx);
-#else
-                gcry_md_close(j->checksum_ctx);
-#endif
                 j->checksum_ctx = NULL;
         }
 
@@ -134,14 +126,34 @@ void pull_job_curl_on_finished(CurlGlue *g, CURL *curl, CURLcode result) {
         if (!j || IN_SET(j->state, PULL_JOB_DONE, PULL_JOB_FAILED))
                 return;
 
-        if (result != CURLE_OK) {
-                r = log_error_errno(SYNTHETIC_ERRNO(EIO), "Transfer failed: %s", curl_easy_strerror(result));
-                goto finish;
-        }
-
         code = curl_easy_getinfo(curl, CURLINFO_SCHEME, &scheme);
         if (code != CURLE_OK || !scheme) {
                 r = log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to retrieve URL scheme.");
+                goto finish;
+        }
+
+        if (strcaseeq(scheme, "FILE") && result == CURLE_FILE_COULDNT_READ_FILE && j->on_not_found) {
+                _cleanup_free_ char *new_url = NULL;
+
+                /* This resource wasn't found, but the implementor wants to maybe let us know a new URL, query for it. */
+                r = j->on_not_found(j, &new_url);
+                if (r < 0)
+                        goto finish;
+                if (r > 0) { /* A new url to use */
+                        assert(new_url);
+
+                        r = pull_job_restart(j, new_url);
+                        if (r < 0)
+                                goto finish;
+
+                        return;
+                }
+
+                /* if this didn't work, handle like any other error below */
+        }
+
+        if (result != CURLE_OK) {
+                r = log_error_errno(SYNTHETIC_ERRNO(EIO), "Transfer failed: %s", curl_easy_strerror(result));
                 goto finish;
         }
 
@@ -187,7 +199,7 @@ void pull_job_curl_on_finished(CurlGlue *g, CURL *curl, CURLcode result) {
                                 }
                         }
 
-                        r = log_error_errno(
+                        r = log_notice_errno(
                                         status == 404 ? SYNTHETIC_ERRNO(ENOMEDIUM) : SYNTHETIC_ERRNO(EIO), /* Make the most common error recognizable */
                                         "HTTP request to %s failed with code %li.", j->url, status);
                         goto finish;
@@ -210,7 +222,6 @@ void pull_job_curl_on_finished(CurlGlue *g, CURL *curl, CURLcode result) {
 
         if (j->checksum_ctx) {
                 unsigned checksum_len;
-#if PREFER_OPENSSL
                 uint8_t k[EVP_MAX_MD_SIZE];
 
                 r = EVP_DigestFinal_ex(j->checksum_ctx, k, &checksum_len);
@@ -219,17 +230,6 @@ void pull_job_curl_on_finished(CurlGlue *g, CURL *curl, CURLcode result) {
                         goto finish;
                 }
                 assert(checksum_len <= sizeof k);
-#else
-                const uint8_t *k;
-
-                k = gcry_md_read(j->checksum_ctx, GCRY_MD_SHA256);
-                if (!k) {
-                        r = log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to get checksum.");
-                        goto finish;
-                }
-
-                checksum_len = gcry_md_get_algo_dlen(GCRY_MD_SHA256);
-#endif
 
                 j->checksum = hexmem(k, checksum_len);
                 if (!j->checksum) {
@@ -250,8 +250,8 @@ void pull_job_curl_on_finished(CurlGlue *g, CURL *curl, CURLcode result) {
                         if (j->offset == UINT64_MAX) {
 
                                 if (j->written_compressed > 0) {
-                                        /* Make sure the file size is right, in case the file was sparse and we just seeked
-                                         * for the last part */
+                                        /* Make sure the file size is right, in case the file was sparse and
+                                         * we just moved to the last part. */
                                         if (ftruncate(j->disk_fd, j->written_uncompressed) < 0) {
                                                 r = log_error_errno(errno, "Failed to truncate file: %m");
                                                 goto finish;
@@ -336,7 +336,7 @@ static int pull_job_write_uncompressed(const void *p, size_t sz, void *userdata)
                         if ((size_t) n < sz)
                                 return log_error_errno(SYNTHETIC_ERRNO(EIO), "Short write");
                 } else {
-                        r = loop_write(j->disk_fd, p, sz, false);
+                        r = loop_write(j->disk_fd, p, sz);
                         if (r < 0)
                                 return log_error_errno(r, "Failed to write file: %m");
                 }
@@ -380,14 +380,10 @@ static int pull_job_write_compressed(PullJob *j, void *p, size_t sz) {
                                        "Content length incorrect.");
 
         if (j->checksum_ctx) {
-#if PREFER_OPENSSL
                 r = EVP_DigestUpdate(j->checksum_ctx, p, sz);
                 if (r == 0)
                         return log_error_errno(SYNTHETIC_ERRNO(EIO),
                                                "Could not hash chunk.");
-#else
-                gcry_md_write(j->checksum_ctx, p, sz);
-#endif
         }
 
         r = import_uncompress(&j->compress, p, sz, pull_job_write_uncompressed, j);
@@ -415,13 +411,12 @@ static int pull_job_open_disk(PullJob *j) {
                         return log_error_errno(errno, "Failed to stat disk file: %m");
 
                 if (j->offset != UINT64_MAX) {
-                        if (lseek(j->disk_fd, j->offset, SEEK_SET) == (off_t) -1)
+                        if (lseek(j->disk_fd, j->offset, SEEK_SET) < 0)
                                 return log_error_errno(errno, "Failed to seek on file descriptor: %m");
                 }
         }
 
         if (j->calc_checksum) {
-#if PREFER_OPENSSL
                 j->checksum_ctx = EVP_MD_CTX_new();
                 if (!j->checksum_ctx)
                         return log_oom();
@@ -430,13 +425,6 @@ static int pull_job_open_disk(PullJob *j) {
                 if (r == 0)
                         return log_error_errno(SYNTHETIC_ERRNO(EIO),
                                                "Failed to initialize hash context.");
-#else
-                initialize_libgcrypt(false);
-
-                if (gcry_md_open(&j->checksum_ctx, GCRY_MD_SHA256, 0) != 0)
-                        return log_error_errno(SYNTHETIC_ERRNO(EIO),
-                                               "Failed to initialize hash context.");
-#endif
         }
 
         return 0;
@@ -771,7 +759,7 @@ int pull_job_begin(PullJob *j) {
         if (curl_easy_setopt(j->curl, CURLOPT_XFERINFODATA, j) != CURLE_OK)
                 return -EIO;
 
-        if (curl_easy_setopt(j->curl, CURLOPT_NOPROGRESS, 0) != CURLE_OK)
+        if (curl_easy_setopt(j->curl, CURLOPT_NOPROGRESS, 0L) != CURLE_OK)
                 return -EIO;
 
         r = curl_glue_add(j->glue, j->curl);

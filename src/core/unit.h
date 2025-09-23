@@ -1,24 +1,30 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include <stdbool.h>
-#include <stdlib.h>
-#include <sys/socket.h>
-#include <unistd.h>
-
 #include "sd-id128.h"
 
-#include "bpf-program.h"
-#include "condition.h"
+#include "core-forward.h"
 #include "emergency-action.h"
+#include "execute.h"
+#include "hashmap.h"
 #include "install.h"
+#include "iterator.h"
+#include "job.h"
 #include "list.h"
-#include "show-status.h"
-#include "set.h"
+#include "log.h"
+#include "log-context.h"
+#include "ratelimit.h"
+#include "time-util.h"
+#include "unit-def.h"
+#include "unit-dependency-atom.h"
 #include "unit-file.h"
-#include "cgroup.h"
 
-typedef struct UnitRef UnitRef;
+typedef enum UnitMountDependencyType {
+        UNIT_MOUNT_WANTS,
+        UNIT_MOUNT_REQUIRES,
+        _UNIT_MOUNT_DEPENDENCY_TYPE_MAX,
+        _UNIT_MOUNT_DEPENDENCY_TYPE_INVALID = -EINVAL,
+} UnitMountDependencyType;
 
 typedef enum KillOperation {
         KILL_TERMINATE,
@@ -37,12 +43,29 @@ typedef enum CollectMode {
         _COLLECT_MODE_INVALID = -EINVAL,
 } CollectMode;
 
+typedef enum OOMPolicy {
+        OOM_CONTINUE,          /* The kernel or systemd-oomd kills the process it wants to kill, and that's it */
+        OOM_STOP,              /* The kernel or systemd-oomd kills the process it wants to kill, and we stop the unit */
+        OOM_KILL,              /* The kernel or systemd-oomd kills the process it wants to kill, and all others in the unit, and we stop the unit */
+        _OOM_POLICY_MAX,
+        _OOM_POLICY_INVALID = -EINVAL,
+} OOMPolicy;
+
+typedef enum StatusType {
+        STATUS_TYPE_EPHEMERAL,   /* ordered by severity! Do not break order */
+        STATUS_TYPE_NORMAL,
+        STATUS_TYPE_NOTICE,
+        STATUS_TYPE_EMERGENCY,
+        _STATUS_TYPE_MAX,
+        _STATUS_TYPE_INVALID = -EINVAL,
+} StatusType;
+
 static inline bool UNIT_IS_ACTIVE_OR_RELOADING(UnitActiveState t) {
-        return IN_SET(t, UNIT_ACTIVE, UNIT_RELOADING);
+        return IN_SET(t, UNIT_ACTIVE, UNIT_RELOADING, UNIT_REFRESHING);
 }
 
 static inline bool UNIT_IS_ACTIVE_OR_ACTIVATING(UnitActiveState t) {
-        return IN_SET(t, UNIT_ACTIVE, UNIT_ACTIVATING, UNIT_RELOADING);
+        return IN_SET(t, UNIT_ACTIVE, UNIT_ACTIVATING, UNIT_RELOADING, UNIT_REFRESHING);
 }
 
 static inline bool UNIT_IS_INACTIVE_OR_DEACTIVATING(UnitActiveState t) {
@@ -54,7 +77,11 @@ static inline bool UNIT_IS_INACTIVE_OR_FAILED(UnitActiveState t) {
 }
 
 static inline bool UNIT_IS_LOAD_COMPLETE(UnitLoadState t) {
-        return t >= 0 && t < _UNIT_LOAD_STATE_MAX && t != UNIT_STUB && t != UNIT_MERGED;
+        return t >= 0 && t < _UNIT_LOAD_STATE_MAX && !IN_SET(t, UNIT_STUB, UNIT_MERGED);
+}
+
+static inline bool UNIT_IS_LOAD_ERROR(UnitLoadState t) {
+        return IN_SET(t, UNIT_NOT_FOUND, UNIT_BAD_SETTING, UNIT_ERROR);
 }
 
 /* Stores the 'reason' a dependency was created as a bit mask, i.e. due to which configuration source it came to be. We
@@ -69,7 +96,7 @@ typedef enum UnitDependencyMask {
          * type) */
         UNIT_DEPENDENCY_IMPLICIT           = 1 << 1,
 
-        /* A dependency effected by DefaultDependencies=yes. Note that dependencies marked this way are conceptually
+        /* A dependency affected by DefaultDependencies=yes. Note that dependencies marked this way are conceptually
          * just a subset of UNIT_DEPENDENCY_FILE, as DefaultDependencies= is itself a unit file setting that can only
          * be set in unit files. We make this two separate bits only to help debugging how dependencies came to be. */
         UNIT_DEPENDENCY_DEFAULT            = 1 << 2,
@@ -118,7 +145,7 @@ typedef struct ActivationDetails {
 
 /* For casting an activation event into the various unit-specific types */
 #define DEFINE_ACTIVATION_DETAILS_CAST(UPPERCASE, MixedCase, UNIT_TYPE)         \
-        static inline MixedCase* UPPERCASE(ActivationDetails *a) {              \
+        static inline MixedCase* UPPERCASE(const ActivationDetails *a) {              \
                 if (_unlikely_(!a || a->trigger_unit_type != UNIT_##UNIT_TYPE)) \
                         return NULL;                                            \
                                                                                 \
@@ -136,10 +163,10 @@ typedef struct ActivationDetails {
 ActivationDetails *activation_details_new(Unit *trigger_unit);
 ActivationDetails *activation_details_ref(ActivationDetails *p);
 ActivationDetails *activation_details_unref(ActivationDetails *p);
-void activation_details_serialize(ActivationDetails *p, FILE *f);
+void activation_details_serialize(const ActivationDetails *p, FILE *f);
 int activation_details_deserialize(const char *key, const char *value, ActivationDetails **info);
-int activation_details_append_env(ActivationDetails *info, char ***strv);
-int activation_details_append_pair(ActivationDetails *info, char ***strv);
+int activation_details_append_env(const ActivationDetails *info, char ***strv);
+int activation_details_append_pair(const ActivationDetails *info, char ***strv);
 DEFINE_TRIVIAL_CLEANUP_FUNC(ActivationDetails*, activation_details_unref);
 
 typedef struct ActivationDetailsVTable {
@@ -154,18 +181,18 @@ typedef struct ActivationDetailsVTable {
         void (*done)(ActivationDetails *info);
 
         /* This should serialize all type-specific variables. */
-        void (*serialize)(ActivationDetails *info, FILE *f);
+        void (*serialize)(const ActivationDetails *info, FILE *f);
 
         /* This should deserialize all type-specific variables, one at a time. */
         int (*deserialize)(const char *key, const char *value, ActivationDetails **info);
 
         /* This should format the type-specific variables for the env block of the spawned service,
          * and return the number of added items. */
-        int (*append_env)(ActivationDetails *info, char ***strv);
+        int (*append_env)(const ActivationDetails *info, char ***strv);
 
         /* This should append type-specific variables as key/value pairs for the D-Bus property of the job,
          * and return the number of added pairs. */
-        int (*append_pair)(ActivationDetails *info, char ***strv);
+        int (*append_pair)(const ActivationDetails *info, char ***strv);
 } ActivationDetailsVTable;
 
 extern const ActivationDetailsVTable * const activation_details_vtable[_UNIT_TYPE_MAX];
@@ -187,17 +214,16 @@ static inline void* UNIT_DEPENDENCY_TO_PTR(UnitDependency d) {
         return INT_TO_PTR(d);
 }
 
-#include "job.h"
-
-struct UnitRef {
+typedef struct UnitRef {
         /* Keeps tracks of references to a unit. This is useful so
          * that we can merge two units if necessary and correct all
          * references to them */
 
         Unit *source, *target;
         LIST_FIELDS(UnitRef, refs_by_target);
-};
+} UnitRef;
 
+/* The generic, dynamic definition of the unit */
 typedef struct Unit {
         Manager *manager;
 
@@ -214,10 +240,11 @@ typedef struct Unit {
          * and whose value encodes why the dependency exists, using the UnitDependencyInfo type. i.e. a
          * Hashmap(UnitDependency → Hashmap(Unit* → UnitDependencyInfo)) */
         Hashmap *dependencies;
+        uint64_t dependency_generation;
 
-        /* Similar, for RequiresMountsFor= path dependencies. The key is the path, the value the
-         * UnitDependencyInfo type */
-        Hashmap *requires_mounts_for;
+        /* Similar, for RequiresMountsFor= and WantsMountsFor= path dependencies. The key is the path, the
+         * value the UnitDependencyInfo type */
+        Hashmap *mounts_for[_UNIT_MOUNT_DEPENDENCY_TYPE_MAX];
 
         char *description;
         char **documentation;
@@ -321,10 +348,12 @@ typedef struct Unit {
         /* Queue of units that should be checked if they can release resources now */
         LIST_FIELDS(Unit, release_resources_queue);
 
-        /* PIDs we keep an eye on. Note that a unit might have many
-         * more, but these are the ones we care enough about to
-         * process SIGCHLD for */
-        Set *pids;
+        /* Queue of units that should be informed when other units stop */
+        LIST_FIELDS(Unit, stop_notify_queue);
+
+        /* PIDs we keep an eye on. Note that a unit might have many more, but these are the ones we care
+         * enough about to process SIGCHLD for */
+        Set *pids; /* → PidRef* */
 
         /* Used in SIGCHLD and sd_notify() message event invocation logic to avoid that we dispatch the same event
          * multiple times on the same unit. */
@@ -361,75 +390,6 @@ typedef struct Unit {
         UnitFileState unit_file_state;
         PresetAction unit_file_preset;
 
-        /* Where the cpu.stat or cpuacct.usage was at the time the unit was started */
-        nsec_t cpu_usage_base;
-        nsec_t cpu_usage_last; /* the most recently read value */
-
-        /* The current counter of OOM kills initiated by systemd-oomd */
-        uint64_t managed_oom_kill_last;
-
-        /* The current counter of the oom_kill field in the memory.events cgroup attribute */
-        uint64_t oom_kill_last;
-
-        /* Where the io.stat data was at the time the unit was started */
-        uint64_t io_accounting_base[_CGROUP_IO_ACCOUNTING_METRIC_MAX];
-        uint64_t io_accounting_last[_CGROUP_IO_ACCOUNTING_METRIC_MAX]; /* the most recently read value */
-
-        /* Counterparts in the cgroup filesystem */
-        char *cgroup_path;
-        uint64_t cgroup_id;
-        CGroupMask cgroup_realized_mask;           /* In which hierarchies does this unit's cgroup exist? (only relevant on cgroup v1) */
-        CGroupMask cgroup_enabled_mask;            /* Which controllers are enabled (or more correctly: enabled for the children) for this unit's cgroup? (only relevant on cgroup v2) */
-        CGroupMask cgroup_invalidated_mask;        /* A mask specifying controllers which shall be considered invalidated, and require re-realization */
-        CGroupMask cgroup_members_mask;            /* A cache for the controllers required by all children of this cgroup (only relevant for slice units) */
-
-        /* Inotify watch descriptors for watching cgroup.events and memory.events on cgroupv2 */
-        int cgroup_control_inotify_wd;
-        int cgroup_memory_inotify_wd;
-
-        /* Device Controller BPF program */
-        BPFProgram *bpf_device_control_installed;
-
-        /* IP BPF Firewalling/accounting */
-        int ip_accounting_ingress_map_fd;
-        int ip_accounting_egress_map_fd;
-        uint64_t ip_accounting_extra[_CGROUP_IP_ACCOUNTING_METRIC_MAX];
-
-        int ipv4_allow_map_fd;
-        int ipv6_allow_map_fd;
-        int ipv4_deny_map_fd;
-        int ipv6_deny_map_fd;
-        BPFProgram *ip_bpf_ingress, *ip_bpf_ingress_installed;
-        BPFProgram *ip_bpf_egress, *ip_bpf_egress_installed;
-
-        Set *ip_bpf_custom_ingress;
-        Set *ip_bpf_custom_ingress_installed;
-        Set *ip_bpf_custom_egress;
-        Set *ip_bpf_custom_egress_installed;
-
-        /* BPF programs managed (e.g. loaded to kernel) by an entity external to systemd,
-         * attached to unit cgroup by provided program fd and attach type. */
-        Hashmap *bpf_foreign_by_key;
-
-        FDSet *initial_socket_bind_link_fds;
-#if BPF_FRAMEWORK
-        /* BPF links to BPF programs attached to cgroup/bind{4|6} hooks and
-         * responsible for allowing or denying a unit to bind(2) to a socket
-         * address. */
-        struct bpf_link *ipv4_socket_bind_link;
-        struct bpf_link *ipv6_socket_bind_link;
-#endif
-
-        FDSet *initial_restric_ifaces_link_fds;
-#if BPF_FRAMEWORK
-        struct bpf_link *restrict_ifaces_ingress_bpf_link;
-        struct bpf_link *restrict_ifaces_egress_bpf_link;
-#endif
-
-        /* Low-priority event source which is used to remove watched PIDs that have gone away, and subscribe to any new
-         * ones which might have appeared. */
-        sd_event_source *rewatch_pids_event_source;
-
         /* How to start OnSuccess=/OnFailure= units */
         JobMode on_success_job_mode;
         JobMode on_failure_job_mode;
@@ -449,6 +409,9 @@ typedef struct Unit {
 
         /* Create default dependencies */
         bool default_dependencies;
+
+        /* Configure so that the unit survives a system transition without stopping/starting. */
+        bool survive_final_kill_signal;
 
         /* Refuse manual starting, allow starting only indirectly via dependency. */
         bool refuse_manual_start;
@@ -472,6 +435,9 @@ typedef struct Unit {
         /* Is this a unit that is always running and cannot be stopped? */
         bool perpetual;
 
+        /* When true logs about this unit will be at debug level regardless of other log level settings */
+        bool debug_invocation;
+
         /* Booleans indicating membership of this unit in the various queues */
         bool in_load_queue:1;
         bool in_dbus_queue:1;
@@ -485,6 +451,7 @@ typedef struct Unit {
         bool in_start_when_upheld_queue:1;
         bool in_stop_when_bound_queue:1;
         bool in_release_resources_queue:1;
+        bool in_stop_notify_queue:1;
 
         bool sent_dbus_new_signal:1;
 
@@ -492,12 +459,6 @@ typedef struct Unit {
 
         bool in_audit:1;
         bool on_console:1;
-
-        bool cgroup_realized:1;
-        bool cgroup_members_mask_valid:1;
-
-        /* Reset cgroup accounting next time we fork something off */
-        bool reset_accounting:1;
 
         bool start_limit_hit:1;
 
@@ -513,9 +474,6 @@ typedef struct Unit {
         bool exported_log_extra_fields:1;
         bool exported_log_ratelimit_interval:1;
         bool exported_log_ratelimit_burst:1;
-
-        /* Whether we warned about clamping the CPU quota period */
-        bool warned_clamping_cpu_quota_period:1;
 
         /* When writing transient unit files, stores which section we stored last. If < 0, we didn't write any yet. If
          * == 0 we are in the [Unit] section, if > 0 we are in the unit type-specific section. */
@@ -562,6 +520,7 @@ static inline bool UNIT_WRITE_FLAGS_NOOP(UnitWriteFlags flags) {
 
 #include "kill.h"
 
+/* The static const, immutable data about a specific unit type */
 typedef struct UnitVTable {
         /* How much memory does an object of this unit type need */
         size_t object_size;
@@ -578,10 +537,13 @@ typedef struct UnitVTable {
          * KillContext is found, if the unit type has that */
         size_t kill_context_offset;
 
-        /* If greater than 0, the offset into the object where the
-         * pointer to ExecSharedRuntime is found, if the unit type has
-         * that */
+        /* If greater than 0, the offset into the object where the pointer to ExecRuntime is found, if
+         * the unit type has that */
         size_t exec_runtime_offset;
+
+        /* If greater than 0, the offset into the object where the pointer to CGroupRuntime is found, if the
+         * unit type has that */
+        size_t cgroup_runtime_offset;
 
         /* The name of the configuration file section with the private settings of this unit */
         const char *private_section;
@@ -624,20 +586,22 @@ typedef struct UnitVTable {
         int (*stop)(Unit *u);
         int (*reload)(Unit *u);
 
-        int (*kill)(Unit *u, KillWho w, int signo, int code, int value, sd_bus_error *error);
-
         /* Clear out the various runtime/state/cache/logs/configuration data */
         int (*clean)(Unit *u, ExecCleanMask m);
 
-        /* Freeze the unit */
-        int (*freeze)(Unit *u);
-        int (*thaw)(Unit *u);
-        bool (*can_freeze)(Unit *u);
+        /* Freeze or thaw the unit. Returns > 0 to indicate that the request will be handled asynchronously; unit_frozen
+         * or unit_thawed should be called once the operation is done. Returns 0 if done successfully, or < 0 on error. */
+        int (*freezer_action)(Unit *u, FreezerAction a);
+        bool (*can_freeze)(const Unit *u);
 
         /* Return which kind of data can be cleaned */
         int (*can_clean)(Unit *u, ExecCleanMask *ret);
 
         bool (*can_reload)(Unit *u);
+
+        /* Add a bind/image mount into the unit namespace while it is running. */
+        int (*live_mount)(Unit *u, const char *src, const char *dst, sd_bus_message *message, MountInNamespaceFlags flags, const MountOptions *options, sd_bus_error *error);
+        int (*can_live_mount)(Unit *u, sd_bus_error *error);
 
         /* Serialize state and file descriptors that should be carried over into the new
          * instance after reexecution. */
@@ -685,7 +649,13 @@ typedef struct UnitVTable {
         void (*notify_cgroup_oom)(Unit *u, bool managed_oom);
 
         /* Called whenever a process of this unit sends us a message */
-        void (*notify_message)(Unit *u, const struct ucred *ucred, char * const *tags, FDSet *fds);
+        void (*notify_message)(Unit *u, PidRef *pidref, const struct ucred *ucred, char * const *tags, FDSet *fds);
+
+        /* Called whenever we learn a handoff timestamp */
+        void (*notify_handoff_timestamp)(Unit *u, const struct ucred *ucred, const dual_timestamp *ts);
+
+        /* Called whenever we learn about a child process */
+        void (*notify_pidref)(Unit *u, PidRef *parent_pidref, PidRef *child_pidref);
 
         /* Called whenever a name this Unit registered for comes or goes away. */
         void (*bus_name_owner_change)(Unit *u, const char *new_owner);
@@ -697,7 +667,7 @@ typedef struct UnitVTable {
         int (*bus_commit_properties)(Unit *u);
 
         /* Return the unit this unit is following */
-        Unit *(*following)(Unit *u);
+        Unit* (*following)(Unit *u);
 
         /* Return the set of units that are following each other */
         int (*following_set)(Unit *u, Set **s);
@@ -705,6 +675,9 @@ typedef struct UnitVTable {
         /* Invoked each time a unit this unit is triggering changes
          * state or gains/loses a job */
         void (*trigger_notify)(Unit *u, Unit *trigger);
+
+        /* Invoked when some other units stop */
+        bool (*stop_notify)(Unit *u);
 
         /* Called whenever CLOCK_REALTIME made a jump */
         void (*time_change)(Unit *u);
@@ -715,11 +688,14 @@ typedef struct UnitVTable {
         /* Returns the next timeout of a unit */
         int (*get_timeout)(Unit *u, usec_t *timeout);
 
-        /* Returns the main PID if there is any defined, or 0. */
-        pid_t (*main_pid)(Unit *u);
+        /* Returns the start timeout of a unit */
+        usec_t (*get_timeout_start_usec)(Unit *u);
 
-        /* Returns the main PID if there is any defined, or 0. */
-        pid_t (*control_pid)(Unit *u);
+        /* Returns the main PID if there is any defined, or NULL. */
+        PidRef* (*main_pid)(Unit *u, bool *ret_is_alien);
+
+        /* Returns the control PID if there is any defined, or NULL. */
+        PidRef* (*control_pid)(Unit *u);
 
         /* Returns true if the unit currently needs access to the console */
         bool (*needs_console)(Unit *u);
@@ -753,6 +729,10 @@ typedef struct UnitVTable {
          * limiting checks to occur before we do anything else. */
         int (*can_start)(Unit *u);
 
+        /* Returns > 0 if the whole subsystem is ratelimited, and new start operations should not be started
+         * for this unit type right now. */
+        int (*subsystem_ratelimited)(Manager *m);
+
         /* The strings to print in status messages */
         UnitStatusMessageFormats status_message_formats;
 
@@ -779,6 +759,16 @@ typedef struct UnitVTable {
 
         /* True if systemd-oomd can monitor and act on this unit's recursive children's cgroups  */
         bool can_set_managed_oom;
+
+        /* If true, we'll notify plymouth about this unit */
+        bool notify_plymouth;
+
+        /* If true, we'll notify a surrounding VMM/container manager about this unit becoming available */
+        bool notify_supervisor;
+
+        /* The audit events to generate on start + stop (or 0 if none shall be generated) */
+        int audit_start_message_type;
+        int audit_stop_message_type;
 } UnitVTable;
 
 extern const UnitVTable * const unit_vtable[_UNIT_TYPE_MAX];
@@ -810,6 +800,7 @@ static inline const UnitVTable* UNIT_VTABLE(const Unit *u) {
 
 Unit* unit_has_dependency(const Unit *u, UnitDependencyAtom atom, Unit *other);
 int unit_get_dependency_array(const Unit *u, UnitDependencyAtom atom, Unit ***ret_array);
+int unit_get_transitive_dependency_set(Unit *u, UnitDependencyAtom atom, Set **ret);
 
 static inline Hashmap* unit_get_dependencies(Unit *u, UnitDependency d) {
         return hashmap_get(u->dependencies, UNIT_DEPENDENCY_TO_PTR(d));
@@ -865,6 +856,8 @@ void unit_submit_to_stop_when_unneeded_queue(Unit *u);
 void unit_submit_to_start_when_upheld_queue(Unit *u);
 void unit_submit_to_stop_when_bound_queue(Unit *u);
 void unit_submit_to_release_resources_queue(Unit *u);
+void unit_add_to_stop_notify_queue(Unit *u);
+void unit_remove_from_stop_notify_queue(Unit *u);
 
 int unit_merge(Unit *u, Unit *other);
 int unit_merge_by_name(Unit *u, const char *other);
@@ -877,14 +870,12 @@ int unit_load(Unit *unit);
 int unit_set_slice(Unit *u, Unit *slice);
 int unit_set_default_slice(Unit *u);
 
-const char *unit_description(Unit *u) _pure_;
-const char *unit_status_string(Unit *u, char **combined);
+const char* unit_description(Unit *u) _pure_;
+const char* unit_status_string(Unit *u, char **combined);
 
 bool unit_has_name(const Unit *u, const char *name);
 
 UnitActiveState unit_active_state(Unit *u);
-FreezerState unit_freezer_state(Unit *u);
-int unit_freezer_state_kernel(Unit *u, FreezerState *ret);
 
 const char* unit_sub_state_to_string(Unit *u);
 
@@ -897,24 +888,16 @@ int unit_start(Unit *u, ActivationDetails *details);
 int unit_stop(Unit *u);
 int unit_reload(Unit *u);
 
-int unit_kill(Unit *u, KillWho w, int signo, int code, int value, sd_bus_error *error);
-int unit_kill_common(Unit *u, KillWho who, int signo, int code, int value, pid_t main_pid, pid_t control_pid, sd_bus_error *error);
+int unit_kill(Unit *u, KillWhom w, const char *subgroup, int signo, int code, int value, sd_bus_error *ret_error);
 
 void unit_notify_cgroup_oom(Unit *u, bool managed_oom);
 
-typedef enum UnitNotifyFlags {
-        UNIT_NOTIFY_RELOAD_FAILURE    = 1 << 0,
-        UNIT_NOTIFY_WILL_AUTO_RESTART = 1 << 1,
-} UnitNotifyFlags;
+void unit_notify(Unit *u, UnitActiveState os, UnitActiveState ns, bool reload_success);
 
-void unit_notify(Unit *u, UnitActiveState os, UnitActiveState ns, UnitNotifyFlags flags);
-
-int unit_watch_pid(Unit *u, pid_t pid, bool exclusive);
-void unit_unwatch_pid(Unit *u, pid_t pid);
+int unit_watch_pidref(Unit *u, const PidRef *pid, bool exclusive);
+void unit_unwatch_pidref(Unit *u, const PidRef *pid);
 void unit_unwatch_all_pids(Unit *u);
-
-int unit_enqueue_rewatch_pids(Unit *u);
-void unit_dequeue_rewatch_pids(Unit *u);
+void unit_unwatch_pidref_done(Unit *u, PidRef *pidref);
 
 int unit_install_bus_match(Unit *u, sd_bus *bus, const char *name);
 int unit_watch_bus_name(Unit *u, const char *name);
@@ -922,10 +905,10 @@ void unit_unwatch_bus_name(Unit *u, const char *name);
 
 bool unit_job_is_applicable(Unit *u, JobType j);
 
-int set_unit_path(const char *p);
+int setenv_unit_path(const char *p);
 
-char *unit_dbus_path(Unit *u);
-char *unit_dbus_path_invocation_id(Unit *u);
+char* unit_dbus_path(Unit *u);
+char* unit_dbus_path_invocation_id(Unit *u);
 
 int unit_load_related_unit(Unit *u, const char *type, Unit **_found);
 
@@ -944,7 +927,7 @@ void unit_reset_failed(Unit *u);
 Unit *unit_following(Unit *u);
 int unit_following_set(Unit *u, Set **s);
 
-const char *unit_slice_name(Unit *u);
+const char* unit_slice_name(Unit *u);
 
 bool unit_stop_pending(Unit *u) _pure_;
 bool unit_inactive_or_pending(Unit *u) _pure_;
@@ -954,8 +937,10 @@ bool unit_will_restart(Unit *u);
 
 int unit_add_default_target_dependency(Unit *u, Unit *target);
 
-void unit_start_on_failure(Unit *u, const char *dependency_name, UnitDependencyAtom atom, JobMode job_mode);
+void unit_start_on_termination_deps(Unit *u, UnitDependencyAtom atom);
 void unit_trigger_notify(Unit *u);
+
+int unit_get_exec_quota_stats(Unit *u, ExecContext *c, ExecDirectoryType dt, uint64_t *ret_usage, uint64_t *ret_limit);
 
 UnitFileState unit_get_unit_file_state(Unit *u);
 PresetAction unit_get_unit_file_preset(Unit *u);
@@ -968,13 +953,15 @@ void unit_ref_unset(UnitRef *ref);
 
 int unit_patch_contexts(Unit *u);
 
-ExecContext *unit_get_exec_context(const Unit *u) _pure_;
-KillContext *unit_get_kill_context(Unit *u) _pure_;
-CGroupContext *unit_get_cgroup_context(Unit *u) _pure_;
+ExecContext* unit_get_exec_context(const Unit *u) _pure_;
+KillContext* unit_get_kill_context(const Unit *u) _pure_;
+CGroupContext* unit_get_cgroup_context(const Unit *u) _pure_;
 
-ExecRuntime *unit_get_exec_runtime(Unit *u) _pure_;
+ExecRuntime* unit_get_exec_runtime(const Unit *u) _pure_;
+CGroupRuntime* unit_get_cgroup_runtime(const Unit *u) _pure_;
 
 int unit_setup_exec_runtime(Unit *u);
+CGroupRuntime* unit_setup_cgroup_runtime(Unit *u);
 
 const char* unit_escape_setting(const char *s, UnitWriteFlags flags, char **buf);
 char* unit_concat_strv(char **l, UnitWriteFlags flags);
@@ -982,11 +969,11 @@ char* unit_concat_strv(char **l, UnitWriteFlags flags);
 int unit_write_setting(Unit *u, UnitWriteFlags flags, const char *name, const char *data);
 int unit_write_settingf(Unit *u, UnitWriteFlags mode, const char *name, const char *format, ...) _printf_(4,5);
 
-int unit_kill_context(Unit *u, KillContext *c, KillOperation k, pid_t main_pid, pid_t control_pid, bool main_pid_alien);
+int unit_kill_context(Unit *u, KillOperation k);
 
 int unit_make_transient(Unit *u);
 
-int unit_require_mounts_for(Unit *u, const char *path, UnitDependencyMask mask);
+int unit_add_mounts_for(Unit *u, const char *path, UnitDependencyMask mask, UnitMountDependencyType type);
 
 bool unit_type_supported(UnitType t);
 
@@ -996,11 +983,15 @@ bool unit_is_unneeded(Unit *u);
 bool unit_is_upheld_by_active(Unit *u, Unit **ret_culprit);
 bool unit_is_bound_by_inactive(Unit *u, Unit **ret_culprit);
 
-pid_t unit_control_pid(Unit *u);
-pid_t unit_main_pid(Unit *u);
+PidRef* unit_control_pid(Unit *u);
+PidRef* unit_main_pid_full(Unit *u, bool *ret_is_alien);
+static inline PidRef* unit_main_pid(Unit *u) {
+        return unit_main_pid_full(u, NULL);
+}
 
 void unit_warn_if_dir_nonempty(Unit *u, const char* where);
-int unit_fail_if_noncanonical(Unit *u, const char* where);
+int unit_log_noncanonical_mount_path(Unit *u, const char *where);
+int unit_fail_if_noncanonical_mount_path(Unit *u, const char* where);
 
 int unit_test_start_limit(Unit *u);
 
@@ -1012,36 +1003,33 @@ void unit_notify_user_lookup(Unit *u, uid_t uid, gid_t gid);
 int unit_set_invocation_id(Unit *u, sd_id128_t id);
 int unit_acquire_invocation_id(Unit *u);
 
-bool unit_shall_confirm_spawn(Unit *u);
-
 int unit_set_exec_params(Unit *s, ExecParameters *p);
 
-int unit_fork_helper_process(Unit *u, const char *name, pid_t *ret);
-int unit_fork_and_watch_rm_rf(Unit *u, char **paths, pid_t *ret_pid);
+int unit_fork_helper_process(Unit *u, const char *name, bool into_cgroup, PidRef *ret);
+int unit_fork_and_watch_rm_rf(Unit *u, char **paths, PidRef *ret);
 
 void unit_remove_dependencies(Unit *u, UnitDependencyMask mask);
 
 void unit_export_state_files(Unit *u);
 void unit_unlink_state_files(Unit *u);
 
+int unit_set_debug_invocation(Unit *u, bool enable);
+
 int unit_prepare_exec(Unit *u);
 
-int unit_log_leftover_process_start(pid_t pid, int sig, void *userdata);
-int unit_log_leftover_process_stop(pid_t pid, int sig, void *userdata);
-int unit_warn_leftover_processes(Unit *u, cg_kill_log_func_t log_func);
+int unit_warn_leftover_processes(Unit *u, bool start);
 
 bool unit_needs_console(Unit *u);
 
-int unit_pid_attachable(Unit *unit, pid_t pid, sd_bus_error *error);
+int unit_pid_attachable(Unit *unit, PidRef *pid, sd_bus_error *error);
 
 static inline bool unit_has_job_type(Unit *u, JobType type) {
         return u && u->job && u->job->type == type;
 }
 
-static inline bool unit_log_level_test(const Unit *u, int level) {
-        ExecContext *ec = unit_get_exec_context(u);
-        return !ec || ec->log_level_max < 0 || ec->log_level_max >= LOG_PRI(level);
-}
+int unit_get_log_level_max(const Unit *u);
+
+bool unit_log_level_test(const Unit *u, int level);
 
 /* unit_log_skip is for cases like ExecCondition= where a unit is considered "done"
  * after some execution, rather than succeeded or failed. */
@@ -1063,21 +1051,40 @@ int unit_failure_action_exit_status(Unit *u);
 
 int unit_test_trigger_loaded(Unit *u);
 
-void unit_destroy_runtime_data(Unit *u, const ExecContext *context);
+void unit_destroy_runtime_data(Unit *u, const ExecContext *context, bool destroy_runtime_dir);
 int unit_clean(Unit *u, ExecCleanMask mask);
 int unit_can_clean(Unit *u, ExecCleanMask *ret_mask);
 
-bool unit_can_freeze(Unit *u);
-int unit_freeze(Unit *u);
-void unit_frozen(Unit *u);
+bool unit_can_start_refuse_manual(Unit *u);
+bool unit_can_stop_refuse_manual(Unit *u);
+bool unit_can_isolate_refuse_manual(Unit *u);
 
-int unit_thaw(Unit *u);
-void unit_thawed(Unit *u);
+bool unit_can_freeze(const Unit *u);
+int unit_freezer_action(Unit *u, FreezerAction action);
+void unit_next_freezer_state(Unit *u, FreezerAction action, FreezerState *ret_next, FreezerState *ret_objective);
+void unit_set_freezer_state(Unit *u, FreezerState state);
+void unit_freezer_complete(Unit *u, FreezerState kernel_state);
 
-int unit_freeze_vtable_common(Unit *u);
-int unit_thaw_vtable_common(Unit *u);
+int unit_can_live_mount(Unit *u, sd_bus_error *error);
+int unit_live_mount(Unit *u, const char *src, const char *dst, sd_bus_message *message, MountInNamespaceFlags flags, const MountOptions *options, sd_bus_error *error);
 
 Condition *unit_find_failed_condition(Unit *u);
+
+int unit_arm_timer(Unit *u, sd_event_source **source, bool relative, usec_t usec, sd_event_time_handler_t handler);
+
+bool unit_passes_filter(Unit *u, char * const *states, char * const *patterns);
+
+int unit_compare_priority(Unit *a, Unit *b);
+
+const char* unit_log_field(const Unit *u);
+const char* unit_invocation_log_field(const Unit *u);
+
+UnitMountDependencyType unit_mount_dependency_type_from_string(const char *s) _const_;
+const char* unit_mount_dependency_type_to_string(UnitMountDependencyType t) _const_;
+UnitDependency unit_mount_dependency_type_to_dependency_type(UnitMountDependencyType t) _pure_;
+
+const char* oom_policy_to_string(OOMPolicy i) _const_;
+OOMPolicy oom_policy_from_string(const char *s) _pure_;
 
 /* Macros which append UNIT= or USER_UNIT= to the message */
 
@@ -1085,15 +1092,12 @@ Condition *unit_find_failed_condition(Unit *u);
         ({                                                              \
                 const Unit *_u = (unit);                                \
                 const int _l = (level);                                 \
-                bool _do_log = !(log_get_max_level() < LOG_PRI(_l) ||   \
-                        (_u && !unit_log_level_test(_u, _l)));          \
-                const ExecContext *_c = _do_log && _u ?                 \
-                        unit_get_exec_context(_u) : NULL;               \
+                LOG_CONTEXT_SET_LOG_LEVEL(unit_get_log_level_max(_u));  \
+                const ExecContext *_c = _u ? unit_get_exec_context(_u) : NULL; \
                 LOG_CONTEXT_PUSH_IOV(_c ? _c->log_extra_fields : NULL,  \
                                      _c ? _c->n_log_extra_fields : 0);  \
-                !_do_log ? -ERRNO_VALUE(error) :                        \
-                        _u ? log_object_internal(_l, error, PROJECT_FILE, __LINE__, __func__, _u->manager->unit_log_field, _u->id, _u->manager->invocation_log_field, _u->invocation_id_string, ##__VA_ARGS__) : \
-                                log_internal(_l, error, PROJECT_FILE, __LINE__, __func__, ##__VA_ARGS__); \
+                _u ? log_object_internal(_l, error, PROJECT_FILE, __LINE__, __func__,  unit_log_field(_u), _u->id, unit_invocation_log_field(_u), _u->invocation_id_string, ##__VA_ARGS__) : \
+                     log_internal(_l, error, PROJECT_FILE, __LINE__, __func__, ##__VA_ARGS__); \
         })
 
 #define log_unit_full_errno(unit, level, error, ...) \
@@ -1129,14 +1133,11 @@ Condition *unit_find_failed_condition(Unit *u);
         ({                                                              \
                 const Unit *_u = (unit);                                \
                 const int _l = (level);                                 \
-                bool _do_log = unit_log_level_test(_u, _l);             \
-                const ExecContext *_c = _do_log && _u ?                 \
-                        unit_get_exec_context(_u) : NULL;               \
+                LOG_CONTEXT_SET_LOG_LEVEL(unit_get_log_level_max(_u));  \
+                const ExecContext *_c = _u ? unit_get_exec_context(_u) : NULL; \
                 LOG_CONTEXT_PUSH_IOV(_c ? _c->log_extra_fields : NULL,  \
                                      _c ? _c->n_log_extra_fields : 0);  \
-                _do_log ?                                               \
-                        log_struct_errno(_l, error, __VA_ARGS__, LOG_UNIT_ID(_u)) : \
-                        -ERRNO_VALUE(error);                            \
+                log_struct_errno(_l, error, __VA_ARGS__, LOG_UNIT_ID(_u)); \
         })
 
 #define log_unit_struct(unit, level, ...) log_unit_struct_errno(unit, level, 0, __VA_ARGS__)
@@ -1145,22 +1146,19 @@ Condition *unit_find_failed_condition(Unit *u);
         ({                                                              \
                 const Unit *_u = (unit);                                \
                 const int _l = (level);                                 \
-                bool _do_log = unit_log_level_test(_u, _l);             \
-                const ExecContext *_c = _do_log && _u ?                 \
-                        unit_get_exec_context(_u) : NULL;               \
+                LOG_CONTEXT_SET_LOG_LEVEL(unit_get_log_level_max(_u));  \
+                const ExecContext *_c = _u ? unit_get_exec_context(_u) : NULL; \
                 LOG_CONTEXT_PUSH_IOV(_c ? _c->log_extra_fields : NULL,  \
                                      _c ? _c->n_log_extra_fields : 0);  \
-                _do_log ?                                               \
-                        log_struct_iovec_errno(_l, error, iovec, n_iovec) : \
-                        -ERRNO_VALUE(error);                            \
+                log_struct_iovec_errno(_l, error, iovec, n_iovec);      \
         })
 
 #define log_unit_struct_iovec(unit, level, iovec, n_iovec) log_unit_struct_iovec_errno(unit, level, 0, iovec, n_iovec)
 
 /* Like LOG_MESSAGE(), but with the unit name prefixed. */
 #define LOG_UNIT_MESSAGE(unit, fmt, ...) LOG_MESSAGE("%s: " fmt, (unit)->id, ##__VA_ARGS__)
-#define LOG_UNIT_ID(unit) (unit)->manager->unit_log_format_string, (unit)->id
-#define LOG_UNIT_INVOCATION_ID(unit) (unit)->manager->invocation_log_format_string, (unit)->invocation_id_string
+#define LOG_UNIT_ID(unit) LOG_ITEM("%s%s", unit_log_field((unit)), (unit)->id)
+#define LOG_UNIT_INVOCATION_ID(unit) LOG_ITEM("%s%s", unit_invocation_log_field((unit)), (unit)->invocation_id_string)
 
 const char* collect_mode_to_string(CollectMode m) _const_;
 CollectMode collect_mode_from_string(const char *s) _pure_;
@@ -1168,26 +1166,43 @@ CollectMode collect_mode_from_string(const char *s) _pure_;
 typedef struct UnitForEachDependencyData {
         /* Stores state for the FOREACH macro below for iterating through all deps that have any of the
          * specified dependency atom bits set */
+        const Unit *unit;
         UnitDependencyAtom match_atom;
         Hashmap *by_type, *by_unit;
         void *current_type;
         Iterator by_type_iterator, by_unit_iterator;
         Unit **current_unit;
+        uint64_t generation;
+        unsigned n_restart;
+        bool restart_on_generation_change;
 } UnitForEachDependencyData;
+
+/* Let's not restart the loop infinitely. */
+#define MAX_FOREACH_DEPENDENCY_RESTART 100000
 
 /* Iterates through all dependencies that have a specific atom in the dependency type set. This tries to be
  * smart: if the atom is unique, we'll directly go to right entry. Otherwise we'll iterate through the
  * per-dependency type hashmap and match all dep that have the right atom set. */
-#define _UNIT_FOREACH_DEPENDENCY(other, u, ma, data)                    \
+#define _UNIT_FOREACH_DEPENDENCY(other, u, ma, restart, data)           \
         for (UnitForEachDependencyData data = {                         \
+                        .unit = (u),                                    \
                         .match_atom = (ma),                             \
-                        .by_type = (u)->dependencies,                   \
-                        .by_type_iterator = ITERATOR_FIRST,             \
                         .current_unit = &(other),                       \
+                        .restart_on_generation_change = (restart),      \
                 };                                                      \
              ({                                                         \
                      UnitDependency _dt = _UNIT_DEPENDENCY_INVALID;     \
                      bool _found;                                       \
+                                                                        \
+                     if (data.generation == 0 ||                        \
+                         (data.restart_on_generation_change &&          \
+                          data.generation != data.unit->dependency_generation)) { \
+                             data.generation = data.unit->dependency_generation; \
+                             data.by_type = data.unit->dependencies;    \
+                             data.by_type_iterator = ITERATOR_FIRST;    \
+                             assert_se(data.n_restart++ < MAX_FOREACH_DEPENDENCY_RESTART); \
+                     } else                                             \
+                             assert(data.generation == data.unit->dependency_generation); \
                                                                         \
                      if (data.by_type && ITERATOR_IS_FIRST(data.by_type_iterator)) { \
                              _dt = unit_dependency_from_unique_atom(data.match_atom); \
@@ -1201,12 +1216,13 @@ typedef struct UnitForEachDependencyData {
                      if (_dt < 0)                                       \
                              _found = hashmap_iterate(data.by_type,     \
                                                       &data.by_type_iterator, \
-                                                      (void**)&(data.by_unit), \
+                                                      (void**) &(data.by_unit), \
                                                       (const void**) &(data.current_type)); \
                      _found;                                            \
              }); )                                                      \
                 if ((unit_dependency_to_atom(UNIT_DEPENDENCY_FROM_PTR(data.current_type)) & data.match_atom) != 0) \
                         for (data.by_unit_iterator = ITERATOR_FIRST;    \
+                             data.generation == data.unit->dependency_generation && \
                                 hashmap_iterate(data.by_unit,           \
                                                 &data.by_unit_iterator, \
                                                 NULL,                   \
@@ -1214,14 +1230,17 @@ typedef struct UnitForEachDependencyData {
 
 /* Note: this matches deps that have *any* of the atoms specified in match_atom set */
 #define UNIT_FOREACH_DEPENDENCY(other, u, match_atom) \
-        _UNIT_FOREACH_DEPENDENCY(other, u, match_atom, UNIQ_T(data, UNIQ))
+        _UNIT_FOREACH_DEPENDENCY(other, u, match_atom, false, UNIQ_T(data, UNIQ))
+#define UNIT_FOREACH_DEPENDENCY_SAFE(other, u, match_atom) \
+        _UNIT_FOREACH_DEPENDENCY(other, u, match_atom, true, UNIQ_T(data, UNIQ))
 
-#define _LOG_CONTEXT_PUSH_UNIT(unit, u, c)                                                      \
-        const Unit *u = (unit);                                                                 \
-        const ExecContext *c = unit_get_exec_context(u);                                        \
-        LOG_CONTEXT_PUSH_KEY_VALUE(u->manager->unit_log_field, u->id);                          \
-        LOG_CONTEXT_PUSH_KEY_VALUE(u->manager->invocation_log_field, u->invocation_id_string);  \
-        LOG_CONTEXT_PUSH_IOV(c ? c->log_extra_fields : NULL, c ? c->n_log_extra_fields : 0)
+#define _LOG_CONTEXT_PUSH_UNIT(unit, u, c)                                                              \
+        const Unit *u = (unit);                                                                         \
+        const ExecContext *c = unit_get_exec_context(u);                                                \
+        LOG_CONTEXT_PUSH_KEY_VALUE(unit_log_field(u), u->id);                                           \
+        LOG_CONTEXT_PUSH_KEY_VALUE(unit_invocation_log_field(u), u->invocation_id_string);              \
+        LOG_CONTEXT_PUSH_IOV(c ? c->log_extra_fields : NULL, c ? c->n_log_extra_fields : 0);            \
+        LOG_CONTEXT_SET_LOG_LEVEL(unit_get_log_level_max(u))
 
 #define LOG_CONTEXT_PUSH_UNIT(unit) \
         _LOG_CONTEXT_PUSH_UNIT(unit, UNIQ_T(u, UNIQ), UNIQ_T(c, UNIQ))

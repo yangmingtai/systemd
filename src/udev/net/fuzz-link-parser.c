@@ -1,7 +1,6 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include "fd-util.h"
-#include "fs-util.h"
 #include "fuzz.h"
 #include "link-config.h"
 #include "tmpfile-util.h"
@@ -14,8 +13,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         if (outside_size_range(size, 0, 65536))
                 return 0;
 
-        if (!getenv("SYSTEMD_LOG_LEVEL"))
-                log_set_max_level(LOG_CRIT);
+        fuzz_setup_logging();
 
         assert_se(fmkostemp_safe(filename, "r+", &f) == 0);
         if (size != 0)

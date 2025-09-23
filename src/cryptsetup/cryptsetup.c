@@ -1,32 +1,38 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <errno.h>
-#include <mntent.h>
+#include <getopt.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
-#include <sys/types.h>
 #include <unistd.h>
 
 #include "sd-device.h"
+#include "sd-event.h"
+#include "sd-json.h"
 #include "sd-messages.h"
 
 #include "alloc-util.h"
+#include "argv-util.h"
 #include "ask-password-api.h"
+#include "build.h"
 #include "cryptsetup-fido2.h"
 #include "cryptsetup-keyfile.h"
 #include "cryptsetup-pkcs11.h"
 #include "cryptsetup-tpm2.h"
 #include "cryptsetup-util.h"
-#include "device-util.h"
 #include "efi-api.h"
 #include "efi-loader.h"
+#include "efivars.h"
 #include "env-util.h"
+#include "errno-util.h"
 #include "escape.h"
+#include "extract-word.h"
 #include "fileio.h"
 #include "fs-util.h"
 #include "fstab-util.h"
 #include "hexdecoct.h"
+#include "json-util.h"
 #include "libfido2-util.h"
+#include "libmount-util.h"
 #include "log.h"
 #include "main-func.h"
 #include "memory-util.h"
@@ -36,12 +42,14 @@
 #include "path-util.h"
 #include "pkcs11-util.h"
 #include "pretty-print.h"
-#include "process-util.h"
 #include "random-util.h"
 #include "string-table.h"
+#include "string-util.h"
 #include "strv.h"
-#include "tpm-pcr.h"
+#include "time-util.h"
+#include "tpm2-pcr.h"
 #include "tpm2-util.h"
+#include "verbs.h"
 
 /* internal helper */
 #define ANY_LUKS "LUKS"
@@ -58,6 +66,14 @@ typedef enum PassphraseType {
         _PASSPHRASE_TYPE_INVALID = -1,
 } PassphraseType;
 
+typedef enum TokenType {
+        TOKEN_TPM2,
+        TOKEN_FIDO2,
+        TOKEN_PKCS11,
+        _TOKEN_TYPE_MAX,
+        _TOKEN_TYPE_INVALID = -EINVAL,
+} TokenType;
+
 static const char *arg_type = NULL; /* ANY_LUKS, CRYPT_LUKS1, CRYPT_LUKS2, CRYPT_TCRYPT, CRYPT_BITLK or CRYPT_PLAIN */
 static char *arg_cipher = NULL;
 static unsigned arg_key_size = 0;
@@ -72,7 +88,8 @@ static char *arg_header = NULL;
 static unsigned arg_tries = 3;
 static bool arg_readonly = false;
 static bool arg_verify = false;
-static AskPasswordFlags arg_ask_password_flags = 0;
+static bool arg_password_cache_set = false; /* Not the actual argument value, just an indicator that some value is set */
+static AskPasswordFlags arg_ask_password_flags = ASK_PASSWORD_ACCEPT_CACHED | ASK_PASSWORD_PUSH_CACHE;
 static bool arg_discards = false;
 static bool arg_same_cpu_crypt = false;
 static bool arg_submit_from_crypt_cpus = false;
@@ -93,15 +110,22 @@ static bool arg_fido2_device_auto = false;
 static void *arg_fido2_cid = NULL;
 static size_t arg_fido2_cid_size = 0;
 static char *arg_fido2_rp_id = NULL;
+/* For now and for compatibility, if the user explicitly configured FIDO2 support and we do
+ * not read FIDO2 metadata off the LUKS2 header, default to the systemd 248 logic, where we
+ * use PIN + UP when needed, and do not configure UV at all. */
+static Fido2EnrollFlags arg_fido2_manual_flags = FIDO2ENROLL_PIN_IF_NEEDED | FIDO2ENROLL_UP_IF_NEEDED | FIDO2ENROLL_UV_OMIT;
 static char *arg_tpm2_device = NULL; /* These and the following fields are about locking an encrypted volume to the local TPM */
 static bool arg_tpm2_device_auto = false;
 static uint32_t arg_tpm2_pcr_mask = UINT32_MAX;
 static char *arg_tpm2_signature = NULL;
 static bool arg_tpm2_pin = false;
-static bool arg_headless = false;
+static char *arg_tpm2_pcrlock = NULL;
 static usec_t arg_token_timeout_usec = 30*USEC_PER_SEC;
 static unsigned arg_tpm2_measure_pcr = UINT_MAX; /* This and the following field is about measuring the unlocked volume key to the local TPM */
 static char **arg_tpm2_measure_banks = NULL;
+static char *arg_link_keyring = NULL;
+static char *arg_link_key_type = NULL;
+static char *arg_link_key_description = NULL;
 
 STATIC_DESTRUCTOR_REGISTER(arg_cipher, freep);
 STATIC_DESTRUCTOR_REGISTER(arg_hash, freep);
@@ -114,20 +138,28 @@ STATIC_DESTRUCTOR_REGISTER(arg_fido2_rp_id, freep);
 STATIC_DESTRUCTOR_REGISTER(arg_tpm2_device, freep);
 STATIC_DESTRUCTOR_REGISTER(arg_tpm2_signature, freep);
 STATIC_DESTRUCTOR_REGISTER(arg_tpm2_measure_banks, strv_freep);
+STATIC_DESTRUCTOR_REGISTER(arg_tpm2_pcrlock, freep);
+STATIC_DESTRUCTOR_REGISTER(arg_link_keyring, freep);
+STATIC_DESTRUCTOR_REGISTER(arg_link_key_type, freep);
+STATIC_DESTRUCTOR_REGISTER(arg_link_key_description, freep);
 
 static const char* const passphrase_type_table[_PASSPHRASE_TYPE_MAX] = {
-        [PASSPHRASE_REGULAR] = "passphrase",
+        [PASSPHRASE_REGULAR]      = "passphrase",
         [PASSPHRASE_RECOVERY_KEY] = "recovery key",
-        [PASSPHRASE_BOTH] = "passphrase or recovery key",
+        [PASSPHRASE_BOTH]         = "passphrase or recovery key",
 };
 
-const char* passphrase_type_to_string(PassphraseType t);
-PassphraseType passphrase_type_from_string(const char *s);
+DEFINE_PRIVATE_STRING_TABLE_LOOKUP_TO_STRING(passphrase_type, PassphraseType);
 
-DEFINE_STRING_TABLE_LOOKUP(passphrase_type, PassphraseType);
+static const char* const token_type_table[_TOKEN_TYPE_MAX] = {
+        [TOKEN_TPM2]   = "tpm2",
+        [TOKEN_FIDO2]  = "fido2",
+        [TOKEN_PKCS11] = "pkcs11",
+};
+
+DEFINE_PRIVATE_STRING_TABLE_LOOKUP_TO_STRING(token_type, TokenType);
 
 /* Options Debian's crypttab knows we don't:
-
     check=
     checkargs=
     noearly
@@ -234,7 +266,7 @@ static int parse_one_option(const char *option) {
                         return log_oom();
 
         } else if ((val = startswith(option, "header="))) {
-                if (!STR_IN_SET(arg_type, ANY_LUKS, CRYPT_LUKS1, CRYPT_LUKS2, CRYPT_TCRYPT))
+                if (!arg_type || !STR_IN_SET(arg_type, ANY_LUKS, CRYPT_LUKS1, CRYPT_LUKS2, CRYPT_TCRYPT))
                         arg_type = ANY_LUKS;
 
                 if (!path_is_absolute(val))
@@ -271,6 +303,21 @@ static int parse_one_option(const char *option) {
 
                         SET_FLAG(arg_ask_password_flags, ASK_PASSWORD_ECHO, r);
                         SET_FLAG(arg_ask_password_flags, ASK_PASSWORD_SILENT, !r);
+                }
+        } else if ((val = startswith(option, "password-cache="))) {
+                arg_password_cache_set = true;
+
+                if (streq(val, "read-only")) {
+                        arg_ask_password_flags |= ASK_PASSWORD_ACCEPT_CACHED;
+                        arg_ask_password_flags &= ~ASK_PASSWORD_PUSH_CACHE;
+                } else {
+                        r = parse_boolean(val);
+                        if (r < 0) {
+                                log_warning_errno(r, "Invalid password-cache= option \"%s\", ignoring.", val);
+                                return 0;
+                        }
+
+                        SET_FLAG(arg_ask_password_flags, ASK_PASSWORD_ACCEPT_CACHED|ASK_PASSWORD_PUSH_CACHE, r);
                 }
         } else if (STR_IN_SET(option, "allow-discards", "discard"))
                 arg_discards = true;
@@ -335,7 +382,7 @@ static int parse_one_option(const char *option) {
                         arg_pkcs11_uri_auto = true;
                 } else {
                         if (!pkcs11_uri_valid(val))
-                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "pkcs11-uri= parameter expects a PKCS#11 URI, refusing");
+                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "pkcs11-uri= parameter expects a PKCS#11 URI, refusing.");
 
                         r = free_and_strdup(&arg_pkcs11_uri, val);
                         if (r < 0)
@@ -365,7 +412,7 @@ static int parse_one_option(const char *option) {
                         _cleanup_free_ void *cid = NULL;
                         size_t cid_size;
 
-                        r = unbase64mem(val, SIZE_MAX, &cid, &cid_size);
+                        r = unbase64mem(val, &cid, &cid_size);
                         if (r < 0)
                                 return log_error_errno(r, "Failed to decode FIDO2 CID data: %m");
 
@@ -384,6 +431,39 @@ static int parse_one_option(const char *option) {
                 if (r < 0)
                         return log_oom();
 
+        } else if ((val = startswith(option, "fido2-pin="))) {
+
+                r = parse_boolean(val);
+                if (r < 0) {
+                        log_warning_errno(r, "Failed to parse %s, ignoring: %m", option);
+                        return 0;
+                }
+
+                arg_fido2_manual_flags &= ~FIDO2ENROLL_PIN_IF_NEEDED;
+                SET_FLAG(arg_fido2_manual_flags, FIDO2ENROLL_PIN, r);
+
+        } else if ((val = startswith(option, "fido2-up="))) {
+
+                r = parse_boolean(val);
+                if (r < 0) {
+                        log_warning_errno(r, "Failed to parse %s, ignoring: %m", option);
+                        return 0;
+                }
+
+                arg_fido2_manual_flags &= ~FIDO2ENROLL_UP_IF_NEEDED;
+                SET_FLAG(arg_fido2_manual_flags, FIDO2ENROLL_UP, r);
+
+        } else if ((val = startswith(option, "fido2-uv="))) {
+
+                r = parse_boolean(val);
+                if (r < 0) {
+                        log_warning_errno(r, "Failed to parse %s, ignoring: %m", option);
+                        return 0;
+                }
+
+                arg_fido2_manual_flags &= ~FIDO2ENROLL_UV_OMIT;
+                SET_FLAG(arg_fido2_manual_flags, FIDO2ENROLL_UV, r);
+
         } else if ((val = startswith(option, "tpm2-device="))) {
 
                 if (streq(val, "auto")) {
@@ -399,7 +479,7 @@ static int parse_one_option(const char *option) {
 
         } else if ((val = startswith(option, "tpm2-pcrs="))) {
 
-                r = tpm2_parse_pcr_argument(val, &arg_tpm2_pcr_mask);
+                r = tpm2_parse_pcr_argument_to_mask(val, &arg_tpm2_pcr_mask);
                 if (r < 0)
                         return r;
 
@@ -423,6 +503,16 @@ static int parse_one_option(const char *option) {
 
                 arg_tpm2_pin = r;
 
+        } else if ((val = startswith(option, "tpm2-pcrlock="))) {
+
+                if (!path_is_absolute(val))
+                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                               "TPM2 pcrlock policy path \"%s\" is not absolute, refusing.", val);
+
+                r = free_and_strdup(&arg_tpm2_pcrlock, val);
+                if (r < 0)
+                        return log_oom();
+
         } else if ((val = startswith(option, "tpm2-measure-pcr="))) {
                 unsigned pcr;
 
@@ -430,12 +520,12 @@ static int parse_one_option(const char *option) {
                 if (r < 0) {
                         r = parse_boolean(val);
                         if (r < 0) {
-                                log_error_errno(r, "Failed to parse %s, ignoring: %m", option);
+                                log_warning_errno(r, "Failed to parse %s, ignoring: %m", option);
                                 return 0;
                         }
 
-                        pcr = r ? TPM_PCR_INDEX_VOLUME_KEY : UINT_MAX;
-                } else if (!TPM2_PCR_VALID(pcr)) {
+                        pcr = r ? TPM2_PCR_SYSTEM_IDENTITY : UINT_MAX;
+                } else if (!TPM2_PCR_INDEX_VALID(pcr)) {
                         log_warning("Selected TPM index for measurement %u outside of allowed range 0…%u, ignoring.", pcr, TPM2_PCRS_MAX-1);
                         return 0;
                 }
@@ -447,7 +537,7 @@ static int parse_one_option(const char *option) {
 #if HAVE_OPENSSL
                 _cleanup_strv_free_ char **l = NULL;
 
-                l = strv_split(optarg, ":");
+                l = strv_split(val, ":");
                 if (!l)
                         return log_oom();
 
@@ -485,9 +575,9 @@ static int parse_one_option(const char *option) {
                         return 0;
                 }
 
-                arg_headless = r;
+                SET_FLAG(arg_ask_password_flags, ASK_PASSWORD_HEADLESS, r);
         } else if (streq(option, "headless"))
-                arg_headless = true;
+                arg_ask_password_flags |= ASK_PASSWORD_HEADLESS;
 
         else if ((val = startswith(option, "token-timeout="))) {
 
@@ -495,13 +585,66 @@ static int parse_one_option(const char *option) {
                 if (r < 0)
                         log_warning_errno(r, "Failed to parse %s, ignoring: %m", option);
 
+        } else if ((val = startswith(option, "link-volume-key="))) {
+#if HAVE_CRYPT_SET_KEYRING_TO_LINK
+                _cleanup_free_ char *keyring = NULL, *key_type = NULL, *key_description = NULL;
+                const char *sep;
+
+                /* Stick with cryptsetup --link-vk-to-keyring format
+                 * <keyring_description>::%<key_type>:<key_description>,
+                 * where %<key_type> is optional and defaults to 'user'.
+                 */
+                sep = strstr(val, "::");
+                if (!sep)
+                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Failed to parse link-volume-key= option value: %s", val);
+
+                /* cryptsetup (cli) supports <keyring_description> passed in various formats:
+                 * - well-known keyrings prefixed with '@' (@u user, @s session, etc)
+                 * - text descriptions prefixed with "%:" or "%keyring:".
+                 * - text description with no prefix.
+                 * - numeric keyring id (ignored in current patch set). */
+                keyring = strndup(val, sep - val);
+                if (!keyring)
+                        return log_oom();
+
+                /* add type prefix if missing (crypt_set_keyring_to_link() expects it) */
+                if (!IN_SET(*keyring, '@', '%'))
+                        if (!strprepend(&keyring, "%:"))
+                                return log_oom();
+
+                sep += 2;
+
+                /* %<key_type> is optional (and defaults to 'user') */
+                if (*sep == '%') {
+                        /* must be separated by colon */
+                        const char *c = strchr(sep, ':');
+                        if (!c)
+                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Failed to parse link-volume-key= option value: %s", val);
+
+                        key_type = strndup(sep + 1, c - sep - 1);
+                        if (!key_type)
+                                return log_oom();
+
+                        sep = c + 1;
+                }
+
+                key_description = strdup(sep);
+                if (!key_description)
+                        return log_oom();
+
+                free_and_replace(arg_link_keyring, keyring);
+                free_and_replace(arg_link_key_type, key_type);
+                free_and_replace(arg_link_key_description, key_description);
+#else
+                log_error("Build lacks libcryptsetup support for linking volume keys in user specified kernel keyrings upon device activation, ignoring: %s", option);
+#endif
         } else if (!streq(option, "x-initrd.attach"))
                 log_warning("Encountered unknown /etc/crypttab option '%s', ignoring.", option);
 
         return 0;
 }
 
-static int parse_options(const char *options) {
+static int parse_crypt_config(const char *options) {
         assert(options);
 
         for (;;) {
@@ -525,6 +668,17 @@ static int parse_options(const char *options) {
                       log_warning("offset= ignored with type %s", arg_type);
                 if (arg_skip != 0)
                       log_warning("skip= ignored with type %s", arg_type);
+        }
+
+        if (arg_pkcs11_uri || arg_pkcs11_uri_auto) {
+                /* If password-cache was not configured explicitly, default to no cache for PKCS#11 */
+                if (!arg_password_cache_set)
+                        arg_ask_password_flags &= ~(ASK_PASSWORD_ACCEPT_CACHED|ASK_PASSWORD_PUSH_CACHE);
+
+                /* This prevents future backward-compatibility issues if we decide to allow caching for PKCS#11 */
+                if (FLAGS_SET(arg_ask_password_flags, ASK_PASSWORD_ACCEPT_CACHED))
+                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                               "Password cache is not supported for PKCS#11 security tokens.");
         }
 
         return 0;
@@ -578,26 +732,37 @@ static char* disk_description(const char *path) {
         return NULL;
 }
 
-static char *disk_mount_point(const char *label) {
+static char* disk_mount_point(const char *label) {
+        _cleanup_(mnt_free_tablep) struct libmnt_table *table = NULL;
+        _cleanup_(mnt_free_iterp) struct libmnt_iter *iter = NULL;
         _cleanup_free_ char *device = NULL;
-        _cleanup_endmntent_ FILE *f = NULL;
-        struct mntent *m;
+        int r;
 
         /* Yeah, we don't support native systemd unit files here for now */
+
+        assert(label);
 
         device = strjoin("/dev/mapper/", label);
         if (!device)
                 return NULL;
 
-        f = setmntent(fstab_path(), "re");
-        if (!f)
+        r = libmount_parse_fstab(&table, &iter);
+        if (r < 0)
                 return NULL;
 
-        while ((m = getmntent(f)))
-                if (path_equal(m->mnt_fsname, device))
-                        return strdup(m->mnt_dir);
+        for (;;) {
+                struct libmnt_fs *fs;
 
-        return NULL;
+                r = mnt_table_next_fs(table, iter, &fs);
+                if (r != 0)
+                        return NULL;
+
+                if (path_equal(mnt_fs_get_source(fs), device)) {
+                        const char *target = mnt_fs_get_target(fs);
+                        if (target)
+                                return strdup(target);
+                }
+        }
 }
 
 static char *friendly_disk_name(const char *src, const char *vol) {
@@ -652,9 +817,9 @@ static PassphraseType check_registered_passwords(struct crypt_device *cd) {
 
         /* Iterate all LUKS2 tokens and keep track of all their slots */
         for (int token = 0; token < sym_crypt_token_max(CRYPT_LUKS2); token++) {
-                _cleanup_(json_variant_unrefp) JsonVariant *v = NULL;
+                _cleanup_(sd_json_variant_unrefp) sd_json_variant *v = NULL;
                 const char *type;
-                JsonVariant *w, *z;
+                sd_json_variant *w, *z;
                 int tk;
 
                 tk = cryptsetup_get_token_as_json(cd, token, NULL, &v);
@@ -665,21 +830,21 @@ static PassphraseType check_registered_passwords(struct crypt_device *cd) {
                         continue;
                 }
 
-                w = json_variant_by_key(v, "type");
-                if (!w || !json_variant_is_string(w)) {
+                w = sd_json_variant_by_key(v, "type");
+                if (!w || !sd_json_variant_is_string(w)) {
                         log_warning("Token JSON data lacks type field, ignoring.");
                         continue;
                 }
 
-                type = json_variant_string(w);
+                type = sd_json_variant_string(w);
                 if (STR_IN_SET(type, "systemd-recovery", "systemd-pkcs11", "systemd-fido2", "systemd-tpm2")) {
 
                         /* At least exists one recovery key */
                         if (streq(type, "systemd-recovery"))
                                 passphrase_type |= PASSPHRASE_RECOVERY_KEY;
 
-                        w = json_variant_by_key(v, "keyslots");
-                        if (!w || !json_variant_is_array(w)) {
+                        w = sd_json_variant_by_key(v, "keyslots");
+                        if (!w || !sd_json_variant_is_array(w)) {
                                 log_warning("Token JSON data lacks keyslots field, ignoring.");
                                 continue;
                         }
@@ -688,12 +853,12 @@ static PassphraseType check_registered_passwords(struct crypt_device *cd) {
                                 unsigned u;
                                 int at;
 
-                                if (!json_variant_is_string(z)) {
+                                if (!sd_json_variant_is_string(z)) {
                                         log_warning("Token JSON data's keyslot field is not an array of strings, ignoring.");
                                         continue;
                                 }
 
-                                at = safe_atou(json_variant_string(z), &u);
+                                at = safe_atou(sd_json_variant_string(z), &u);
                                 if (at < 0) {
                                         log_warning_errno(at, "Token JSON data's keyslot field is not an integer formatted as string, ignoring.");
                                         continue;
@@ -725,21 +890,20 @@ static int get_password(
                 const char *vol,
                 const char *src,
                 usec_t until,
-                bool accept_cached,
+                bool ignore_cached,
                 PassphraseType passphrase_type,
                 char ***ret) {
 
-        _cleanup_free_ char *friendly = NULL, *text = NULL, *disk_path = NULL;
+        _cleanup_free_ char *friendly = NULL, *text = NULL, *disk_path = NULL, *id = NULL;
         _cleanup_strv_free_erase_ char **passwords = NULL;
-        char *id;
-        int r = 0;
-        AskPasswordFlags flags = arg_ask_password_flags | ASK_PASSWORD_PUSH_CACHE;
+        AskPasswordFlags flags = arg_ask_password_flags;
+        int r;
 
         assert(vol);
         assert(src);
         assert(ret);
 
-        if (arg_headless)
+        if (FLAGS_SET(arg_ask_password_flags, ASK_PASSWORD_HEADLESS))
                 return log_error_errno(SYNTHETIC_ERRNO(ENOPKG), "Password querying disabled via 'headless' option.");
 
         friendly = friendly_disk_name(src, vol);
@@ -753,11 +917,25 @@ static int get_password(
         if (!disk_path)
                 return log_oom();
 
-        id = strjoina("cryptsetup:", disk_path);
+        id = strjoin("cryptsetup:", disk_path);
+        if (!id)
+                return log_oom();
 
-        r = ask_password_auto(text, "drive-harddisk", id, "cryptsetup", "cryptsetup.passphrase", until,
-                              flags | (accept_cached*ASK_PASSWORD_ACCEPT_CACHED),
-                              &passwords);
+        AskPasswordRequest req = {
+                .tty_fd = -EBADF,
+                .message = text,
+                .icon = "drive-harddisk",
+                .id = id,
+                .keyring = "cryptsetup",
+                .credential = "cryptsetup.passphrase",
+                .until = until,
+                .hup_fd = -EBADF,
+        };
+
+        if (ignore_cached)
+                flags &= ~ASK_PASSWORD_ACCEPT_CACHED;
+
+        r = ask_password_auto(&req, flags, &passwords);
         if (r < 0)
                 return log_error_errno(r, "Failed to query password: %m");
 
@@ -766,12 +944,19 @@ static int get_password(
 
                 assert(strv_length(passwords) == 1);
 
+                text = mfree(text);
                 if (asprintf(&text, "Please enter %s for disk %s (verification):", passphrase_type_to_string(passphrase_type), friendly) < 0)
                         return log_oom();
 
-                id = strjoina("cryptsetup-verification:", disk_path);
+                free(id);
+                id = strjoin("cryptsetup-verification:", disk_path);
+                if (!id)
+                        return log_oom();
 
-                r = ask_password_auto(text, "drive-harddisk", id, "cryptsetup", "cryptsetup.passphrase", until, flags, &passwords2);
+                req.message = text;
+                req.id = id;
+
+                r = ask_password_auto(&req, flags, &passwords2);
                 if (r < 0)
                         return log_error_errno(r, "Failed to query verification password: %m");
 
@@ -823,7 +1008,7 @@ static int measure_volume_key(
                 return 0;
         }
 
-        r = efi_stub_measured(LOG_WARNING);
+        r = efi_measured_uki(LOG_WARNING);
         if (r < 0)
                 return r;
         if (r == 0) {
@@ -832,12 +1017,8 @@ static int measure_volume_key(
         }
 
 #if HAVE_TPM2
-        r = dlopen_tpm2();
-        if (r < 0)
-                return log_error_errno(r, "Failed to load TPM2 libraries: %m");
-
-        _cleanup_tpm2_context_ Tpm2Context *c = NULL;
-        r = tpm2_context_new(arg_tpm2_device, &c);
+        _cleanup_(tpm2_context_unrefp) Tpm2Context *c = NULL;
+        r = tpm2_context_new_or_warn(arg_tpm2_device, &c);
         if (r < 0)
                 return r;
 
@@ -845,7 +1026,7 @@ static int measure_volume_key(
         if (strv_isempty(arg_tpm2_measure_banks)) {
                 r = tpm2_get_good_pcr_banks_strv(c, UINT32_C(1) << arg_tpm2_measure_pcr, &l);
                 if (r < 0)
-                        return r;
+                        return log_error_errno(r, "Could not verify pcr banks: %m");
         }
 
         _cleanup_free_ char *joined = strv_join(l ?: arg_tpm2_measure_banks, ", ");
@@ -866,21 +1047,28 @@ static int measure_volume_key(
         if (!s)
                 return log_oom();
 
-        r = tpm2_extend_bytes(c, l ?: arg_tpm2_measure_banks, arg_tpm2_measure_pcr, s, SIZE_MAX, volume_key, volume_key_size);
+        r = tpm2_extend_bytes(c, l ?: arg_tpm2_measure_banks, arg_tpm2_measure_pcr, s, SIZE_MAX, volume_key, volume_key_size, TPM2_EVENT_VOLUME_KEY, s);
         if (r < 0)
-                return r;
+                return log_error_errno(r, "Could not extend PCR: %m");
 
         log_struct(LOG_INFO,
-                   "MESSAGE_ID=" SD_MESSAGE_TPM_PCR_EXTEND_STR,
+                   LOG_MESSAGE_ID(SD_MESSAGE_TPM_PCR_EXTEND_STR),
                    LOG_MESSAGE("Successfully extended PCR index %u with '%s' and volume key (banks %s).", arg_tpm2_measure_pcr, s, joined),
-                   "MEASURING=%s", s,
-                   "PCR=%u", arg_tpm2_measure_pcr,
-                   "BANKS=%s", joined);
+                   LOG_ITEM("MEASURING=%s", s),
+                   LOG_ITEM("PCR=%u", arg_tpm2_measure_pcr),
+                   LOG_ITEM("BANKS=%s", joined));
 
         return 0;
 #else
         return log_error_errno(SYNTHETIC_ERRNO(EOPNOTSUPP), "TPM2 support disabled, not measuring.");
 #endif
+}
+
+static int log_external_activation(int r, const char *volume) {
+        assert(volume);
+
+        log_notice_errno(r, "Volume '%s' has been activated externally while we have been trying to activate it.", volume);
+        return 0;
 }
 
 static int measured_crypt_activate_by_volume_key(
@@ -898,6 +1086,8 @@ static int measured_crypt_activate_by_volume_key(
         /* A wrapper around crypt_activate_by_volume_key() which also measures to a PCR if that's requested. */
 
         r = crypt_activate_by_volume_key(cd, name, volume_key, volume_key_size, flags);
+        if (r == -EEXIST) /* volume is already active */
+                return log_external_activation(r, name);
         if (r < 0)
                 return r;
 
@@ -953,15 +1143,18 @@ static int measured_crypt_activate_by_passphrase(
         return measured_crypt_activate_by_volume_key(cd, name, vk, vks, flags);
 
 shortcut:
-        return crypt_activate_by_passphrase(cd, name, keyslot, passphrase, passphrase_size, flags);
+        r = crypt_activate_by_passphrase(cd, name, keyslot, passphrase, passphrase_size, flags);
+        if (r == -EEXIST) /* volume is already active */
+                return log_external_activation(r, name);
+        return r;
 }
 
 static int attach_tcrypt(
                 struct crypt_device *cd,
                 const char *name,
+                TokenType token_type,
                 const char *key_file,
-                const void *key_data,
-                size_t key_data_size,
+                const struct iovec *key_data,
                 char **passwords,
                 uint32_t flags) {
 
@@ -977,7 +1170,7 @@ static int attach_tcrypt(
         assert(name);
         assert(key_file || key_data || !strv_isempty(passwords));
 
-        if (arg_pkcs11_uri || arg_pkcs11_uri_auto || arg_fido2_device || arg_fido2_device_auto || arg_tpm2_device || arg_tpm2_device_auto)
+        if (token_type >= 0)
                 /* Ask for a regular password */
                 return log_error_errno(SYNTHETIC_ERRNO(EAGAIN),
                                        "Sorry, but tcrypt devices are currently not supported in conjunction with pkcs11/fido2/tpm2 support.");
@@ -990,38 +1183,44 @@ static int attach_tcrypt(
 
         if (arg_tcrypt_veracrypt)
                 params.flags |= CRYPT_TCRYPT_VERA_MODES;
-        
+
         if (arg_tcrypt_veracrypt && arg_tcrypt_veracrypt_pim != 0)
                 params.veracrypt_pim = arg_tcrypt_veracrypt_pim;
 
         if (key_data) {
-                params.passphrase = key_data;
-                params.passphrase_size = key_data_size;
+                params.passphrase = key_data->iov_base;
+                params.passphrase_size = key_data->iov_len;
+                r = crypt_load(cd, CRYPT_TCRYPT, &params);
+        } else if (key_file) {
+                r = read_one_line_file(key_file, &passphrase);
+                if (r < 0) {
+                        log_error_errno(r, "Failed to read password file '%s': %m", key_file);
+                        return -EAGAIN; /* log with the actual error, but return EAGAIN */
+                }
+                params.passphrase = passphrase;
+                params.passphrase_size = strlen(passphrase);
+                r = crypt_load(cd, CRYPT_TCRYPT, &params);
         } else {
-                if (key_file) {
-                        r = read_one_line_file(key_file, &passphrase);
-                        if (r < 0) {
-                                log_error_errno(r, "Failed to read password file '%s': %m", key_file);
-                                return -EAGAIN; /* log with the actual error, but return EAGAIN */
-                        }
-
-                        params.passphrase = passphrase;
-                } else
-                        params.passphrase = passwords[0];
-
-                params.passphrase_size = strlen(params.passphrase);
+                r = -EINVAL;
+                STRV_FOREACH(p, passwords){
+                        params.passphrase = *p;
+                        params.passphrase_size = strlen(*p);
+                        r = crypt_load(cd, CRYPT_TCRYPT, &params);
+                        if (r >= 0)
+                                break;
+                }
         }
 
-        r = crypt_load(cd, CRYPT_TCRYPT, &params);
         if (r < 0) {
                 if (r == -EPERM) {
                         if (key_data)
                                 log_error_errno(r, "Failed to activate using discovered key. (Key not correct?)");
-
-                        if (key_file)
+                        else if (key_file)
                                 log_error_errno(r, "Failed to activate using password file '%s'. (Key data not correct?)", key_file);
+                        else
+                                log_error_errno(r, "Failed to activate using supplied passwords.");
 
-                        return -EAGAIN; /* log the actual error, but return EAGAIN */
+                        return r;
                 }
 
                 return log_error_errno(r, "Failed to load tcrypt superblock on device %s: %m", crypt_get_device_name(cd));
@@ -1034,13 +1233,32 @@ static int attach_tcrypt(
         return 0;
 }
 
-static char *make_bindname(const char *volume) {
-        char *s;
+static char *make_bindname(const char *volume, TokenType token_type) {
+        const char *token_type_name = token_type_to_string(token_type), *suffix;
+        char *bindname;
+        int r;
 
-        if (asprintf(&s, "@%" PRIx64"/cryptsetup/%s", random_u64(), volume) < 0)
+        switch (token_type) {
+
+        case TOKEN_FIDO2:
+                suffix = "-salt";
+                break;
+
+        default:
+                suffix = NULL;
+        }
+
+        r = asprintf(&bindname,
+                     "@%" PRIx64"/cryptsetup%s%s%s/%s",
+                     random_u64(),
+                     token_type_name ? "-" : "",
+                     strempty(token_type_name),
+                     strempty(suffix),
+                     volume);
+        if (r < 0)
                 return NULL;
 
-        return s;
+        return bindname;
 }
 
 static int make_security_device_monitor(
@@ -1054,6 +1272,8 @@ static int make_security_device_monitor(
         assert(ret_monitor);
 
         /* Waits for a device with "security-device" tag to show up in udev */
+        log_debug("Creating device monitor for tag 'security-device' with timeout %s",
+                  FORMAT_TIMESPAN(arg_token_timeout_usec, 1*USEC_PER_SEC));
 
         r = sd_event_default(&event);
         if (r < 0)
@@ -1095,7 +1315,7 @@ static int run_security_device_monitor(
         assert(event);
         assert(monitor);
 
-        /* Runs the event loop for the device monitor until either something happens, or the time-out is
+        /* Runs the event loop for the device monitor until either something happens, or the timeout is
          * hit. */
 
         for (;;) {
@@ -1124,7 +1344,7 @@ static int run_security_device_monitor(
         }
 }
 
-static bool libcryptsetup_plugins_support(void) {
+static bool use_token_plugins(void) {
 
 #if HAVE_TPM2
         /* Currently, there's no way for us to query the volume key when plugins are used. Hence don't use
@@ -1132,6 +1352,10 @@ static bool libcryptsetup_plugins_support(void) {
         if (arg_tpm2_measure_pcr != UINT_MAX)
                 return false;
 #endif
+
+        /* Disable tokens if we're in FIDO2 mode with manual parameters. */
+        if (arg_fido2_cid)
+                return false;
 
 #if HAVE_LIBCRYPTSETUP_PLUGINS
         int r;
@@ -1177,21 +1401,22 @@ static int crypt_activate_by_token_pin_ask_password(
                 const char *name,
                 const char *type,
                 usec_t until,
-                bool headless,
-                void *usrptr,
+                void *userdata,
                 uint32_t activation_flags,
                 const char *message,
-                const char *key_name,
-                const char *credential_name) {
+                const char *keyring,
+                const char *credential) {
 
 #if HAVE_LIBCRYPTSETUP_PLUGINS
-        AskPasswordFlags flags = ASK_PASSWORD_PUSH_CACHE | ASK_PASSWORD_ACCEPT_CACHED;
+        AskPasswordFlags flags = arg_ask_password_flags;
         _cleanup_strv_free_erase_ char **pins = NULL;
         int r;
 
-        r = crypt_activate_by_token_pin(cd, name, type, CRYPT_ANY_TOKEN, NULL, 0, usrptr, activation_flags);
+        r = crypt_activate_by_token_pin(cd, name, type, CRYPT_ANY_TOKEN, /* pin=*/ NULL, /* pin_size= */ 0, userdata, activation_flags);
         if (r > 0) /* returns unlocked keyslot id on success */
-                r = 0;
+                return 0;
+        if (r == -EEXIST) /* volume is already active */
+                return log_external_activation(r, name);
         if (r != -ENOANO) /* needs pin or pin is wrong */
                 return r;
 
@@ -1200,26 +1425,41 @@ static int crypt_activate_by_token_pin_ask_password(
                 return r;
 
         STRV_FOREACH(p, pins) {
-                r = crypt_activate_by_token_pin(cd, name, type, CRYPT_ANY_TOKEN, *p, strlen(*p), usrptr, activation_flags);
+                r = crypt_activate_by_token_pin(cd, name, type, CRYPT_ANY_TOKEN, *p, strlen(*p), userdata, activation_flags);
                 if (r > 0) /* returns unlocked keyslot id on success */
-                        r = 0;
+                        return 0;
+                if (r == -EEXIST) /* volume is already active */
+                        return log_external_activation(r, name);
                 if (r != -ENOANO) /* needs pin or pin is wrong */
                         return r;
         }
 
-        if (headless)
+        if (FLAGS_SET(arg_ask_password_flags, ASK_PASSWORD_HEADLESS))
                 return log_error_errno(SYNTHETIC_ERRNO(ENOPKG), "PIN querying disabled via 'headless' option. Use the '$PIN' environment variable.");
 
         for (;;) {
                 pins = strv_free_erase(pins);
-                r = ask_password_auto(message, "drive-harddisk", NULL, key_name, credential_name, until, flags, &pins);
+
+                AskPasswordRequest req = {
+                        .tty_fd = -EBADF,
+                        .message = message,
+                        .icon = "drive-harddisk",
+                        .keyring = keyring,
+                        .credential = credential,
+                        .until = until,
+                        .hup_fd = -EBADF,
+                };
+
+                r = ask_password_auto(&req, flags, &pins);
                 if (r < 0)
                         return r;
 
                 STRV_FOREACH(p, pins) {
-                        r = crypt_activate_by_token_pin(cd, name, type, CRYPT_ANY_TOKEN, *p, strlen(*p), usrptr, activation_flags);
+                        r = crypt_activate_by_token_pin(cd, name, type, CRYPT_ANY_TOKEN, *p, strlen(*p), userdata, activation_flags);
                         if (r > 0) /* returns unlocked keyslot id on success */
-                                r = 0;
+                                return 0;
+                        if (r == -EEXIST) /* volume is already active */
+                                return log_external_activation(r, name);
                         if (r != -ENOANO) /* needs pin or pin is wrong */
                                 return r;
                 }
@@ -1236,8 +1476,7 @@ static int attach_luks2_by_fido2_via_plugin(
                 struct crypt_device *cd,
                 const char *name,
                 usec_t until,
-                bool headless,
-                void *usrptr,
+                void *userdata,
                 uint32_t activation_flags) {
 
         return crypt_activate_by_token_pin_ask_password(
@@ -1245,8 +1484,7 @@ static int attach_luks2_by_fido2_via_plugin(
                         name,
                         "systemd-fido2",
                         until,
-                        headless,
-                        usrptr,
+                        userdata,
                         activation_flags,
                         "Please enter security token PIN:",
                         "fido2-pin",
@@ -1257,8 +1495,7 @@ static int attach_luks_or_plain_or_bitlk_by_fido2(
                 struct crypt_device *cd,
                 const char *name,
                 const char *key_file,
-                const void *key_data,
-                size_t key_data_size,
+                const struct iovec *key_data,
                 usec_t until,
                 uint32_t flags,
                 bool pass_volume_key) {
@@ -1266,33 +1503,18 @@ static int attach_luks_or_plain_or_bitlk_by_fido2(
         _cleanup_(sd_device_monitor_unrefp) sd_device_monitor *monitor = NULL;
         _cleanup_(erase_and_freep) void *decrypted_key = NULL;
         _cleanup_(sd_event_unrefp) sd_event *event = NULL;
-        size_t decrypted_key_size, cid_size = 0;
+        size_t decrypted_key_size;
         _cleanup_free_ char *friendly = NULL;
         int keyslot = arg_key_slot, r;
-        const char *rp_id = NULL;
-        const void *cid = NULL;
-        Fido2EnrollFlags required;
-        bool use_libcryptsetup_plugin = libcryptsetup_plugins_support();
+        bool use_libcryptsetup_plugin = use_token_plugins();
 
         assert(cd);
         assert(name);
         assert(arg_fido2_device || arg_fido2_device_auto);
 
-        if (arg_fido2_cid) {
-                if (!key_file && !key_data)
-                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
-                                               "FIDO2 mode with manual parameters selected, but no keyfile specified, refusing.");
-
-                rp_id = arg_fido2_rp_id;
-                cid = arg_fido2_cid;
-                cid_size = arg_fido2_cid_size;
-
-                /* For now and for compatibility, if the user explicitly configured FIDO2 support and we do
-                 * not read FIDO2 metadata off the LUKS2 header, default to the systemd 248 logic, where we
-                 * use PIN + UP when needed, and do not configure UV at all. Eventually, we should make this
-                 * explicitly configurable. */
-                required = FIDO2ENROLL_PIN_IF_NEEDED | FIDO2ENROLL_UP_IF_NEEDED | FIDO2ENROLL_UV_OMIT;
-        }
+        if (arg_fido2_cid && !key_file && !iovec_is_set(key_data))
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                        "FIDO2 mode with manual parameters selected, but no keyfile specified, refusing.");
 
         friendly = friendly_disk_name(crypt_get_device_name(cd), name);
         if (!friendly)
@@ -1300,26 +1522,27 @@ static int attach_luks_or_plain_or_bitlk_by_fido2(
 
         for (;;) {
                 if (use_libcryptsetup_plugin && !arg_fido2_cid) {
-                        r = attach_luks2_by_fido2_via_plugin(cd, name, until, arg_headless, arg_fido2_device, flags);
+                        r = attach_luks2_by_fido2_via_plugin(cd, name, until, arg_fido2_device, flags);
                         if (IN_SET(r, -ENOTUNIQ, -ENXIO, -ENOENT))
                                 return log_debug_errno(SYNTHETIC_ERRNO(EAGAIN),
                                                        "Automatic FIDO2 metadata discovery was not possible because missing or not unique, falling back to traditional unlocking.");
 
                 } else {
-                        if (cid)
+                        if (arg_fido2_cid)
                                 r = acquire_fido2_key(
                                                 name,
                                                 friendly,
                                                 arg_fido2_device,
-                                                rp_id,
-                                                cid, cid_size,
+                                                arg_fido2_rp_id,
+                                                arg_fido2_cid, arg_fido2_cid_size,
                                                 key_file, arg_keyfile_size, arg_keyfile_offset,
-                                                key_data, key_data_size,
+                                                key_data,
                                                 until,
-                                                arg_headless,
-                                                required,
-                                                &decrypted_key, &decrypted_key_size,
-                                                arg_ask_password_flags);
+                                                arg_fido2_manual_flags,
+                                                "cryptsetup.fido2-pin",
+                                                arg_ask_password_flags,
+                                                &decrypted_key,
+                                                &decrypted_key_size);
                         else
                                 r = acquire_fido2_key_auto(
                                                 cd,
@@ -1327,9 +1550,10 @@ static int attach_luks_or_plain_or_bitlk_by_fido2(
                                                 friendly,
                                                 arg_fido2_device,
                                                 until,
-                                                arg_headless,
-                                                &decrypted_key, &decrypted_key_size,
-                                                arg_ask_password_flags);
+                                                "cryptsetup.fido2-pin",
+                                                arg_ask_password_flags,
+                                                &decrypted_key,
+                                                &decrypted_key_size);
                         if (r >= 0)
                                 break;
                 }
@@ -1390,7 +1614,7 @@ static int attach_luks2_by_pkcs11_via_plugin(
                 const char *name,
                 const char *friendly_name,
                 usec_t until,
-                bool headless,
+                const char *askpw_credential,
                 uint32_t flags) {
 
 #if HAVE_LIBCRYPTSETUP_PLUGINS
@@ -1402,12 +1626,15 @@ static int attach_luks2_by_pkcs11_via_plugin(
         systemd_pkcs11_plugin_params params = {
                 .friendly_name = friendly_name,
                 .until = until,
-                .headless = headless
+                .askpw_credential = askpw_credential,
+                .askpw_flags = arg_ask_password_flags,
         };
 
         r = crypt_activate_by_token_pin(cd, name, "systemd-pkcs11", CRYPT_ANY_TOKEN, NULL, 0, &params, flags);
         if (r > 0) /* returns unlocked keyslot id on success */
                 r = 0;
+        if (r == -EEXIST) /* volume is already active */
+                r = log_external_activation(r, name);
 
         return r;
 #else
@@ -1419,8 +1646,7 @@ static int attach_luks_or_plain_or_bitlk_by_pkcs11(
                 struct crypt_device *cd,
                 const char *name,
                 const char *key_file,
-                const void *key_data,
-                size_t key_data_size,
+                const struct iovec *key_data,
                 usec_t until,
                 uint32_t flags,
                 bool pass_volume_key) {
@@ -1431,9 +1657,10 @@ static int attach_luks_or_plain_or_bitlk_by_pkcs11(
         _cleanup_(erase_and_freep) void *decrypted_key = NULL;
         _cleanup_(sd_event_unrefp) sd_event *event = NULL;
         _cleanup_free_ void *discovered_key = NULL;
+        struct iovec discovered_key_data = {};
         int keyslot = arg_key_slot, r;
         const char *uri = NULL;
-        bool use_libcryptsetup_plugin = libcryptsetup_plugins_support();
+        bool use_libcryptsetup_plugin = use_token_plugins();
 
         assert(cd);
         assert(name);
@@ -1449,13 +1676,13 @@ static int attach_luks_or_plain_or_bitlk_by_pkcs11(
                                 return r;
 
                         uri = discovered_uri;
-                        key_data = discovered_key;
-                        key_data_size = discovered_key_size;
+                        discovered_key_data = IOVEC_MAKE(discovered_key, discovered_key_size);
+                        key_data = &discovered_key_data;
                 }
         } else {
                 uri = arg_pkcs11_uri;
 
-                if (!key_file && !key_data)
+                if (!key_file && !iovec_is_set(key_data))
                         return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "PKCS#11 mode selected but no key file specified, refusing.");
         }
 
@@ -1465,16 +1692,22 @@ static int attach_luks_or_plain_or_bitlk_by_pkcs11(
 
         for (;;) {
                 if (use_libcryptsetup_plugin && arg_pkcs11_uri_auto)
-                        r = attach_luks2_by_pkcs11_via_plugin(cd, name, friendly, until, arg_headless, flags);
+                        r = attach_luks2_by_pkcs11_via_plugin(
+                                        cd,
+                                        name,
+                                        friendly,
+                                        until,
+                                        "cryptsetup.pkcs11-pin",
+                                        flags);
                 else {
                         r = decrypt_pkcs11_key(
                                         name,
                                         friendly,
                                         uri,
                                         key_file, arg_keyfile_size, arg_keyfile_offset,
-                                        key_data, key_data_size,
+                                        key_data,
                                         until,
-                                        arg_headless,
+                                        arg_ask_password_flags,
                                         &decrypted_key, &decrypted_key_size);
                         if (r >= 0)
                                 break;
@@ -1493,8 +1726,8 @@ static int attach_luks_or_plain_or_bitlk_by_pkcs11(
                         if (r < 0)
                                 return r;
 
-                        log_notice("Security token %s not present for unlocking volume %s, please plug it in.",
-                                   uri, friendly);
+                        log_notice("Security token%s%s not present for unlocking volume %s, please plug it in.",
+                                   uri ? " " : "", strempty(uri), friendly);
 
                         /* Let's immediately rescan in case the token appeared in the time we needed
                          * to create and configure the monitor */
@@ -1585,7 +1818,6 @@ static int attach_luks2_by_tpm2_via_plugin(
                 struct crypt_device *cd,
                 const char *name,
                 usec_t until,
-                bool headless,
                 uint32_t flags) {
 
 #if HAVE_LIBCRYPTSETUP_PLUGINS
@@ -1593,18 +1825,18 @@ static int attach_luks2_by_tpm2_via_plugin(
                 .search_pcr_mask = arg_tpm2_pcr_mask,
                 .device = arg_tpm2_device,
                 .signature_path = arg_tpm2_signature,
+                .pcrlock_path = arg_tpm2_pcrlock,
         };
 
-        if (!libcryptsetup_plugins_support())
+        if (!use_token_plugins())
                 return log_debug_errno(SYNTHETIC_ERRNO(EOPNOTSUPP),
-                                       "Libcryptsetup has external plugins support disabled.");
+                                       "libcryptsetup has external plugins support disabled.");
 
         return crypt_activate_by_token_pin_ask_password(
                         cd,
                         name,
                         "systemd-tpm2",
                         until,
-                        headless,
                         &params,
                         flags,
                         "Please enter TPM2 PIN:",
@@ -1619,18 +1851,16 @@ static int attach_luks_or_plain_or_bitlk_by_tpm2(
                 struct crypt_device *cd,
                 const char *name,
                 const char *key_file,
-                const void *key_data,
-                size_t key_data_size,
+                const struct iovec *key_data,
                 usec_t until,
                 uint32_t flags,
                 bool pass_volume_key) {
 
         _cleanup_(sd_device_monitor_unrefp) sd_device_monitor *monitor = NULL;
-        _cleanup_(erase_and_freep) void *decrypted_key = NULL;
+        _cleanup_(iovec_done_erase) struct iovec decrypted_key = {};
         _cleanup_(sd_event_unrefp) sd_event *event = NULL;
         _cleanup_free_ char *friendly = NULL;
         int keyslot = arg_key_slot, r;
-        size_t decrypted_key_size;
 
         assert(cd);
         assert(name);
@@ -1641,28 +1871,31 @@ static int attach_luks_or_plain_or_bitlk_by_tpm2(
                 return log_oom();
 
         for (;;) {
-                if (key_file || key_data) {
+                if (key_file || iovec_is_set(key_data)) {
                         /* If key data is specified, use that */
 
                         r = acquire_tpm2_key(
                                         name,
                                         arg_tpm2_device,
-                                        arg_tpm2_pcr_mask == UINT32_MAX ? TPM2_PCR_MASK_DEFAULT : arg_tpm2_pcr_mask,
+                                        arg_tpm2_pcr_mask == UINT32_MAX ? TPM2_PCR_MASK_DEFAULT_LEGACY : arg_tpm2_pcr_mask,
                                         UINT16_MAX,
-                                        /* pubkey= */ NULL, /* pubkey_size= */ 0,
+                                        /* pubkey= */ NULL,
                                         /* pubkey_pcr_mask= */ 0,
                                         /* signature_path= */ NULL,
+                                        /* pcrlock_path= */ NULL,
                                         /* primary_alg= */ 0,
                                         key_file, arg_keyfile_size, arg_keyfile_offset,
-                                        key_data, key_data_size,
-                                        /* policy_hash= */ NULL, /* policy_hash_size= */ 0, /* we don't know the policy hash */
-                                        /* salt= */ NULL, /* salt_size= */ 0,
-                                        /* srk_buf= */ NULL, /* srk_buf_size= */ 0,
+                                        key_data, /* n_blobs= */ 1,
+                                        /* policy_hash= */ NULL, /* we don't know the policy hash */
+                                        /* n_policy_hash= */ 0,
+                                        /* salt= */ NULL,
+                                        /* srk= */ NULL,
+                                        /* pcrlock_nv= */ NULL,
                                         arg_tpm2_pin ? TPM2_FLAGS_USE_PIN : 0,
                                         until,
-                                        arg_headless,
+                                        "cryptsetup.tpm2-pin",
                                         arg_ask_password_flags,
-                                        &decrypted_key, &decrypted_key_size);
+                                        &decrypted_key);
                         if (r >= 0)
                                 break;
                         if (IN_SET(r, -EACCES, -ENOLCK))
@@ -1675,7 +1908,7 @@ static int attach_luks_or_plain_or_bitlk_by_tpm2(
                                 return -EAGAIN; /* Mangle error code: let's make any form of TPM2 failure non-fatal. */
                         }
                 } else {
-                        r = attach_luks2_by_tpm2_via_plugin(cd, name, until, arg_headless, flags);
+                        r = attach_luks2_by_tpm2_via_plugin(cd, name, until, flags);
                         if (r >= 0)
                                 return 0;
                         /* EAGAIN     means: no tpm2 chip found
@@ -1693,8 +1926,6 @@ static int attach_luks_or_plain_or_bitlk_by_tpm2(
                 }
 
                 if (r == -EOPNOTSUPP) { /* Plugin not available, let's process TPM2 stuff right here instead */
-                        _cleanup_free_ void *blob = NULL, *policy_hash = NULL;
-                        size_t blob_size, policy_hash_size;
                         bool found_some = false;
                         int token = 0; /* first token to look at */
 
@@ -1703,11 +1934,15 @@ static int attach_luks_or_plain_or_bitlk_by_tpm2(
                          * works. */
 
                         for (;;) {
-                                _cleanup_free_ void *pubkey = NULL, *salt = NULL, *srk_buf = NULL;
-                                size_t pubkey_size = 0, salt_size = 0, srk_buf_size = 0;
+                                _cleanup_(iovec_done) struct iovec pubkey = {}, salt = {}, srk = {}, pcrlock_nv = {};
+                                struct iovec *blobs = NULL, *policy_hash = NULL;
                                 uint32_t hash_pcr_mask, pubkey_pcr_mask;
+                                size_t n_blobs = 0, n_policy_hash = 0;
                                 uint16_t pcr_bank, primary_alg;
                                 TPM2Flags tpm2_flags;
+
+                                CLEANUP_ARRAY(blobs, n_blobs, iovec_array_free);
+                                CLEANUP_ARRAY(policy_hash, n_policy_hash, iovec_array_free);
 
                                 r = find_tpm2_auto_data(
                                                 cd,
@@ -1715,13 +1950,16 @@ static int attach_luks_or_plain_or_bitlk_by_tpm2(
                                                 token, /* search for the token with this index, or any later index than this */
                                                 &hash_pcr_mask,
                                                 &pcr_bank,
-                                                &pubkey, &pubkey_size,
+                                                &pubkey,
                                                 &pubkey_pcr_mask,
                                                 &primary_alg,
-                                                &blob, &blob_size,
-                                                &policy_hash, &policy_hash_size,
-                                                &salt, &salt_size,
-                                                &srk_buf, &srk_buf_size,
+                                                &blobs,
+                                                &n_blobs,
+                                                &policy_hash,
+                                                &n_policy_hash,
+                                                &salt,
+                                                &srk,
+                                                &pcrlock_nv,
                                                 &tpm2_flags,
                                                 &keyslot,
                                                 &token);
@@ -1732,8 +1970,10 @@ static int attach_luks_or_plain_or_bitlk_by_tpm2(
                                                               found_some
                                                               ? "No TPM2 metadata matching the current system state found in LUKS2 header, falling back to traditional unlocking."
                                                               : "No TPM2 metadata enrolled in LUKS2 header, falling back to traditional unlocking.");
-                                if (ERRNO_IS_NOT_SUPPORTED(r))  /* TPM2 support not compiled in? */
-                                        return log_debug_errno(SYNTHETIC_ERRNO(EAGAIN), "TPM2 support not available, falling back to traditional unlocking.");
+                                if (ERRNO_IS_NEG_NOT_SUPPORTED(r))
+                                        /* TPM2 support not compiled in? */
+                                        return log_debug_errno(SYNTHETIC_ERRNO(EAGAIN),
+                                                               "TPM2 support not available, falling back to traditional unlocking.");
                                 if (r < 0)
                                         return r;
 
@@ -1744,20 +1984,24 @@ static int attach_luks_or_plain_or_bitlk_by_tpm2(
                                                 arg_tpm2_device,
                                                 hash_pcr_mask,
                                                 pcr_bank,
-                                                pubkey, pubkey_size,
+                                                &pubkey,
                                                 pubkey_pcr_mask,
                                                 arg_tpm2_signature,
+                                                arg_tpm2_pcrlock,
                                                 primary_alg,
                                                 /* key_file= */ NULL, /* key_file_size= */ 0, /* key_file_offset= */ 0, /* no key file */
-                                                blob, blob_size,
-                                                policy_hash, policy_hash_size,
-                                                salt, salt_size,
-                                                srk_buf, srk_buf_size,
+                                                blobs,
+                                                n_blobs,
+                                                policy_hash,
+                                                n_policy_hash,
+                                                &salt,
+                                                &srk,
+                                                &pcrlock_nv,
                                                 tpm2_flags,
                                                 until,
-                                                arg_headless,
+                                                "cryptsetup.tpm2-pin",
                                                 arg_ask_password_flags,
-                                                &decrypted_key, &decrypted_key_size);
+                                                &decrypted_key);
                                 if (IN_SET(r, -EACCES, -ENOLCK))
                                         return log_notice_errno(SYNTHETIC_ERRNO(EAGAIN), "TPM2 PIN unlock failed, falling back to traditional unlocking.");
                                 if (r != -EPERM)
@@ -1802,17 +2046,16 @@ static int attach_luks_or_plain_or_bitlk_by_tpm2(
 
                 log_debug("Got one or more potentially relevant udev events, rescanning for TPM2...");
         }
-        assert(decrypted_key);
 
         if (pass_volume_key)
-                r = measured_crypt_activate_by_volume_key(cd, name, decrypted_key, decrypted_key_size, flags);
+                r = measured_crypt_activate_by_volume_key(cd, name, decrypted_key.iov_base, decrypted_key.iov_len, flags);
         else {
                 _cleanup_(erase_and_freep) char *base64_encoded = NULL;
                 ssize_t base64_encoded_size;
 
                 /* Before using this key as passphrase we base64 encode it, for compat with homed */
 
-                base64_encoded_size = base64mem(decrypted_key, decrypted_key_size, &base64_encoded);
+                base64_encoded_size = base64mem(decrypted_key.iov_base, decrypted_key.iov_len, &base64_encoded);
                 if (base64_encoded_size < 0)
                         return log_oom();
 
@@ -1831,8 +2074,7 @@ static int attach_luks_or_plain_or_bitlk_by_tpm2(
 static int attach_luks_or_plain_or_bitlk_by_key_data(
                 struct crypt_device *cd,
                 const char *name,
-                const void *key_data,
-                size_t key_data_size,
+                const struct iovec *key_data,
                 uint32_t flags,
                 bool pass_volume_key) {
 
@@ -1843,9 +2085,9 @@ static int attach_luks_or_plain_or_bitlk_by_key_data(
         assert(key_data);
 
         if (pass_volume_key)
-                r = measured_crypt_activate_by_volume_key(cd, name, key_data, key_data_size, flags);
+                r = measured_crypt_activate_by_volume_key(cd, name, key_data->iov_base, key_data->iov_len, flags);
         else
-                r = measured_crypt_activate_by_passphrase(cd, name, arg_key_slot, key_data, key_data_size, flags);
+                r = measured_crypt_activate_by_passphrase(cd, name, arg_key_slot, key_data->iov_base, key_data->iov_len, flags);
         if (r == -EPERM) {
                 log_error_errno(r, "Failed to activate. (Key incorrect?)");
                 return -EAGAIN; /* Log actual error, but return EAGAIN */
@@ -1873,7 +2115,7 @@ static int attach_luks_or_plain_or_bitlk_by_key_file(
         assert(key_file);
 
         /* If we read the key via AF_UNIX, make this client recognizable */
-        bindname = make_bindname(name);
+        bindname = make_bindname(name, /* token_type= */ _TOKEN_TYPE_INVALID);
         if (!bindname)
                 return log_oom();
 
@@ -1943,9 +2185,9 @@ static int attach_luks_or_plain_or_bitlk_by_passphrase(
 static int attach_luks_or_plain_or_bitlk(
                 struct crypt_device *cd,
                 const char *name,
+                TokenType token_type,
                 const char *key_file,
-                const void *key_data,
-                size_t key_data_size,
+                const struct iovec *key_data,
                 char **passwords,
                 uint32_t flags,
                 usec_t until) {
@@ -2009,14 +2251,14 @@ static int attach_luks_or_plain_or_bitlk(
                  crypt_get_volume_key_size(cd)*8,
                  crypt_get_device_name(cd));
 
-        if (arg_tpm2_device || arg_tpm2_device_auto)
-                return attach_luks_or_plain_or_bitlk_by_tpm2(cd, name, key_file, key_data, key_data_size, until, flags, pass_volume_key);
-        if (arg_fido2_device || arg_fido2_device_auto)
-                return attach_luks_or_plain_or_bitlk_by_fido2(cd, name, key_file, key_data, key_data_size, until, flags, pass_volume_key);
-        if (arg_pkcs11_uri || arg_pkcs11_uri_auto)
-                return attach_luks_or_plain_or_bitlk_by_pkcs11(cd, name, key_file, key_data, key_data_size, until, flags, pass_volume_key);
+        if (token_type == TOKEN_TPM2)
+                return attach_luks_or_plain_or_bitlk_by_tpm2(cd, name, key_file, key_data, until, flags, pass_volume_key);
+        if (token_type == TOKEN_FIDO2)
+                return attach_luks_or_plain_or_bitlk_by_fido2(cd, name, key_file, key_data, until, flags, pass_volume_key);
+        if (token_type == TOKEN_PKCS11)
+                return attach_luks_or_plain_or_bitlk_by_pkcs11(cd, name, key_file, key_data, until, flags, pass_volume_key);
         if (key_data)
-                return attach_luks_or_plain_or_bitlk_by_key_data(cd, name, key_data, key_data_size, flags, pass_volume_key);
+                return attach_luks_or_plain_or_bitlk_by_key_data(cd, name, key_data, flags, pass_volume_key);
         if (key_file)
                 return attach_luks_or_plain_or_bitlk_by_key_file(cd, name, key_file, flags, pass_volume_key);
 
@@ -2027,19 +2269,60 @@ static int help(void) {
         _cleanup_free_ char *link = NULL;
         int r;
 
-        r = terminal_urlify_man("systemd-cryptsetup@.service", "8", &link);
+        r = terminal_urlify_man("systemd-cryptsetup", "8", &link);
         if (r < 0)
                 return log_oom();
 
-        printf("%s attach VOLUME SOURCEDEVICE [KEY-FILE] [OPTIONS]\n"
-               "%s detach VOLUME\n\n"
-               "Attaches or detaches an encrypted block device.\n"
-               "\nSee the %s for details.\n",
+        printf("%1$s attach VOLUME SOURCE-DEVICE [KEY-FILE] [CONFIG]\n"
+               "%1$s detach VOLUME\n\n"
+               "%2$sAttach or detach an encrypted block device.%3$s\n\n"
+               "  -h --help            Show this help\n"
+               "     --version         Show package version\n"
+               "\nSee the %4$s for details.\n",
                program_invocation_short_name,
-               program_invocation_short_name,
+               ansi_highlight(),
+               ansi_normal(),
                link);
 
         return 0;
+}
+
+static int parse_argv(int argc, char *argv[]) {
+        enum {
+                ARG_VERSION = 0x100,
+        };
+
+        static const struct option options[] = {
+                { "help",                         no_argument,       NULL, 'h'                       },
+                { "version",                      no_argument,       NULL, ARG_VERSION               },
+                {}
+        };
+
+        int c;
+
+        assert(argc >= 0);
+        assert(argv);
+
+        if (argv_looks_like_help(argc, argv))
+                return help();
+
+        while ((c = getopt_long(argc, argv, "h", options, NULL)) >= 0)
+                switch (c) {
+
+                case 'h':
+                        return help();
+
+                case ARG_VERSION:
+                        return version();
+
+                case '?':
+                        return -EINVAL;
+
+                default:
+                        assert_not_reached();
+                }
+
+        return 1;
 }
 
 static uint32_t determine_flags(void) {
@@ -2083,263 +2366,334 @@ static void remove_and_erasep(const char **p) {
                 log_warning_errno(r, "Unable to erase key file '%s', ignoring: %m", *p);
 }
 
-static int run(int argc, char *argv[]) {
-        _cleanup_(crypt_freep) struct crypt_device *cd = NULL;
-        const char *verb;
+static TokenType determine_token_type(void) {
+        if (arg_tpm2_device || arg_tpm2_device_auto)
+                return TOKEN_TPM2;
+        if (arg_fido2_device || arg_fido2_device_auto)
+                return TOKEN_FIDO2;
+        if (arg_pkcs11_uri || arg_pkcs11_uri_auto)
+                return TOKEN_PKCS11;
+
+        return _TOKEN_TYPE_INVALID;
+}
+
+static int discover_key(const char *key_file, const char *volume, TokenType token_type, struct iovec *ret_key_data) {
+        _cleanup_free_ char *bindname = NULL;
+        const char *token_type_name;
         int r;
 
-        if (argv_looks_like_help(argc, argv))
-                return help();
+        assert(key_file);
+        assert(volume);
+        assert(ret_key_data);
 
-        if (argc < 3)
-                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
-                                       "This program requires at least two arguments.");
+        bindname = make_bindname(volume, token_type);
+        if (!bindname)
+                return log_oom();
 
-        log_setup();
+        /* If a key file is not explicitly specified, search for a key in a well defined search path, and load it. */
+        r = find_key_file(key_file, STRV_MAKE("/etc/cryptsetup-keys.d", "/run/cryptsetup-keys.d"), bindname, ret_key_data);
+        if (r <= 0)
+                return r;
 
-        cryptsetup_enable_logging(NULL);
+        token_type_name = token_type_to_string(token_type);
+        if (token_type_name)
+                log_debug("Automatically discovered encrypted key for volume '%s' (token type: %s).", volume, token_type_name);
+        else
+                log_debug("Automatically discovered key for volume '%s'.", volume);
 
-        umask(0022);
+        return r;
+}
 
-        verb = argv[1];
+static int verb_attach(int argc, char *argv[], void *userdata) {
+        _cleanup_(crypt_freep) struct crypt_device *cd = NULL;
+        _unused_ _cleanup_(remove_and_erasep) const char *destroy_key_file = NULL;
+        crypt_status_info status;
+        uint32_t flags = 0;
+        unsigned tries;
+        usec_t until;
+        PassphraseType passphrase_type = PASSPHRASE_NONE;
+        int r;
 
-        if (streq(verb, "attach")) {
-                _unused_ _cleanup_(remove_and_erasep) const char *destroy_key_file = NULL;
-                _cleanup_(erase_and_freep) void *key_data = NULL;
-                const char *volume, *source, *key_file, *options;
-                crypt_status_info status;
-                size_t key_data_size = 0;
-                uint32_t flags = 0;
-                unsigned tries;
-                usec_t until;
-                PassphraseType passphrase_type = PASSPHRASE_NONE;
+        /* Arguments: systemd-cryptsetup attach VOLUME SOURCE-DEVICE [KEY-FILE] [CONFIG] */
 
-                /* Arguments: systemd-cryptsetup attach VOLUME SOURCE-DEVICE [KEY-FILE] [OPTIONS] */
+        assert(argc >= 3 && argc <= 5);
 
-                if (argc < 4)
-                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "attach requires at least two arguments.");
+        const char *volume = ASSERT_PTR(argv[1]),
+                *source = ASSERT_PTR(argv[2]),
+                *key_file = argc >= 4 ? mangle_none(argv[3]) : NULL,
+                *config = argc >= 5 ? mangle_none(argv[4]) : NULL;
 
-                volume = argv[2];
-                source = argv[3];
-                key_file = mangle_none(argc >= 5 ? argv[4] : NULL);
-                options = mangle_none(argc >= 6 ? argv[5] : NULL);
+        if (!filename_is_valid(volume))
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Volume name '%s' is not valid.", volume);
 
-                if (!filename_is_valid(volume))
-                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Volume name '%s' is not valid.", volume);
+        if (key_file && !path_is_absolute(key_file)) {
+                log_warning("Password file path '%s' is not absolute. Ignoring.", key_file);
+                key_file = NULL;
+        }
 
-                if (key_file && !path_is_absolute(key_file)) {
-                        log_warning("Password file path '%s' is not absolute. Ignoring.", key_file);
-                        key_file = NULL;
-                }
-
-                if (options) {
-                        r = parse_options(options);
-                        if (r < 0)
-                                return r;
-                }
-
-                log_debug("%s %s ← %s type=%s cipher=%s", __func__,
-                          volume, source, strempty(arg_type), strempty(arg_cipher));
-
-                /* A delicious drop of snake oil */
-                (void) mlockall(MCL_FUTURE);
-
-                if (!key_file) {
-                        _cleanup_free_ char *bindname = NULL;
-                        const char *fn;
-
-                        bindname = make_bindname(volume);
-                        if (!bindname)
-                                return log_oom();
-
-                        /* If a key file is not explicitly specified, search for a key in a well defined
-                         * search path, and load it. */
-
-                        fn = strjoina(volume, ".key");
-                        r = find_key_file(
-                                        fn,
-                                        STRV_MAKE("/etc/cryptsetup-keys.d", "/run/cryptsetup-keys.d"),
-                                        bindname,
-                                        &key_data, &key_data_size);
-                        if (r < 0)
-                                return r;
-                        if (r > 0)
-                                log_debug("Automatically discovered key for volume '%s'.", volume);
-                } else if (arg_keyfile_erase)
-                        destroy_key_file = key_file; /* let's get this baby erased when we leave */
-
-                if (arg_header) {
-                        if (streq_ptr(arg_type, CRYPT_TCRYPT)){
-                            log_debug("tcrypt header: %s", arg_header);
-                            r = crypt_init_data_device(&cd, arg_header, source);
-                        } else {
-                            log_debug("LUKS header: %s", arg_header);
-                            r = crypt_init(&cd, arg_header);
-                        }
-                } else
-                        r = crypt_init(&cd, source);
+        if (config) {
+                r = parse_crypt_config(config);
                 if (r < 0)
-                        return log_error_errno(r, "crypt_init() failed: %m");
+                        return r;
+        }
 
-                cryptsetup_enable_logging(cd);
+        log_debug("%s %s ← %s type=%s cipher=%s", __func__,
+                  volume, source, strempty(arg_type), strempty(arg_cipher));
 
-                status = crypt_status(cd, volume);
-                if (IN_SET(status, CRYPT_ACTIVE, CRYPT_BUSY)) {
-                        log_info("Volume %s already active.", volume);
-                        return 0;
+        /* A delicious drop of snake oil */
+        (void) mlockall(MCL_FUTURE);
+
+        if (key_file && arg_keyfile_erase)
+                destroy_key_file = key_file; /* let's get this baby erased when we leave */
+
+        if (arg_header) {
+                if (streq_ptr(arg_type, CRYPT_TCRYPT)){
+                        log_debug("tcrypt header: %s", arg_header);
+                        r = crypt_init_data_device(&cd, arg_header, source);
+                } else {
+                        log_debug("LUKS header: %s", arg_header);
+                        r = crypt_init(&cd, arg_header);
                 }
+        } else
+                r = crypt_init(&cd, source);
+        if (r < 0)
+                return log_error_errno(r, "crypt_init() failed: %m");
 
-                flags = determine_flags();
+        cryptsetup_enable_logging(cd);
 
-                until = usec_add(now(CLOCK_MONOTONIC), arg_timeout);
-                if (until == USEC_INFINITY)
-                        until = 0;
+        status = crypt_status(cd, volume);
+        if (IN_SET(status, CRYPT_ACTIVE, CRYPT_BUSY)) {
+                log_info("Volume %s already active.", volume);
+                return 0;
+        }
 
-                if (arg_key_size == 0)
-                        arg_key_size = 256U / 8U;
+        flags = determine_flags();
 
-                if (key_file) {
-                        struct stat st;
+        until = usec_add(now(CLOCK_MONOTONIC), arg_timeout);
+        if (until == USEC_INFINITY)
+                until = 0;
 
-                        /* Ideally we'd do this on the open fd, but since this is just a
-                         * warning it's OK to do this in two steps. */
-                        if (stat(key_file, &st) >= 0 && S_ISREG(st.st_mode) && (st.st_mode & 0005))
-                                log_warning("Key file %s is world-readable. This is not a good idea!", key_file);
-                }
+        if (arg_key_size == 0)
+                arg_key_size = 256U / 8U;
 
-                if (!arg_type || STR_IN_SET(arg_type, ANY_LUKS, CRYPT_LUKS1, CRYPT_LUKS2)) {
-                        r = crypt_load(cd, !arg_type || streq(arg_type, ANY_LUKS) ? CRYPT_LUKS : arg_type, NULL);
+        if (key_file) {
+                struct stat st;
+
+                /* Ideally we'd do this on the open fd, but since this is just a warning it's OK to do this
+                 * in two steps. */
+                if (stat(key_file, &st) >= 0 && S_ISREG(st.st_mode) && (st.st_mode & 0005))
+                        log_warning("Key file %s is world-readable. This is not a good idea!", key_file);
+        }
+
+        if (!arg_type || STR_IN_SET(arg_type, ANY_LUKS, CRYPT_LUKS1, CRYPT_LUKS2)) {
+                r = crypt_load(cd, !arg_type || streq(arg_type, ANY_LUKS) ? CRYPT_LUKS : arg_type, NULL);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to load LUKS superblock on device %s: %m", crypt_get_device_name(cd));
+
+/* since cryptsetup 2.7.0 (Jan 2024) */
+#if HAVE_CRYPT_SET_KEYRING_TO_LINK
+                if (arg_link_key_description) {
+                        r = crypt_set_keyring_to_link(cd, arg_link_key_description, NULL, arg_link_key_type, arg_link_keyring);
                         if (r < 0)
-                                return log_error_errno(r, "Failed to load LUKS superblock on device %s: %m", crypt_get_device_name(cd));
-
-                        if (arg_header) {
-                                r = crypt_set_data_device(cd, source);
-                                if (r < 0)
-                                        return log_error_errno(r, "Failed to set LUKS data device %s: %m", source);
-                        }
-
-                        /* Tokens are available in LUKS2 only, but it is ok to call (and fail) with LUKS1. */
-                        if (!key_file && !key_data && getenv_bool("SYSTEMD_CRYPTSETUP_USE_TOKEN_MODULE") != 0) {
-                                r = crypt_activate_by_token_pin_ask_password(
-                                                cd,
-                                                volume,
-                                                NULL,
-                                                until,
-                                                arg_headless,
-                                                NULL,
-                                                flags,
-                                                "Please enter LUKS2 token PIN:",
-                                                "luks2-pin",
-                                                "cryptsetup.luks2-pin");
-                                if (r >= 0) {
-                                        log_debug("Volume %s activated with LUKS token id %i.", volume, r);
-                                        return 0;
-                                }
-
-                                log_debug_errno(r, "Token activation unsuccessful for device %s: %m", crypt_get_device_name(cd));
-                        }
-                }
-
-/* since cryptsetup 2.3.0 (Feb 2020) */
-#ifdef CRYPT_BITLK
-                if (streq_ptr(arg_type, CRYPT_BITLK)) {
-                        r = crypt_load(cd, CRYPT_BITLK, NULL);
-                        if (r < 0)
-                                return log_error_errno(r, "Failed to load Bitlocker superblock on device %s: %m", crypt_get_device_name(cd));
+                                log_warning_errno(r, "Failed to set keyring or key description to link volume key in, ignoring: %m");
                 }
 #endif
 
-                for (tries = 0; arg_tries == 0 || tries < arg_tries; tries++) {
-                        _cleanup_strv_free_erase_ char **passwords = NULL;
+                if (arg_header) {
+                        r = crypt_set_data_device(cd, source);
+                        if (r < 0)
+                                return log_error_errno(r, "Failed to set LUKS data device %s: %m", source);
+                }
 
-                        /* When we were able to acquire multiple keys, let's always process them in this order:
-                         *
-                         *    1. A key acquired via PKCS#11 or FIDO2 token, or TPM2 chip
-                         *    2. The discovered key: i.e. key_data + key_data_size
-                         *    3. The configured key: i.e. key_file + arg_keyfile_offset + arg_keyfile_size
-                         *    4. The empty password, in case arg_try_empty_password is set
-                         *    5. We enquire the user for a password
-                         */
-
-                        if (!key_file && !key_data && !arg_pkcs11_uri && !arg_pkcs11_uri_auto && !arg_fido2_device && !arg_fido2_device_auto && !arg_tpm2_device && !arg_tpm2_device_auto) {
-
-                                if (arg_try_empty_password) {
-                                        /* Hmm, let's try an empty password now, but only once */
-                                        arg_try_empty_password = false;
-
-                                        key_data = strdup("");
-                                        if (!key_data)
-                                                return log_oom();
-
-                                        key_data_size = 0;
-                                } else {
-                                        /* Ask the user for a passphrase or recovery key only as last resort, if we have
-                                         * nothing else to check for */
-                                        if (passphrase_type == PASSPHRASE_NONE) {
-                                                passphrase_type = check_registered_passwords(cd);
-                                                if (passphrase_type == PASSPHRASE_NONE)
-                                                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "No passphrase or recovery key registered.");
-                                        }
-
-                                        r = get_password(volume, source, until, tries == 0 && !arg_verify, passphrase_type, &passwords);
-                                        if (r == -EAGAIN)
-                                                continue;
-                                        if (r < 0)
-                                                return r;
-                                }
+                /* Tokens are available in LUKS2 only, but it is ok to call (and fail) with LUKS1. */
+                if (!key_file && use_token_plugins()) {
+                        r = crypt_activate_by_token_pin_ask_password(
+                                        cd,
+                                        volume,
+                                        /* type= */ NULL,
+                                        until,
+                                        /* userdata= */ NULL,
+                                        flags,
+                                        "Please enter LUKS2 token PIN:",
+                                        "luks2-pin",
+                                        "cryptsetup.luks2-pin");
+                        if (r >= 0) {
+                                log_debug("Volume %s activated with a LUKS token.", volume);
+                                return 0;
                         }
 
-                        if (streq_ptr(arg_type, CRYPT_TCRYPT))
-                                r = attach_tcrypt(cd, volume, key_file, key_data, key_data_size, passwords, flags);
-                        else
-                                r = attach_luks_or_plain_or_bitlk(cd, volume, key_file, key_data, key_data_size, passwords, flags, until);
-                        if (r >= 0)
-                                break;
-                        if (r != -EAGAIN)
+                        log_debug_errno(r, "Token activation unsuccessful for device %s: %m", crypt_get_device_name(cd));
+                }
+        }
+
+/* since cryptsetup 2.3.0 (Feb 2020) */
+#ifdef CRYPT_BITLK
+        if (streq_ptr(arg_type, CRYPT_BITLK)) {
+                r = crypt_load(cd, CRYPT_BITLK, NULL);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to load Bitlocker superblock on device %s: %m", crypt_get_device_name(cd));
+        }
+#endif
+
+        bool use_cached_passphrase = true, try_discover_key = !key_file;
+        const char *discovered_key_fn = strjoina(volume, ".key");
+        _cleanup_strv_free_erase_ char **passwords = NULL;
+        for (tries = 0; arg_tries == 0 || tries < arg_tries; tries++) {
+                _cleanup_(iovec_done_erase) struct iovec discovered_key_data = {};
+                const struct iovec *key_data = NULL;
+                TokenType token_type = determine_token_type();
+
+                log_debug("Beginning attempt %u to unlock.", tries);
+
+                /* When we were able to acquire multiple keys, let's always process them in this order:
+                 *
+                 *    1. A key acquired via PKCS#11 or FIDO2 token, or TPM2 chip
+                 *    2. The configured or discovered key, of which both are exclusive and optional
+                 *    3. The empty password, in case arg_try_empty_password is set
+                 *    4. We enquire the user for a password
+                 */
+
+                if (try_discover_key) {
+                        r = discover_key(discovered_key_fn, volume, token_type, &discovered_key_data);
+                        if (r < 0)
                                 return r;
+                        if (r > 0)
+                                key_data = &discovered_key_data;
+                }
 
-                        /* Key not correct? Let's try again! */
+                if (token_type < 0 && !key_file && !key_data && !passwords) {
 
-                        key_file = NULL;
-                        key_data = erase_and_free(key_data);
-                        key_data_size = 0;
-                        arg_pkcs11_uri = mfree(arg_pkcs11_uri);
-                        arg_pkcs11_uri_auto = false;
-                        arg_fido2_device = mfree(arg_fido2_device);
-                        arg_fido2_device_auto = false;
+                        /* If we have nothing to try anymore, then acquire a new password */
+
+                        if (arg_try_empty_password) {
+                                /* Hmm, let's try an empty password now, but only once */
+                                arg_try_empty_password = false;
+                                key_data = &iovec_empty;
+                        } else {
+                                /* Ask the user for a passphrase or recovery key only as last resort, if we
+                                 * have nothing else to check for */
+                                if (passphrase_type == PASSPHRASE_NONE) {
+                                        passphrase_type = check_registered_passwords(cd);
+                                        if (passphrase_type == PASSPHRASE_NONE)
+                                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "No passphrase or recovery key registered.");
+                                }
+
+                                r = get_password(
+                                                volume,
+                                                source,
+                                                until,
+                                                /* ignore_cached= */ !use_cached_passphrase || arg_verify,
+                                                passphrase_type,
+                                                &passwords);
+                                use_cached_passphrase = false;
+                                if (r == -EAGAIN)
+                                        continue;
+                                if (r < 0)
+                                        return r;
+                        }
+                }
+
+                if (streq_ptr(arg_type, CRYPT_TCRYPT))
+                        r = attach_tcrypt(cd, volume, token_type, key_file, key_data, passwords, flags);
+                else
+                        r = attach_luks_or_plain_or_bitlk(cd, volume, token_type, key_file, key_data, passwords, flags, until);
+                if (r >= 0)
+                        break;
+                if (r != -EAGAIN)
+                        return r;
+
+                /* Key not correct? Let's try again, but let's invalidate one of the passed fields, so that
+                 * we fall back to the next best thing. */
+
+                if (token_type == TOKEN_TPM2) {
                         arg_tpm2_device = mfree(arg_tpm2_device);
                         arg_tpm2_device_auto = false;
+                        continue;
                 }
 
-                if (arg_tries != 0 && tries >= arg_tries)
-                        return log_error_errno(SYNTHETIC_ERRNO(EPERM), "Too many attempts to activate; giving up.");
-
-        } else if (streq(verb, "detach")) {
-                const char *volume;
-
-                volume = argv[2];
-
-                if (!filename_is_valid(volume))
-                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Volume name '%s' is not valid.", volume);
-
-                r = crypt_init_by_name(&cd, volume);
-                if (r == -ENODEV) {
-                        log_info("Volume %s already inactive.", volume);
-                        return 0;
+                if (token_type == TOKEN_FIDO2) {
+                        arg_fido2_device = mfree(arg_fido2_device);
+                        arg_fido2_device_auto = false;
+                        continue;
                 }
-                if (r < 0)
-                        return log_error_errno(r, "crypt_init_by_name() failed: %m");
 
-                cryptsetup_enable_logging(cd);
+                if (token_type == TOKEN_PKCS11) {
+                        arg_pkcs11_uri = mfree(arg_pkcs11_uri);
+                        arg_pkcs11_uri_auto = false;
+                        continue;
+                }
 
-                r = crypt_deactivate(cd, volume);
-                if (r < 0)
-                        return log_error_errno(r, "Failed to deactivate: %m");
+                if (try_discover_key) {
+                        try_discover_key = false;
+                        continue;
+                }
 
-        } else
-                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Unknown verb %s.", verb);
+                if (key_file) {
+                        key_file = NULL;
+                        continue;
+                }
+
+                if (passwords) {
+                        passwords = strv_free_erase(passwords);
+                        continue;
+                }
+
+                log_debug("Prepared for next attempt to unlock.");
+        }
+
+        if (arg_tries != 0 && tries >= arg_tries)
+                return log_error_errno(SYNTHETIC_ERRNO(EPERM), "Too many attempts to activate; giving up.");
 
         return 0;
+}
+
+static int verb_detach(int argc, char *argv[], void *userdata) {
+        _cleanup_(crypt_freep) struct crypt_device *cd = NULL;
+        const char *volume = ASSERT_PTR(argv[1]);
+        int r;
+
+        assert(argc == 2);
+
+        if (!filename_is_valid(volume))
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Volume name '%s' is not valid.", volume);
+
+        r = crypt_init_by_name(&cd, volume);
+        if (r == -ENODEV) {
+                log_info("Volume %s already inactive.", volume);
+                return 0;
+        }
+        if (r < 0)
+                return log_error_errno(r, "crypt_init_by_name() for volume '%s' failed: %m", volume);
+
+        cryptsetup_enable_logging(cd);
+
+        r = crypt_deactivate(cd, volume);
+        if (r < 0)
+                return log_error_errno(r, "Failed to deactivate '%s': %m", volume);
+
+        return 0;
+}
+
+static int run(int argc, char *argv[]) {
+        int r;
+
+        log_setup();
+
+        umask(0022);
+
+        r = parse_argv(argc, argv);
+        if (r <= 0)
+                return r;
+
+        cryptsetup_enable_logging(NULL);
+
+        static const Verb verbs[] = {
+                { "attach", 3, 5, 0, verb_attach },
+                { "detach", 2, 2, 0, verb_detach },
+                {}
+        };
+
+        return dispatch_verb(argc, argv, verbs, NULL);
 }
 
 DEFINE_MAIN_FUNCTION(run);

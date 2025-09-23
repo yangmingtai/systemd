@@ -1,17 +1,17 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <netinet/in.h>
-#include <sys/socket.h>
 #include <linux/batman_adv.h>
 #include <linux/fou.h>
 #include <linux/genetlink.h>
 #include <linux/if.h>
+#include <linux/if_ether.h>
 #include <linux/if_macsec.h>
 #include <linux/l2tp.h>
 #include <linux/nl80211.h>
 #include <linux/wireguard.h>
+#include <netinet/in.h>
 
-#include "missing_network.h"
+#include "missing-network.h"
 #include "netlink-genl.h"
 #include "netlink-types-internal.h"
 
@@ -199,6 +199,7 @@ static const NLAPolicy genl_nl80211_policies[] = {
         [NL80211_ATTR_SSID]        = BUILD_POLICY_WITH_SIZE(BINARY, IEEE80211_MAX_SSID_LEN),
         [NL80211_ATTR_STATUS_CODE] = BUILD_POLICY(U16),
         [NL80211_ATTR_4ADDR]       = BUILD_POLICY(U8),
+        [NL80211_ATTR_NETNS_FD]    = BUILD_POLICY(U32),
 };
 
 /***************** genl wireguard type systems *****************/

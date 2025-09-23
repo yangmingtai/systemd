@@ -1,18 +1,24 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <sys/stat.h>
-#include <sys/types.h>
-#include <unistd.h>
+#include "sd-event.h"
 
+#include "alloc-util.h"
+#include "dns-domain.h"
+#include "extract-word.h"
 #include "fd-util.h"
 #include "fileio.h"
 #include "hostname-util.h"
-#include "resolved-dns-synthesize.h"
+#include "log.h"
+#include "resolved-dns-answer.h"
+#include "resolved-dns-question.h"
+#include "resolved-dns-rr.h"
 #include "resolved-etc-hosts.h"
+#include "resolved-manager.h"
+#include "set.h"
 #include "socket-netlink.h"
 #include "stat-util.h"
 #include "string-util.h"
-#include "strv.h"
 #include "time-util.h"
 
 /* Recheck /etc/hosts at most once every 2s */
@@ -189,9 +195,18 @@ static int parse_line(EtcHosts *hosts, unsigned nr, const char *line) {
                                 return log_oom();
                 }
 
-                r = set_ensure_consume(&item->names, &dns_name_hash_ops_free, TAKE_PTR(name));
+                r = set_ensure_put(&item->names, &dns_name_hash_ops_free, name);
                 if (r < 0)
                         return log_oom();
+                if (r == 0) /* the name is already listed */
+                        continue;
+                /*
+                 * Keep track of the first name listed for this address.
+                 * This name will be used in responses as the canonical name.
+                 */
+                if (!item->canonical_name)
+                        item->canonical_name = name;
+                TAKE_PTR(name);
         }
 
         if (!found)
@@ -226,12 +241,12 @@ static void strip_localhost(EtcHosts *hosts) {
          * This way our regular synthesizing can take over, but only if it would result in the exact same
          * mappings.  */
 
-        for (size_t j = 0; j < ELEMENTSOF(local_in_addrs); j++) {
+        FOREACH_ELEMENT(local_in_addr, local_in_addrs) {
                 bool all_localhost, all_local_address;
                 EtcHostsItemByAddress *item;
                 const char *name;
 
-                item = hashmap_get(hosts->by_address, local_in_addrs + j);
+                item = hashmap_get(hosts->by_address, local_in_addr);
                 if (!item)
                         continue;
 
@@ -275,7 +290,7 @@ static void strip_localhost(EtcHosts *hosts) {
                 SET_FOREACH(name, item->names)
                         etc_hosts_item_by_name_free(hashmap_remove(hosts->by_name, name));
 
-                assert_se(hashmap_remove(hosts->by_address, local_in_addrs + j) == item);
+                assert_se(hashmap_remove(hosts->by_address, local_in_addr) == item);
                 etc_hosts_item_by_address_free(item);
         }
 }
@@ -333,7 +348,7 @@ static int manager_etc_hosts_read(Manager *m) {
 
         m->etc_hosts_last = ts;
 
-        if (m->etc_hosts_stat.st_mode != 0) {
+        if (stat_is_set(&m->etc_hosts_stat)) {
                 if (stat("/etc/hosts", &st) < 0) {
                         if (errno != ENOENT)
                                 return log_error_errno(errno, "Failed to stat /etc/hosts: %m");
@@ -350,7 +365,7 @@ static int manager_etc_hosts_read(Manager *m) {
         f = fopen("/etc/hosts", "re");
         if (!f) {
                 if (errno != ENOENT)
-                        return log_error_errno(errno, "Failed to open /etc/hosts: %m");
+                        return log_error_errno(errno, "Failed to open %s: %m", "/etc/hosts");
 
                 manager_etc_hosts_flush(m);
                 return 0;
@@ -370,6 +385,45 @@ static int manager_etc_hosts_read(Manager *m) {
         m->etc_hosts_last = ts;
 
         return 1;
+}
+
+static int answer_add_ptr(DnsAnswer *answer, DnsResourceKey *key, const char *name) {
+        _cleanup_(dns_resource_record_unrefp) DnsResourceRecord *rr = NULL;
+
+        rr = dns_resource_record_new(key);
+        if (!rr)
+                return -ENOMEM;
+
+        rr->ptr.name = strdup(name);
+        if (!rr->ptr.name)
+                return -ENOMEM;
+
+        return dns_answer_add(answer, rr, 0, DNS_ANSWER_AUTHENTICATED, NULL);
+}
+
+static int answer_add_cname(DnsAnswer *answer, const char *name, const char *cname) {
+        _cleanup_(dns_resource_record_unrefp) DnsResourceRecord *rr = NULL;
+
+        rr = dns_resource_record_new_full(DNS_CLASS_IN, DNS_TYPE_CNAME, name);
+        if (!rr)
+                return -ENOMEM;
+
+        rr->cname.name = strdup(cname);
+        if (!rr->cname.name)
+                return -ENOMEM;
+
+        return dns_answer_add(answer, rr, 0, DNS_ANSWER_AUTHENTICATED, NULL);
+}
+
+static int answer_add_addr(DnsAnswer *answer, const char *name, const struct in_addr_data *a) {
+        _cleanup_(dns_resource_record_unrefp) DnsResourceRecord *rr = NULL;
+        int r;
+
+        r = dns_resource_record_new_address(&rr, a->family, &a->address, name);
+        if (r < 0)
+                return r;
+
+        return dns_answer_add(answer, rr, 0, DNS_ANSWER_AUTHENTICATED, NULL);
 }
 
 static int etc_hosts_lookup_by_address(
@@ -418,18 +472,17 @@ static int etc_hosts_lookup_by_address(
                 if (r < 0)
                         return r;
 
+                if (item->canonical_name) {
+                        r = answer_add_ptr(*answer, found_ptr, item->canonical_name);
+                        if (r < 0)
+                                return r;
+                }
+
                 SET_FOREACH(n, item->names) {
-                        _cleanup_(dns_resource_record_unrefp) DnsResourceRecord *rr = NULL;
+                        if (n == item->canonical_name)
+                                continue;
 
-                        rr = dns_resource_record_new(found_ptr);
-                        if (!rr)
-                                return -ENOMEM;
-
-                        rr->ptr.name = strdup(n);
-                        if (!rr->ptr.name)
-                                return -ENOMEM;
-
-                        r = dns_answer_add(*answer, rr, 0, DNS_ANSWER_AUTHENTICATED, NULL);
+                        r = answer_add_ptr(*answer, found_ptr, n);
                         if (r < 0)
                                 return r;
                 }
@@ -444,7 +497,7 @@ static int etc_hosts_lookup_by_name(
                 const char *name,
                 DnsAnswer **answer) {
 
-        bool found_a = false, found_aaaa = false;
+        bool question_for_a = false, question_for_aaaa = false;
         const struct in_addr_data *a;
         EtcHostsItemByName *item;
         DnsResourceKey *t;
@@ -466,6 +519,7 @@ static int etc_hosts_lookup_by_name(
                         return 0;
         }
 
+        /* Determine whether we are looking for A and/or AAAA RRs */
         DNS_QUESTION_FOREACH(t, q) {
                 if (!IN_SET(t->type, DNS_TYPE_A, DNS_TYPE_AAAA, DNS_TYPE_ANY))
                         continue;
@@ -479,31 +533,40 @@ static int etc_hosts_lookup_by_name(
                         continue;
 
                 if (IN_SET(t->type, DNS_TYPE_A, DNS_TYPE_ANY))
-                        found_a = true;
+                        question_for_a = true;
                 if (IN_SET(t->type, DNS_TYPE_AAAA, DNS_TYPE_ANY))
-                        found_aaaa = true;
+                        question_for_aaaa = true;
 
-                if (found_a && found_aaaa)
-                        break;
+                if (question_for_a && question_for_aaaa)
+                        break; /* We are looking for both, no need to continue loop */
         }
 
         SET_FOREACH(a, item ? item->addresses : NULL) {
-                _cleanup_(dns_resource_record_unrefp) DnsResourceRecord *rr = NULL;
+                EtcHostsItemByAddress *item_by_addr;
+                const char *canonical_name;
 
-                if ((!found_a && a->family == AF_INET) ||
-                    (!found_aaaa && a->family == AF_INET6))
+                if ((!question_for_a && a->family == AF_INET) ||
+                    (!question_for_aaaa && a->family == AF_INET6))
                         continue;
 
-                r = dns_resource_record_new_address(&rr, a->family, &a->address, item->name);
-                if (r < 0)
-                        return r;
+                item_by_addr = hashmap_get(hosts->by_address, a);
+                if (item_by_addr && item_by_addr->canonical_name)
+                        canonical_name = item_by_addr->canonical_name;
+                else
+                        canonical_name = item->name;
 
-                r = dns_answer_add(*answer, rr, 0, DNS_ANSWER_AUTHENTICATED, NULL);
+                if (!streq(item->name, canonical_name)) {
+                        r = answer_add_cname(*answer, item->name, canonical_name);
+                        if (r < 0)
+                                return r;
+                }
+
+                r = answer_add_addr(*answer, canonical_name, a);
                 if (r < 0)
                         return r;
         }
 
-        return found_a || found_aaaa;
+        return true; /* We consider ourselves authoritative for the whole name, all RR types, not just A/AAAA */
 }
 
 int manager_etc_hosts_lookup(Manager *m, DnsQuestion *q, DnsAnswer **answer) {

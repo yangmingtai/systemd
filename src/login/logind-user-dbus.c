@@ -1,20 +1,23 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <errno.h>
+#include "sd-bus.h"
 
 #include "alloc-util.h"
 #include "bus-get-properties.h"
+#include "bus-object.h"
 #include "bus-polkit.h"
-#include "bus-util.h"
 #include "format-util.h"
-#include "logind-dbus.h"
-#include "logind-session-dbus.h"
-#include "logind-user-dbus.h"
-#include "logind-user.h"
+#include "hashmap.h"
 #include "logind.h"
-#include "missing_capability.h"
+#include "logind-dbus.h"
+#include "logind-session.h"
+#include "logind-session-dbus.h"
+#include "logind-user.h"
+#include "logind-user-dbus.h"
 #include "signal-util.h"
+#include "string-util.h"
 #include "strv.h"
+#include "user-record.h"
 #include "user-util.h"
 
 static int property_get_uid(
@@ -192,13 +195,12 @@ int bus_user_method_terminate(sd_bus_message *message, void *userdata, sd_bus_er
 
         assert(message);
 
-        r = bus_verify_polkit_async(
+        r = bus_verify_polkit_async_full(
                         message,
-                        CAP_KILL,
                         "org.freedesktop.login1.manage",
-                        NULL,
-                        false,
+                        /* details= */ NULL,
                         u->user_record->uid,
+                        /* flags= */ 0,
                         &u->manager->polkit_registry,
                         error);
         if (r < 0)
@@ -220,13 +222,12 @@ int bus_user_method_kill(sd_bus_message *message, void *userdata, sd_bus_error *
 
         assert(message);
 
-        r = bus_verify_polkit_async(
+        r = bus_verify_polkit_async_full(
                         message,
-                        CAP_KILL,
                         "org.freedesktop.login1.manage",
-                        NULL,
-                        false,
+                        /* details= */ NULL,
                         u->user_record->uid,
+                        /* flags= */ 0,
                         &u->manager->polkit_registry,
                         error);
         if (r < 0)
@@ -291,7 +292,7 @@ static int user_object_find(sd_bus *bus, const char *path, const char *interface
         return 1;
 }
 
-char *user_bus_path(User *u) {
+char* user_bus_path(User *u) {
         char *s;
 
         assert(u);
@@ -358,7 +359,7 @@ static const sd_bus_vtable user_vtable[] = {
         SD_BUS_PROPERTY("Name", "s", property_get_name, 0, SD_BUS_VTABLE_PROPERTY_CONST),
         BUS_PROPERTY_DUAL_TIMESTAMP("Timestamp", offsetof(User, timestamp), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("RuntimePath", "s", NULL, offsetof(User, runtime_path), SD_BUS_VTABLE_PROPERTY_CONST),
-        SD_BUS_PROPERTY("Service", "s", NULL, offsetof(User, service), SD_BUS_VTABLE_PROPERTY_CONST),
+        SD_BUS_PROPERTY("Service", "s", NULL, offsetof(User, service_manager_unit), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("Slice", "s", NULL, offsetof(User, slice), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("Display", "(so)", property_get_display, 0, SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
         SD_BUS_PROPERTY("State", "s", property_get_state, 0, 0),
@@ -402,9 +403,8 @@ int user_send_signal(User *u, bool new_user) {
                         "uo", (uint32_t) u->user_record->uid, p);
 }
 
-int user_send_changed(User *u, const char *properties, ...) {
+int user_send_changed_strv(User *u, char **properties) {
         _cleanup_free_ char *p = NULL;
-        char **l;
 
         assert(u);
 
@@ -415,7 +415,5 @@ int user_send_changed(User *u, const char *properties, ...) {
         if (!p)
                 return -ENOMEM;
 
-        l = strv_from_stdarg_alloca(properties);
-
-        return sd_bus_emit_properties_changed_strv(u->manager->bus, p, "org.freedesktop.login1.User", l);
+        return sd_bus_emit_properties_changed_strv(u->manager->bus, p, "org.freedesktop.login1.User", properties);
 }

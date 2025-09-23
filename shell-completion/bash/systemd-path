@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # systemd-path(1) completion                               -*- shell-script -*-
 # SPDX-License-Identifier: LGPL-2.1-or-later
 #
@@ -25,7 +26,7 @@ __contains_word () {
 }
 
 __get_names() {
-    systemd-path | { while IFS=: read -r a b; do echo " $a"; done; }
+    systemd-path 2>/dev/null | { while IFS=: read -r a b; do echo " $a"; done; }
 }
 
 _systemd_path() {

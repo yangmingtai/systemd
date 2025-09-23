@@ -1,24 +1,15 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <errno.h>
-#include <stdbool.h>
 #include <stdlib.h>
-#include <sys/stat.h>
-#include <unistd.h>
 
 #include "alloc-util.h"
 #include "fd-util.h"
 #include "fileio.h"
 #include "fstab-util.h"
 #include "generator.h"
-#include "hexdecoct.h"
-#include "id128-util.h"
 #include "integrity-util.h"
-#include "main-func.h"
-#include "mkdir.h"
-#include "parse-util.h"
+#include "log.h"
 #include "path-util.h"
-#include "proc-cmdline.h"
 #include "specifier.h"
 #include "string-util.h"
 #include "unit-name.h"
@@ -36,11 +27,16 @@ static int create_disk(
 
         _cleanup_free_ char *n = NULL, *dd = NULL, *e = NULL, *name_escaped = NULL, *key_file_escaped = NULL;
         _cleanup_fclose_ FILE *f = NULL;
-        int r;
         char *dmname = NULL;
+        bool noauto, nofail, netdev;
+        int r;
 
         assert(name);
         assert(device);
+
+        noauto = fstab_test_yes_no_option(options, "noauto\0" "auto\0");
+        nofail = fstab_test_yes_no_option(options, "nofail\0" "fail\0");
+        netdev = fstab_test_option(options, "_netdev\0");
 
         name_escaped = specifier_escape(name);
         if (!name_escaped)
@@ -88,21 +84,28 @@ static int create_disk(
                 "Before=blockdev@dev-mapper-%%i.target\n"
                 "Wants=blockdev@dev-mapper-%%i.target\n"
                 "Conflicts=umount.target\n"
-                "Before=integritysetup.target\n"
                 "BindsTo=%s\n"
                 "After=%s\n"
                 "Before=umount.target\n",
                 arg_integritytab,
                 dd, dd);
 
+        if (netdev)
+                fprintf(f, "After=remote-fs-pre.target\n");
+
+        if (!nofail)
+                fprintf(f,
+                        "Before=%s\n",
+                        netdev ? "remote-integritysetup.target" : "integritysetup.target");
+
         fprintf(f,
                 "\n"
                 "[Service]\n"
                 "Type=oneshot\n"
                 "RemainAfterExit=yes\n"
-                "TimeoutSec=0\n"
-                "ExecStart=" ROOTLIBEXECDIR "/systemd-integritysetup attach '%s' '%s' '%s' '%s'\n"
-                "ExecStop=" ROOTLIBEXECDIR "/systemd-integritysetup detach '%s'\n",
+                "TimeoutSec=infinity\n"
+                "ExecStart=" LIBEXECDIR "/systemd-integritysetup attach '%s' '%s' '%s' '%s'\n"
+                "ExecStop=" LIBEXECDIR "/systemd-integritysetup detach '%s'\n",
                 name_escaped, device, empty_to_dash(key_file_escaped), empty_to_dash(options),
                 name_escaped);
 
@@ -110,9 +113,15 @@ static int create_disk(
         if (r < 0)
                 return log_error_errno(r, "Failed to write unit file %s: %m", n);
 
-        r = generator_add_symlink(arg_dest, "integritysetup.target", "requires", n);
-        if (r < 0)
-                return r;
+        if (!noauto) {
+                r = generator_add_symlink(
+                                arg_dest,
+                                netdev ? "remote-integritysetup.target" : "integritysetup.target",
+                                nofail ? "wants" : "requires",
+                                n);
+                if (r < 0)
+                        return r;
+        }
 
         dmname = strjoina("dev-mapper-", e, ".device");
         return generator_add_symlink(arg_dest, dmname, "requires", n);
@@ -132,9 +141,8 @@ static int add_integritytab_devices(void) {
 
         for (;;) {
                 _cleanup_free_ char *line = NULL, *name = NULL, *device_id = NULL, *device_path = NULL, *key_file = NULL, *options = NULL;
-                char *l;
 
-                r = read_line(f, LONG_LINE_MAX, &line);
+                r = read_stripped_line(f, LONG_LINE_MAX, &line);
                 if (r < 0)
                         return log_error_errno(r, "Failed to read %s: %m", arg_integritytab);
                 if (r == 0)
@@ -142,17 +150,13 @@ static int add_integritytab_devices(void) {
 
                 integritytab_line++;
 
-                l = strstrip(line);
-                if (!l)
-                        continue;
-
-                if (IN_SET(l[0], 0, '#'))
+                if (IN_SET(line[0], 0, '#'))
                         continue;
 
                 /* The key file and the options are optional */
-                r = sscanf(l, "%ms %ms %ms %ms", &name, &device_id, &key_file, &options);
+                r = sscanf(line, "%ms %ms %ms %ms", &name, &device_id, &key_file, &options);
                 if (!IN_SET(r, 2, 3, 4)) {
-                        log_error("Failed to parse %s:%u, ignoring.", l, integritytab_line);
+                        log_error("Failed to parse %s:%u, ignoring.", arg_integritytab, integritytab_line);
                         continue;
                 }
 

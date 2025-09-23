@@ -1,13 +1,15 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
+#include <stdlib.h>
 #include <sys/stat.h>
-#include <sys/types.h>
+
+#include "sd-event.h"
 
 #include "daemon-util.h"
-#include "userdbd-manager.h"
 #include "log.h"
 #include "main-func.h"
 #include "signal-util.h"
+#include "userdbd-manager.h"
 
 /* This service offers two Varlink services, both implementing io.systemd.UserDatabase:
  *
@@ -37,7 +39,7 @@ static int run(int argc, char *argv[]) {
         if (setenv("SYSTEMD_BYPASS_USERDB", "io.systemd.NameServiceSwitch:io.systemd.Multiplexer:io.systemd.DropIn", 1) < 0)
                 return log_error_errno(errno, "Failed to set $SYSTEMD_BYPASS_USERDB: %m");
 
-        assert_se(sigprocmask_many(SIG_BLOCK, NULL, SIGCHLD, -1) >= 0);
+        assert_se(sigprocmask_many(SIG_BLOCK, NULL, SIGCHLD) >= 0);
 
         r = manager_new(&m);
         if (r < 0)
@@ -47,7 +49,7 @@ static int run(int argc, char *argv[]) {
         if (r < 0)
                 return log_error_errno(r, "Failed to start up daemon: %m");
 
-        notify_stop = notify_start(NOTIFY_READY, NOTIFY_STOPPING);
+        notify_stop = notify_start(NOTIFY_READY_MESSAGE, NOTIFY_STOPPING_MESSAGE);
 
         r = sd_event_loop(m->event);
         if (r < 0)

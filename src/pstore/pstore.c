@@ -4,47 +4,26 @@
 
 /* Generally speaking, the pstore contains a small number of files
  * that in turn contain a small amount of data.  */
-#include <errno.h>
 #include <stdio.h>
-#include <stdio_ext.h>
-#include <sys/prctl.h>
-#include <sys/xattr.h>
 #include <unistd.h>
 
-#include "sd-daemon.h"
 #include "sd-journal.h"
-#include "sd-login.h"
-#include "sd-messages.h"
 
-#include "acl-util.h"
 #include "alloc-util.h"
-#include "capability-util.h"
-#include "cgroup-util.h"
-#include "compress.h"
 #include "conf-parser.h"
 #include "copy.h"
 #include "dirent-util.h"
-#include "escape.h"
 #include "fd-util.h"
 #include "fileio.h"
-#include "fs-util.h"
-#include "io-util.h"
-#include "journal-importer.h"
+#include "iovec-util.h"
 #include "log.h"
-#include "macro.h"
 #include "main-func.h"
 #include "mkdir.h"
 #include "parse-util.h"
-#include "process-util.h"
-#include "signal-util.h"
-#include "socket-util.h"
-#include "special.h"
 #include "sort-util.h"
 #include "string-table.h"
 #include "string-util.h"
 #include "strv.h"
-#include "tmpfile-util.h"
-#include "user-util.h"
 
 /* Command line argument handling */
 typedef enum PStoreStorage {
@@ -56,13 +35,13 @@ typedef enum PStoreStorage {
 } PStoreStorage;
 
 static const char* const pstore_storage_table[_PSTORE_STORAGE_MAX] = {
-        [PSTORE_STORAGE_NONE] = "none",
+        [PSTORE_STORAGE_NONE]     = "none",
         [PSTORE_STORAGE_EXTERNAL] = "external",
-        [PSTORE_STORAGE_JOURNAL] = "journal",
+        [PSTORE_STORAGE_JOURNAL]  = "journal",
 };
 
 DEFINE_PRIVATE_STRING_TABLE_LOOKUP(pstore_storage, PStoreStorage);
-static DEFINE_CONFIG_PARSE_ENUM(config_parse_pstore_storage, pstore_storage, PStoreStorage, "Failed to parse storage setting");
+static DEFINE_CONFIG_PARSE_ENUM(config_parse_pstore_storage, pstore_storage, PStoreStorage);
 
 static PStoreStorage arg_storage = PSTORE_STORAGE_EXTERNAL;
 
@@ -77,9 +56,12 @@ static int parse_config(void) {
                 {}
         };
 
-        return config_parse_config_file("pstore.conf", "PStore\0",
-                                        config_item_table_lookup, items,
-                                        CONFIG_PARSE_WARN, NULL);
+        return config_parse_standard_file_with_dropins(
+                        "systemd/pstore.conf",
+                        "PStore\0",
+                        config_item_table_lookup, items,
+                        CONFIG_PARSE_WARN,
+                        /* userdata= */ NULL);
 }
 
 /* File list handling - PStoreEntry is the struct and
@@ -227,7 +209,9 @@ static int process_dmesg_files(PStoreList *list) {
                 if (!startswith(pe->dirent.d_name, "dmesg-"))
                         continue;
 
-                if ((p = startswith(pe->dirent.d_name, "dmesg-efi-"))) {
+                /* The linux kernel changed the prefix from dmesg-efi- to dmesg-efi_pstore-
+                 * so now we have to handle both cases. */
+                if ((p = STARTSWITH_SET(pe->dirent.d_name, "dmesg-efi-", "dmesg-efi_pstore-"))) {
                         /* For the EFI backend, the 3 least significant digits of record id encodes a
                          * "count" number, the next 2 least significant digits for the dmesg part
                          * (chunk) number, and the remaining digits as the timestamp.  See
@@ -277,11 +261,12 @@ static int process_dmesg_files(PStoreList *list) {
                 } else
                         log_debug("Unknown backend, ignoring \"%s\".", pe->dirent.d_name);
         }
+
         return 0;
 }
 
 static int list_files(PStoreList *list, const char *sourcepath) {
-        _cleanup_(closedirp) DIR *dirp = NULL;
+        _cleanup_closedir_ DIR *dirp = NULL;
         int r;
 
         dirp = opendir(sourcepath);

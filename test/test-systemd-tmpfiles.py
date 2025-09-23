@@ -31,6 +31,14 @@ except AttributeError:
 exe_with_args = sys.argv[1:]
 temp_dir = tempfile.TemporaryDirectory(prefix='test-systemd-tmpfiles.')
 
+# If /tmp isn't owned by either 'root' or the current user
+# systemd-tmpfiles will exit with "Detected unsafe path transition"
+# breaking this test
+tmpowner = os.stat("/tmp").st_uid
+if tmpowner != 0 and tmpowner != os.getuid():
+    print("Skip: /tmp is not owned by 'root' or current user")
+    sys.exit(EXIT_TEST_SKIP)
+
 def test_line(line, *, user, returncode=EX_DATAERR, extra={}):
     args = ['--user'] if user else []
     print('Running {} on {!r}'.format(' '.join(exe_with_args + args), line))
@@ -130,22 +138,23 @@ def test_valid_specifiers(*, user):
                      xdg_runtime_dir if user else '/run',
                      user=user)
 
-    xdg_config_home = os.getenv('XDG_CONFIG_HOME')
-    if xdg_config_home is not None or not user:
-        test_content('f {} - - - - %S',
-                     xdg_config_home if user else '/var/lib',
-                     user=user)
+    xdg_state_home = os.getenv('XDG_STATE_HOME')
+    if xdg_state_home is None and user:
+        xdg_state_home = os.path.join(home, ".local/state")
+    test_content('f {} - - - - %S',
+                 xdg_state_home if user else '/var/lib',
+                 user=user)
 
     xdg_cache_home = os.getenv('XDG_CACHE_HOME')
-    if xdg_cache_home is not None or not user:
-        test_content('f {} - - - - %C',
-                     xdg_cache_home if user else '/var/cache',
-                     user=user)
+    if xdg_cache_home is None and user:
+        xdg_cache_home = os.path.join(home, ".cache")
+    test_content('f {} - - - - %C',
+                 xdg_cache_home if user else '/var/cache',
+                 user=user)
 
-    if xdg_config_home is not None or not user:
-        test_content('f {} - - - - %L',
-                     xdg_config_home + '/log' if user else '/var/log',
-                     user=user)
+    test_content('f {} - - - - %L',
+                 os.path.join(xdg_state_home, 'log') if user else '/var/log',
+                 user=user)
 
     test_content('f {} - - - - %%', '%', user=user)
 

@@ -8,16 +8,17 @@
 #include <linux/cdrom.h>
 #include <scsi/sg.h>
 #include <sys/ioctl.h>
-#include <unistd.h>
 
+#include "alloc-util.h"
 #include "build.h"
+#include "errno-util.h"
 #include "fd-util.h"
 #include "main-func.h"
-#include "memory-util.h"
 #include "random-util.h"
 #include "sort-util.h"
 #include "string-table.h"
 #include "string-util.h"
+#include "time-util.h"
 #include "udev-util.h"
 #include "unaligned.h"
 
@@ -477,12 +478,11 @@ static int cd_profiles(Context *c) {
 
                 switch (feature) {
                 case 0x00:
-                        log_debug("GET CONFIGURATION: feature 'profiles', with %u entries", features[i + 3] / 4);
+                        log_debug("GET CONFIGURATION: feature 'profiles', with %u entries", features[i + 3] / 4U);
                         feature_profiles(c, features + i + 4, MIN(features[i + 3], len - i - 4));
                         break;
                 default:
                         log_debug("GET CONFIGURATION: feature 0x%04x <ignored>, with 0x%02x bytes", feature, features[i + 3]);
-                        break;
                 }
         }
 
@@ -750,7 +750,7 @@ static int open_drive(Context *c) {
                 if (++cnt >= 20 || errno != EBUSY)
                         return log_debug_errno(errno, "Unable to open '%s': %m", arg_node);
 
-                (void) usleep(100 * USEC_PER_MSEC + random_u64_range(100 * USEC_PER_MSEC));
+                (void) usleep_safe(100 * USEC_PER_MSEC + random_u64_range(100 * USEC_PER_MSEC));
         }
 
         log_debug("probing: '%s'", arg_node);
@@ -818,7 +818,7 @@ static int feature_to_string_compare_func(const FeatureToString *a, const Featur
 }
 
 static void print_feature(Feature feature, const char *prefix) {
-        FeatureToString *found, in = {
+        const FeatureToString *found, in = {
                 .feature = feature,
         };
 
@@ -959,18 +959,18 @@ static int run(int argc, char *argv[]) {
         _cleanup_(context_clear) Context c = CONTEXT_EMPTY;
         int r;
 
-        log_set_target(LOG_TARGET_AUTO);
-        udev_parse_config();
-        log_parse_environment();
-        log_open();
+        (void) udev_parse_config();
+        log_setup();
 
         r = parse_argv(argc, argv);
         if (r <= 0)
                 return r;
 
         r = open_drive(&c);
+        if (ERRNO_IS_NEG_DEVICE_ABSENT(r))
+                return 0;
         if (r < 0)
-                return r;
+                return log_warning_errno(r, "Failed to open device node '%s': %m", arg_node);
 
         /* same data as original cdrom_id */
         r = cd_capability_compat(&c);

@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include "emergency-action.h"
+#include "runtime-scope.h"
 #include "tests.h"
 
 TEST(parse_emergency_action) {
@@ -38,6 +39,14 @@ TEST(parse_emergency_action) {
         assert_se(parse_emergency_action("exit-force", RUNTIME_SCOPE_SYSTEM, &x) == 0);
         assert_se(parse_emergency_action("exit-forcee", RUNTIME_SCOPE_SYSTEM, &x) == -EINVAL);
         assert_se(x == EMERGENCY_ACTION_EXIT_FORCE);
+        assert_se(parse_emergency_action("kexec", RUNTIME_SCOPE_SYSTEM, &x) == 0);
+        assert_se(parse_emergency_action("kexec-force", RUNTIME_SCOPE_SYSTEM, &x) == 0);
+        assert_se(parse_emergency_action("kexec-forcee", RUNTIME_SCOPE_SYSTEM, &x) == -EINVAL);
+        assert_se(x == EMERGENCY_ACTION_KEXEC_FORCE);
+        assert_se(parse_emergency_action("halt", RUNTIME_SCOPE_SYSTEM, &x) == 0);
+        assert_se(parse_emergency_action("halt-force", RUNTIME_SCOPE_SYSTEM, &x) == 0);
+        assert_se(parse_emergency_action("halt-forcee", RUNTIME_SCOPE_SYSTEM, &x) == -EINVAL);
+        assert_se(x == EMERGENCY_ACTION_HALT_FORCE);
 }
 
 DEFINE_TEST_MAIN(LOG_INFO);

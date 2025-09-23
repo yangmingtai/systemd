@@ -2,7 +2,6 @@
 
 #include <stdio.h>
 
-#include "macro.h"
 #include "replace-var.h"
 #include "string-util.h"
 #include "tests.h"
@@ -16,7 +15,7 @@ TEST(replace_var) {
 
         assert_se(r = replace_var("@@@foobar@xyz@HALLO@foobar@test@@testtest@TEST@...@@@", lookup, NULL));
         puts(r);
-        assert_se(streq(r, "@@@foobar@xyz<<<HALLO>>>foobar@test@@testtest<<<TEST>>>...@@@"));
+        ASSERT_STREQ(r, "@@@foobar@xyz<<<HALLO>>>foobar@test@@testtest<<<TEST>>>...@@@");
         free(r);
 }
 
@@ -25,7 +24,7 @@ TEST(strreplace) {
 
         assert_se(r = strreplace("XYZFFFFXYZFFFFXYZ", "XYZ", "ABC"));
         puts(r);
-        assert_se(streq(r, "ABCFFFFABCFFFFABC"));
+        ASSERT_STREQ(r, "ABCFFFFABCFFFFABC");
         free(r);
 }
 

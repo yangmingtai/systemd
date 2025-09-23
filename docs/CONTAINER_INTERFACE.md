@@ -7,8 +7,7 @@ SPDX-License-Identifier: LGPL-2.1-or-later
 
 # The Container Interface
 
-Also consult [Writing Virtual Machine or Container
-Managers](https://www.freedesktop.org/wiki/Software/systemd/writing-vm-managers).
+Also consult [Writing Virtual Machine or Container Managers](/WRITING_VM_AND_CONTAINER_MANAGERS).
 
 systemd has a number of interfaces for interacting with container managers,
 when systemd is used inside of an OS container. If you work on a container
@@ -25,16 +24,19 @@ manager, please consider supporting the following interfaces.
    invoking systemd, and mount `/sys/`, `/sys/fs/selinux/` and `/proc/sys/`
    read-only (the latter via e.g. a read-only bind mount on itself) in order
    to prevent the container from altering the host kernel's configuration
-   settings. (As a special exception, if your container has network namespaces
+   settings. As a special exception, if your container has network namespaces
    enabled, feel free to make `/proc/sys/net/` writable. If it also has user, ipc,
-   uts and pid namespaces enabled, the entire `/proc/sys` can be left writable).
-   systemd and various other subsystems (such as the SELinux userspace) have
-   been modified to behave accordingly when these file systems are read-only.
-   (It's OK to mount `/sys/` as `tmpfs` btw, and only mount a subset of its
-   sub-trees from the real `sysfs` to hide `/sys/firmware/`, `/sys/kernel/` and
-   so on. If you do that, make sure to mark `/sys/` read-only, as that
-   condition is what systemd looks for, and is what is considered to be the API
-   in this context.)
+   uts and pid namespaces enabled, the entire `/proc/sys` can be left writable.
+   However, in the latter case, an appropriate userns mapping should exist to
+   map the root user inside the container to an unprivileged user on the
+   host. Otherwise, the root user inside the container could modify the host's
+   kernel settings. systemd and various other subsystems (such as the SELinux
+   userspace) have been modified to behave accordingly when these file systems
+   are read-only. (It's OK to mount `/sys/` as `tmpfs` btw, and only mount a
+   subset of its sub-trees from the real `sysfs` to hide `/sys/firmware/`,
+   `/sys/kernel/` and so on. If you do that, make sure to mark `/sys/`
+   read-only, as that condition is what systemd looks for, and is what is
+   considered to be the API in this context.)
 
 3. Pre-mount `/dev/` as (container private) `tmpfs` for the container and bind
    mount some suitable TTY to `/dev/console`. If this is a pty, make sure to
@@ -44,9 +46,8 @@ manager, please consider supporting the following interfaces.
    for `/dev/null`, `/dev/zero`, `/dev/full`, `/dev/random`, `/dev/urandom`,
    `/dev/tty`, `/dev/ptmx` in `/dev/`. It is not necessary to create `/dev/fd`
    or `/dev/stdout`, as systemd will do that on its own. Make sure to set up a
-   `BPF_PROG_TYPE_CGROUP_DEVICE` BPF program — on cgroupv2 — or the `devices`
-   cgroup controller — on cgroupv1 — so that no other devices but these may be
-   created in the container. Note that many systemd services use
+   `BPF_PROG_TYPE_CGROUP_DEVICE` BPF program on cgroupv2, so that no other devices
+   but these may be created in the container. Note that many systemd services use
    `PrivateDevices=`, which means that systemd will set up a private `/dev/`
    for them for which it needs to be able to create these device nodes.
    Dropping `CAP_MKNOD` for containers is hence generally not advisable, but
@@ -70,13 +71,7 @@ manager, please consider supporting the following interfaces.
    root-level cgroup directories tend to be quite different from inner
    directories, and that distinction matters. It is OK however, to mount the
    "upper" parts read-only of the hierarchies, and only allow write-access to
-   the cgroup sub-tree the container runs in. It's also a good idea to mount
-   all controller hierarchies with exception of `name=systemd` fully read-only
-   (this only applies to cgroupv1, of course), to protect the controllers from
-   alteration from inside the containers. Or to turn this around: only the
-   cgroup sub-tree of the container itself (on cgroupv2 in the unified
-   hierarchy, and on cgroupv1 in the `name=systemd` hierarchy) may be writable
-   to the container.
+   the cgroup sub-tree the container runs in.
 
 7. Create the control group root of your container by either running your
    container as a service (in case you have one container manager instance per
@@ -121,7 +116,7 @@ manager, please consider supporting the following interfaces.
    variable's name you may only specify ptys, and not other types of ttys. Also
    you need to specify the pty itself, a symlink will not suffice. This is
    implemented in
-   [systemd-getty-generator(8)](https://www.freedesktop.org/software/systemd/man/systemd-getty-generator.html).
+   [systemd-getty-generator(8)](https://www.freedesktop.org/software/systemd/man/latest/systemd-getty-generator.html).
    Note that this variable should not include the pty that `/dev/console` maps
    to if it maps to one (see below). Example: if the container receives
    `container_ttys=pts/7 pts/8 pts/14` it will spawn three additional login
@@ -131,22 +126,23 @@ manager, please consider supporting the following interfaces.
    running the container manager, if this is considered desirable, please parse
    the host's `/etc/os-release` and set a `$container_host_<key>=<VALUE>`
    environment variable for the ID fields described by the [os-release
-   interface](https://www.freedesktop.org/software/systemd/man/os-release.html), eg:
+   interface](https://www.freedesktop.org/software/systemd/man/latest/os-release.html), eg:
    `$container_host_id=debian`
    `$container_host_build_id=2020-06-15`
    `$container_host_variant_id=server`
    `$container_host_version_id=10`
 
 5. systemd supports passing immutable binary data blobs with limited size and
-   restricted access to services via the `LoadCredential=` and `SetCredential=`
-   settings. The same protocol may be used to pass credentials from the
-   container manager to systemd itself. The credential data should be placed in
-   some location (ideally a read-only and non-swappable file system, like
-   'ramfs'), and the absolute path to this directory exported in the
+   restricted access to services via the `ImportCredential=`, `LoadCredential=`
+   and `SetCredential=` settings. The same protocol may be used to pass credentials
+   from the container manager to systemd itself. The credential data should be
+   placed in some location (ideally a read-only and non-swappable file system,
+   like 'ramfs'), and the absolute path to this directory exported in the
    `$CREDENTIALS_DIRECTORY` environment variable. If the container managers
    does this, the credentials passed to the service manager can be propagated
-   to services via `LoadCredential=` (see ...). The container manager can
-   choose any path, but `/run/host/credentials` is recommended.
+   to services via `LoadCredential=` or `ImportCredential=` (see ...). The
+   container manager can choose any path, but `/run/host/credentials` is
+   recommended.
 
 ## Advanced Integration
 
@@ -164,13 +160,18 @@ manager, please consider supporting the following interfaces.
    issuing `journalctl -m`. The container machine ID can be determined from
    `/etc/machine-id` in the container.
 
-3. If the container manager wants to cleanly shutdown the container, it might
+3. If the container manager wants to cleanly shut down the container, it might
    be a good idea to send `SIGRTMIN+3` to its init process. systemd will then
    do a clean shutdown. Note however, that since only systemd understands
-   `SIGRTMIN+3` like this, this might confuse other init systems.
+   `SIGRTMIN+3` like this, this might confuse other init systems. A container
+   manager may implement the `$NOTIFY_SOCKET` protocol mentioned below in which
+   case it will receive a notification message `X_SYSTEMD_SIGNALS_LEVEL=2` that
+   indicates if and when these additional signal handlers are installed. If
+   these signals are sent to the container's PID 1 before this notification
+   message is sent they might not be handled correctly yet.
 
 4. To support [Socket Activated
-   Containers](http://0pointer.de/blog/projects/socket-activated-containers.html)
+   Containers](https://0pointer.de/blog/projects/socket-activated-containers.html)
    the container manager should be capable of being run as a systemd
    service. It will then receive the sockets starting with FD 3, the number of
    passed FDs in `$LISTEN_FDS` and its PID as `$LISTEN_PID`. It should take
@@ -181,20 +182,22 @@ manager, please consider supporting the following interfaces.
    activation work. The protocol to hand sockets from systemd to services is
    hence the same as from the container manager to the container systemd. For
    further details see the explanations of
-   [sd_listen_fds(1)](http://0pointer.de/public/systemd-man/sd_listen_fds.html)
+   [sd_listen_fds(1)](https://0pointer.de/public/systemd-man/sd_listen_fds.html)
    and the [blog story for service
-   developers](http://0pointer.de/blog/projects/socket-activation.html).
+   developers](https://0pointer.de/blog/projects/socket-activation.html).
 
 5. Container managers should stay away from the cgroup hierarchy outside of the
    unit they created for their container. That's private property of systemd,
    and no other code should modify it.
 
-6. systemd running inside the container can report when boot-up is complete
-   using the usual `sd_notify()` protocol that is also used when a service
-   wants to tell the service manager about readiness. A container manager can
-   set the `$NOTIFY_SOCKET` environment variable to a suitable socket path to
-   make use of this functionality. (Also see information about
-   `/run/host/notify` below.)
+6. systemd running inside the container can report when boot-up is complete,
+   boot progress and functionality as well as various other bits of system
+   information using the `sd_notify()` protocol that is also used when a
+   service wants to tell the service manager about readiness. A container
+   manager can set the `$NOTIFY_SOCKET` environment variable to a suitable
+   socket path to make use of this functionality. (Also see information about
+   `/run/host/notify` below, as well as the Readiness Protocol section on
+   [systemd(1)](https://www.freedesktop.org/software/systemd/man/latest/systemd.html)
 
 ## Networking
 
@@ -230,7 +233,9 @@ care should be taken to avoid naming conflicts. `systemd` (and in particular
    directory: it's used by code outside the container to insert mounts inside
    it only, and is mostly an internal vehicle to achieve this. Other container
    managers that want to implement similar functionality might consider using
-   the same directory.
+   the same directory. Alternatively, the new mount API may be used by the
+   container manager to establish new mounts in the container without the need
+   for the `/run/host/incoming/` directory.
 
 2. The `/run/host/inaccessible/` directory may be set up by the container
    manager to include six file nodes: `reg`, `dir`, `fifo`, `sock`, `chr`,
@@ -271,6 +276,36 @@ care should be taken to avoid naming conflicts. `systemd` (and in particular
 
 7. The `/run/host/credentials/` directory is a good place to pass credentials
    into the container, using the `$CREDENTIALS_DIRECTORY` protocol, see above.
+
+8. The `/run/host/unix-export/` directory shall be writable from the container
+   payload, and is where container payload can bind `AF_UNIX` sockets in that
+   shall be *exported* to the host, so that the host can connect to them. The
+   container manager should bind mount this directory on the host side
+   (read-only ideally), so that the host can connect to contained sockets. This
+   is most prominently used by `systemd-ssh-generator` when run in such a
+   container to automatically bind an SSH socket into that directory, which
+   then can be used to connect to the container.
+
+9. The `/run/host/unix-export/ssh` `AF_UNIX` socket will be automatically bound
+   by `systemd-ssh-generator` in the container if possible, and can be used to
+   connect to the container.
+
+10. The `/run/host/userdb/` directory may be used to drop-in additional JSON
+    user records that `nss-systemd` inside the container shall include in the
+    system's user database. This is useful to make host users and their home
+    directories automatically accessible to containers in transitive
+    fashion. See `nss-systemd(8)` for details.
+
+11. The `/run/host/home/` directory may be used to bind mount host home
+    directories of users that shall be made available in the container to. This
+    may be used in combination with `/run/host/userdb/` above: one defines the
+    user record, the other contains the user's home directory.
+
+12. The `/run/host/root/` directory may be used to bind mount the host root
+    filesystem. Binding the host's root filesystem into the container is a
+    major security hole: any container manager that maintains a security
+    boundary should not use this; however, if having the root filesystem in
+    the container is desired, this is a good place to mount it to.
 
 ## What You Shouldn't Do
 

@@ -1,17 +1,12 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include <sys/vfs.h>
+#include <linux/fscrypt.h>
+#include <sys/keyctl.h>
 
 #include "sd-id128.h"
 
-#include "cryptsetup-util.h"
-#include "homework-password-cache.h"
-#include "loop-util.h"
-#include "missing_fs.h" /* for FS_KEY_DESCRIPTOR_SIZE, do not include linux/fs.h */
-#include "missing_keyctl.h"
-#include "missing_syscall.h"
-#include "user-record.h"
+#include "homework-forward.h"
 #include "user-record-util.h"
 
 typedef struct HomeSetup {
@@ -87,7 +82,7 @@ int home_maybe_shift_uid(UserRecord *h, HomeSetupFlags flags, HomeSetup *setup);
 int home_populate(UserRecord *h, int dir_fd);
 
 int home_load_embedded_identity(UserRecord *h, int root_fd, UserRecord *header_home, UserReconcileMode mode, PasswordCache *cache, UserRecord **ret_embedded_home, UserRecord **ret_new_home);
-int home_store_embedded_identity(UserRecord *h, int root_fd, uid_t uid, UserRecord *old_home);
+int home_store_embedded_identity(UserRecord *h, int root_fd, UserRecord *old_home);
 int home_extend_embedded_identity(UserRecord *h, UserRecord *used, HomeSetup *setup);
 
 int user_record_authenticate(UserRecord *h, UserRecord *secret, PasswordCache *cache, bool strict_verify);

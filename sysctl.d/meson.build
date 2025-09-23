@@ -13,7 +13,6 @@ if cc.sizeof('long') > 4
 endif
 
 custom_target(
-        '50-coredump.conf',
         input : '50-coredump.conf.in',
         output : '50-coredump.conf',
         command : [jinja2_cmdline, '@INPUT@', '@OUTPUT@'],
@@ -21,6 +20,5 @@ custom_target(
         install_dir : sysctldir)
 
 if install_sysconfdir
-        meson.add_install_script('sh', '-c',
-                                 mkdir_p.format(sysconfdir / 'sysctl.d'))
+        install_emptydir(sysconfdir / 'sysctl.d')
 endif

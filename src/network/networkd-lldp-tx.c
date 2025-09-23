@@ -8,10 +8,12 @@
 #include "networkd-link.h"
 #include "networkd-lldp-tx.h"
 #include "networkd-manager.h"
+#include "networkd-sysctl.h"
 #include "parse-util.h"
 #include "string-table.h"
 #include "string-util.h"
 #include "strv.h"
+#include "vlan.h"
 
 static bool link_lldp_tx_enabled(Link *link) {
         assert(link);
@@ -69,9 +71,8 @@ int link_lldp_tx_configure(Link *link) {
                                         SD_LLDP_SYSTEM_CAPABILITIES_STATION |
                                         SD_LLDP_SYSTEM_CAPABILITIES_BRIDGE |
                                         SD_LLDP_SYSTEM_CAPABILITIES_ROUTER,
-                                        (link->network->ip_forward != ADDRESS_FAMILY_NO) ?
-                                        SD_LLDP_SYSTEM_CAPABILITIES_ROUTER :
-                                        SD_LLDP_SYSTEM_CAPABILITIES_STATION);
+                                        (link_get_ip_forwarding(link, AF_INET) > 0 || link_get_ip_forwarding(link, AF_INET6) > 0) ?
+                                        SD_LLDP_SYSTEM_CAPABILITIES_ROUTER : SD_LLDP_SYSTEM_CAPABILITIES_STATION);
         if (r < 0)
                 return r;
 
@@ -82,6 +83,42 @@ int link_lldp_tx_configure(Link *link) {
         r = sd_lldp_tx_set_mud_url(link->lldp_tx, link->network->lldp_mudurl);
         if (r < 0)
                 return r;
+
+        if (link->netdev && link->netdev->kind == NETDEV_KIND_VLAN) {
+                r = sd_lldp_tx_set_vlan_id(link->lldp_tx, VLAN(link->netdev)->id);
+                if (r < 0)
+                        return r;
+        }
+
+        return 0;
+}
+
+int link_lldp_tx_update_capabilities(Link *link) {
+        int r;
+
+        assert(link);
+
+        if (!link->lldp_tx)
+                return 0; /* disabled, or not configured yet. */
+
+        r = sd_lldp_tx_set_capabilities(link->lldp_tx,
+                                        SD_LLDP_SYSTEM_CAPABILITIES_STATION |
+                                        SD_LLDP_SYSTEM_CAPABILITIES_BRIDGE |
+                                        SD_LLDP_SYSTEM_CAPABILITIES_ROUTER,
+                                        (link_get_ip_forwarding(link, AF_INET) > 0 || link_get_ip_forwarding(link, AF_INET6) > 0) ?
+                                        SD_LLDP_SYSTEM_CAPABILITIES_ROUTER : SD_LLDP_SYSTEM_CAPABILITIES_STATION);
+        if (r < 0)
+                return r;
+
+        if (sd_lldp_tx_is_running(link->lldp_tx)) {
+                r = sd_lldp_tx_stop(link->lldp_tx);
+                if (r < 0)
+                        return r;
+
+                r = sd_lldp_tx_start(link->lldp_tx);
+                if (r < 0)
+                        return r;
+        }
 
         return 0;
 }

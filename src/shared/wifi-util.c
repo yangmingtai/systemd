@@ -1,5 +1,9 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
+#include "sd-netlink.h"
+
+#include "alloc-util.h"
+#include "ether-addr-util.h"
 #include "log.h"
 #include "string-table.h"
 #include "string-util.h"
@@ -55,7 +59,7 @@ int wifi_get_interface(sd_netlink *genl, int ifindex, enum nl80211_iftype *ret_i
         if (r < 0)
                 return log_debug_errno(r, "Failed to get NL80211_ATTR_IFTYPE attribute: %m");
 
-        r = sd_netlink_message_read_data_suffix0(reply, NL80211_ATTR_SSID, &len, (void**) &ssid);
+        r = sd_netlink_message_read_data(reply, NL80211_ATTR_SSID, &len, (void**) &ssid);
         if (r < 0 && r != -ENODATA)
                 return log_debug_errno(r, "Failed to get NL80211_ATTR_SSID attribute: %m");
         if (r >= 0) {

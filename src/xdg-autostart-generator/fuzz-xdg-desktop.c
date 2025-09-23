@@ -1,13 +1,10 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include "alloc-util.h"
+#include <unistd.h>
+
 #include "fd-util.h"
-#include "fs-util.h"
 #include "fuzz.h"
 #include "rm-rf.h"
-#include "string-util.h"
-#include "strv.h"
-#include "tests.h"
 #include "tmpfile-util.h"
 #include "xdg-autostart-service.h"
 
@@ -20,10 +17,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         if (outside_size_range(size, 0, 65536))
                 return 0;
 
-        /* We don't want to fill the logs with messages about parse errors.
-         * Disable most logging if not running standalone */
-        if (!getenv("SYSTEMD_LOG_LEVEL"))
-                log_set_max_level(LOG_CRIT);
+        fuzz_setup_logging();
 
         assert_se(mkdtemp_malloc("/tmp/fuzz-xdg-desktop-XXXXXX", &tmpdir) >= 0);
 

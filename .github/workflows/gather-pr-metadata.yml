@@ -6,32 +6,25 @@ on:
   pull_request:
     branches: [ main ]
 
-env:
-  PULL_REQUEST_METADATA_DIR: pull_request
-  PULL_REQUEST_METADATA_FILE: metadata
-
 permissions:
   contents: read
 
 jobs:
   gather-metadata:
     if: github.repository == 'systemd/systemd'
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
 
     steps:
       - name: Repository checkout
-        uses: actions/checkout@8e5e7e5ab8b370d6c329ec480221332ada57f0ab
-        with:
-          fetch-depth: 0
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
 
-      - name: Store PR number in file
-        run: |
-          mkdir -p ./${{ env.PULL_REQUEST_METADATA_DIR }}
-          echo ${{ github.event.number }} >./${{ env.PULL_REQUEST_METADATA_DIR }}/${{ env.PULL_REQUEST_METADATA_FILE }}
+      - id: metadata
+        name: Gather Pull Request Metadata
+        uses: redhat-plumbers-in-action/gather-pull-request-metadata@5da2967931dd7c4b9ccd22f49b045e2c1f05165b
 
       - name: Upload Pull Request Metadata artifact
-        uses: actions/upload-artifact@0b7f8abb1508181956e8e162db84b466c27e18ce
+        uses: actions/upload-artifact@5d5d22a31266ced268874388b861e4b58bb5c2f3
         with:
-          name: ${{ env.PULL_REQUEST_METADATA_FILE }}
-          path: ${{ env.PULL_REQUEST_METADATA_DIR }}
+          name: Pull Request Metadata
+          path: ${{ steps.metadata.outputs.metadata-file }}
           retention-days: 1

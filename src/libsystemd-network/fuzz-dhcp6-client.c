@@ -1,22 +1,22 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
+#include <stdlib.h>
 #include <unistd.h>
 
 #include "sd-dhcp6-client.h"
 #include "sd-event.h"
 
 #include "dhcp6-internal.h"
-#include "event-util.h"
 #include "fd-util.h"
 #include "fuzz.h"
 
-static int test_dhcp_fd[2] = PIPE_EBADF;
+static int test_dhcp_fd[2] = EBADF_PAIR;
 
-int dhcp6_network_send_udp_socket(int s, struct in6_addr *server_address, const void *packet, size_t len) {
+int dhcp6_network_send_udp_socket(int s, const struct in6_addr *server_address, const void *packet, size_t len) {
         return len;
 }
 
-int dhcp6_network_bind_udp_socket(int index, struct in6_addr *local_address) {
+int dhcp6_network_bind_udp_socket(int index, const struct in6_addr *local_address) {
         assert_se(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0, test_dhcp_fd) >= 0);
         return TAKE_FD(test_dhcp_fd[0]);
 }
@@ -73,6 +73,10 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         struct in6_addr hint = { { { 0x3f, 0xfe, 0x05, 0x01, 0xff, 0xff, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 } } };
         static const char *v1_data = "hogehoge", *v2_data = "foobar";
 
+        assert_se(setenv("SYSTEMD_NETWORK_TEST_MODE", "1", 1) >= 0);
+
+        fuzz_setup_logging();
+
         if (outside_size_range(size, 0, 65536))
                 return 0;
 
@@ -81,7 +85,6 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         assert_se(sd_dhcp6_client_attach_event(client, e, 0) >= 0);
         assert_se(sd_dhcp6_client_set_ifindex(client, 42) >= 0);
         assert_se(sd_dhcp6_client_set_local_address(client, &address) >= 0);
-        dhcp6_client_set_test_mode(client, true);
 
         /* Used when sending message. */
         assert_se(sd_dhcp6_client_set_fqdn(client, "example.com") == 1);

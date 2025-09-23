@@ -1,9 +1,12 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
+#include "alloc-util.h"
 #include "dns-def.h"
 #include "dns-domain.h"
+#include "hostname-setup.h"
 #include "hostname-util.h"
 #include "idn-util.h"
+#include "log.h"
 #include "resolved-util.h"
 #include "utf8.h"
 
@@ -14,7 +17,7 @@ int resolve_system_hostname(char **full_hostname, char **first_label) {
 #elif HAVE_LIBIDN
         int k;
 #endif
-        char label[DNS_LABEL_MAX];
+        char label[DNS_LABEL_MAX+1];
         const char *p, *decoded;
         int r;
 

@@ -1,26 +1,29 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <errno.h>
+#include <linux/prctl.h>
+#include <stdatomic.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <sys/prctl.h>
 #include <unistd.h>
 
 #include "alloc-util.h"
+#include "bitfield.h"
+#include "capability-list.h"
 #include "capability-util.h"
-#include "cap-list.h"
+#include "fd-util.h"
 #include "fileio.h"
 #include "log.h"
 #include "logarithm.h"
-#include "macro.h"
-#include "missing_prctl.h"
-#include "missing_threads.h"
 #include "parse-util.h"
+#include "pidref.h"
+#include "process-util.h"
+#include "stat-util.h"
 #include "user-util.h"
 
 int have_effective_cap(int value) {
         _cleanup_cap_free_ cap_t cap = NULL;
-        cap_flag_value_t fv;
+        cap_flag_value_t fv = CAP_CLEAR; /* To avoid false-positive use-of-uninitialized-value error reported
+                                          * by fuzzers. */
 
         cap = cap_get_proc();
         if (!cap)
@@ -33,37 +36,38 @@ int have_effective_cap(int value) {
 }
 
 unsigned cap_last_cap(void) {
-        static thread_local unsigned saved;
-        static thread_local bool valid = false;
+        static atomic_int saved = INT_MAX;
+        int r, c;
+
+        c = saved;
+        if (c != INT_MAX)
+                return c;
+
+        /* Available since linux-3.2 */
         _cleanup_free_ char *content = NULL;
-        unsigned long p = 0;
-        int r;
-
-        if (valid)
-                return saved;
-
-        /* available since linux-3.2 */
         r = read_one_line_file("/proc/sys/kernel/cap_last_cap", &content);
-        if (r >= 0) {
-                r = safe_atolu(content, &p);
-                if (r >= 0) {
-
-                        if (p > CAP_LIMIT) /* Safety for the future: if one day the kernel learns more than
+        if (r < 0)
+                log_debug_errno(r, "Failed to read /proc/sys/kernel/cap_last_cap, ignoring: %m");
+        else {
+                r = safe_atoi(content, &c);
+                if (r < 0)
+                        log_debug_errno(r, "Failed to parse /proc/sys/kernel/cap_last_cap, ignoring: %m");
+                else {
+                        if (c > CAP_LIMIT) /* Safety for the future: if one day the kernel learns more than
                                             * 64 caps, then we are in trouble (since we, as much userspace
                                             * and kernel space store capability masks in uint64_t types). We
                                             * also want to use UINT64_MAX as marker for "unset". Hence let's
                                             * hence protect ourselves against that and always cap at 62 for
                                             * now. */
-                                p = CAP_LIMIT;
+                                c = CAP_LIMIT;
 
-                        saved = p;
-                        valid = true;
-                        return p;
+                        saved = c;
+                        return c;
                 }
         }
 
-        /* fall back to syscall-probing for pre linux-3.2 */
-        p = (unsigned long) MIN(CAP_LAST_CAP, CAP_LIMIT);
+        /* Fall back to syscall-probing for pre linux-3.2, or where /proc/ is not mounted */
+        unsigned long p = (unsigned long) MIN(CAP_LAST_CAP, CAP_LIMIT);
 
         if (prctl(PR_CAPBSET_READ, p) < 0) {
 
@@ -80,10 +84,9 @@ unsigned cap_last_cap(void) {
                                 break;
         }
 
-        saved = p;
-        valid = true;
-
-        return p;
+        c = (int) p;
+        saved = c;
+        return c;
 }
 
 int capability_update_inherited_set(cap_t caps, uint64_t set) {
@@ -109,23 +112,17 @@ int capability_ambient_set_apply(uint64_t set, bool also_inherit) {
 
         /* Remove capabilities requested in ambient set, but not in the bounding set */
         for (unsigned i = 0; i <= cap_last_cap(); i++) {
-                if (set == 0)
-                        break;
+                if (!BIT_SET(set, i))
+                        continue;
 
-                if (FLAGS_SET(set, (UINT64_C(1) << i)) && prctl(PR_CAPBSET_READ, i) != 1) {
-                        log_debug("Ambient capability %s requested but missing from bounding set,"
-                                        " suppressing automatically.", capability_to_name(i));
-                        set &= ~(UINT64_C(1) << i);
+                if (prctl(PR_CAPBSET_READ, (unsigned long) i) != 1) {
+                        log_debug("Ambient capability %s requested but missing from bounding set, suppressing automatically.",
+                                  capability_to_name(i));
+                        CLEAR_BIT(set, i);
                 }
         }
 
         /* Add the capabilities to the ambient set (an possibly also the inheritable set) */
-
-        /* Check that we can use PR_CAP_AMBIENT or quit early. */
-        if (!ambient_capabilities_supported())
-                return (set & all_capabilities()) == 0 ?
-                        0 : -EOPNOTSUPP; /* if actually no ambient caps are to be set, be silent,
-                                          * otherwise fail recognizably */
 
         if (also_inherit) {
                 caps = cap_get_proc();
@@ -141,23 +138,18 @@ int capability_ambient_set_apply(uint64_t set, bool also_inherit) {
         }
 
         for (unsigned i = 0; i <= cap_last_cap(); i++) {
-
-                if (set & (UINT64_C(1) << i)) {
-
+                if (BIT_SET(set, i)) {
                         /* Add the capability to the ambient set. */
                         if (prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_RAISE, i, 0, 0) < 0)
                                 return -errno;
                 } else {
-
                         /* Drop the capability so we don't inherit capabilities we didn't ask for. */
                         r = prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, i, 0, 0);
                         if (r < 0)
                                 return -errno;
-
-                        if (r)
+                        if (r > 0)
                                 if (prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_LOWER, i, 0, 0) < 0)
                                         return -errno;
-
                 }
         }
 
@@ -367,16 +359,16 @@ int drop_privileges(uid_t uid, gid_t gid, uint64_t keep_capabilities) {
         return 0;
 }
 
-int drop_capability(cap_value_t cv) {
+static int change_capability(cap_value_t cv, cap_flag_value_t flag) {
         _cleanup_cap_free_ cap_t tmp_cap = NULL;
 
         tmp_cap = cap_get_proc();
         if (!tmp_cap)
                 return -errno;
 
-        if ((cap_set_flag(tmp_cap, CAP_INHERITABLE, 1, &cv, CAP_CLEAR) < 0) ||
-            (cap_set_flag(tmp_cap, CAP_PERMITTED, 1, &cv, CAP_CLEAR) < 0) ||
-            (cap_set_flag(tmp_cap, CAP_EFFECTIVE, 1, &cv, CAP_CLEAR) < 0))
+        if ((cap_set_flag(tmp_cap, CAP_INHERITABLE, 1, &cv, flag) < 0) ||
+            (cap_set_flag(tmp_cap, CAP_PERMITTED, 1, &cv, flag) < 0) ||
+            (cap_set_flag(tmp_cap, CAP_EFFECTIVE, 1, &cv, flag) < 0))
                 return -errno;
 
         if (cap_set_proc(tmp_cap) < 0)
@@ -385,53 +377,38 @@ int drop_capability(cap_value_t cv) {
         return 0;
 }
 
-bool ambient_capabilities_supported(void) {
-        static int cache = -1;
+int drop_capability(cap_value_t cv) {
+        return change_capability(cv, CAP_CLEAR);
+}
 
-        if (cache >= 0)
-                return cache;
-
-        /* If PR_CAP_AMBIENT returns something valid, or an unexpected error code we assume that ambient caps are
-         * available. */
-
-        cache = prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, CAP_KILL, 0, 0) >= 0 ||
-                !IN_SET(errno, EINVAL, EOPNOTSUPP, ENOSYS);
-
-        return cache;
+int keep_capability(cap_value_t cv) {
+        return change_capability(cv, CAP_SET);
 }
 
 bool capability_quintet_mangle(CapabilityQuintet *q) {
         uint64_t combined, drop = 0;
-        bool ambient_supported;
 
         assert(q);
 
-        combined = q->effective | q->bounding | q->inheritable | q->permitted;
-
-        ambient_supported = q->ambient != CAP_MASK_UNSET;
-        if (ambient_supported)
-                combined |= q->ambient;
+        combined = q->effective | q->bounding | q->inheritable | q->permitted | q->ambient;
 
         for (unsigned i = 0; i <= cap_last_cap(); i++) {
-                unsigned long bit = UINT64_C(1) << i;
-                if (!FLAGS_SET(combined, bit))
+                if (!BIT_SET(combined, i))
                         continue;
 
-                if (prctl(PR_CAPBSET_READ, i) > 0)
+                if (prctl(PR_CAPBSET_READ, (unsigned long) i) > 0)
                         continue;
 
-                drop |= bit;
+                SET_BIT(drop, i);
 
-                log_debug("Not in the current bounding set: %s", capability_to_name(i));
+                log_debug("Dropping capability not in the current bounding set: %s", capability_to_name(i));
         }
 
         q->effective &= ~drop;
         q->bounding &= ~drop;
         q->inheritable &= ~drop;
         q->permitted &= ~drop;
-
-        if (ambient_supported)
-                q->ambient &= ~drop;
+        q->ambient &= ~drop;
 
         return drop != 0; /* Let the caller know we changed something */
 }
@@ -613,21 +590,85 @@ int capability_get_ambient(uint64_t *ret) {
 
         assert(ret);
 
-        if (!ambient_capabilities_supported()) {
-                *ret = 0;
-                return 0;
-        }
-
         for (unsigned i = 0; i <= cap_last_cap(); i++) {
                 r = prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, i, 0, 0);
                 if (r < 0)
                         return -errno;
-
-                if (r)
-                        a |= UINT64_C(1) << i;
+                if (r > 0)
+                        SET_BIT(a, i);
         }
-
 
         *ret = a;
         return 1;
+}
+
+int pidref_get_capability(const PidRef *pidref, CapabilityQuintet *ret) {
+        int r;
+
+        if (!pidref_is_set(pidref))
+                return -ESRCH;
+        if (pidref_is_remote(pidref))
+                return -EREMOTE;
+
+        const char *path = procfs_file_alloca(pidref->pid, "status");
+        _cleanup_fclose_ FILE *f = fopen(path, "re");
+        if (!f) {
+                if (errno == ENOENT && proc_mounted() == 0)
+                        return -ENOSYS;
+
+                return -errno;
+        }
+
+        CapabilityQuintet q = CAPABILITY_QUINTET_NULL;
+        for (;;) {
+                _cleanup_free_ char *line = NULL;
+
+                r = read_line(f, LONG_LINE_MAX, &line);
+                if (r < 0)
+                        return r;
+                if (r == 0)
+                        break;
+
+                static const struct {
+                        const char *field;
+                        size_t offset;
+                } fields[] = {
+                        { "CapBnd:", offsetof(CapabilityQuintet, bounding)    },
+                        { "CapInh:", offsetof(CapabilityQuintet, inheritable) },
+                        { "CapPrm:", offsetof(CapabilityQuintet, permitted)   },
+                        { "CapEff:", offsetof(CapabilityQuintet, effective)   },
+                        { "CapAmb:", offsetof(CapabilityQuintet, ambient)     },
+                };
+
+                FOREACH_ELEMENT(i, fields) {
+
+                        const char *p = first_word(line, i->field);
+                        if (!p)
+                                continue;
+
+                        uint64_t *v = (uint64_t*) ((uint8_t*) &q + i->offset);
+
+                        if (*v != CAP_MASK_UNSET)
+                                return -EBADMSG;
+
+                        r = safe_atoux64(p, v);
+                        if (r < 0)
+                                return r;
+
+                        if (*v == CAP_MASK_UNSET)
+                                return -EBADMSG;
+                }
+        }
+
+        if (!capability_quintet_is_fully_set(&q))
+                return -EBADMSG;
+
+        r = pidref_verify(pidref);
+        if (r < 0)
+                return r;
+
+        if (ret)
+                *ret = q;
+
+        return 0;
 }

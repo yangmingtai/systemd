@@ -2,13 +2,14 @@
 
 #include <unistd.h>
 
+#include "errno-util.h"
 #include "generator-setup.h"
-#include "macro.h"
 #include "mkdir-label.h"
+#include "path-lookup.h"
 #include "rm-rf.h"
 
 int lookup_paths_mkdir_generator(LookupPaths *p) {
-        int r, q;
+        int r;
 
         assert(p);
 
@@ -16,14 +17,8 @@ int lookup_paths_mkdir_generator(LookupPaths *p) {
                 return -EINVAL;
 
         r = mkdir_p_label(p->generator, 0755);
-
-        q = mkdir_p_label(p->generator_early, 0755);
-        if (q < 0 && r >= 0)
-                r = q;
-
-        q = mkdir_p_label(p->generator_late, 0755);
-        if (q < 0 && r >= 0)
-                r = q;
+        RET_GATHER(r, mkdir_p_label(p->generator_early, 0755));
+        RET_GATHER(r, mkdir_p_label(p->generator_late, 0755));
 
         return r;
 }

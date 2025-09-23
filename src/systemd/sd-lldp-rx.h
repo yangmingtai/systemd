@@ -17,22 +17,18 @@
   along with systemd; If not, see <https://www.gnu.org/licenses/>.
 ***/
 
-#include <errno.h>
-#include <inttypes.h>
-#include <net/ethernet.h>
-#include <sys/types.h>
-
-#include "sd-event.h"
-#include "sd-lldp.h"
-
 #include "_sd-common.h"
+#include "sd-lldp.h"    /* IWYU pragma: export*/
 
 _SD_BEGIN_DECLARATIONS;
 
+struct ether_addr;
+
+typedef struct sd_event sd_event;
 typedef struct sd_lldp_rx sd_lldp_rx;
 typedef struct sd_lldp_neighbor sd_lldp_neighbor;
 
-__extension__ typedef enum sd_lldp_rx_event_t {
+__extension__ typedef enum _SD_ENUM_TYPE_S64(sd_lldp_rx_event_t) {
         SD_LLDP_RX_EVENT_ADDED,
         SD_LLDP_RX_EVENT_REMOVED,
         SD_LLDP_RX_EVENT_UPDATED,
@@ -68,7 +64,6 @@ int sd_lldp_rx_set_filter_address(sd_lldp_rx *lldp_rx, const struct ether_addr *
 
 int sd_lldp_rx_get_neighbors(sd_lldp_rx *lldp_rx, sd_lldp_neighbor ***neighbors);
 
-int sd_lldp_neighbor_from_raw(sd_lldp_neighbor **ret, const void *raw, size_t raw_size);
 sd_lldp_neighbor *sd_lldp_neighbor_ref(sd_lldp_neighbor *n);
 sd_lldp_neighbor *sd_lldp_neighbor_unref(sd_lldp_neighbor *n);
 
@@ -76,7 +71,6 @@ sd_lldp_neighbor *sd_lldp_neighbor_unref(sd_lldp_neighbor *n);
 int sd_lldp_neighbor_get_source_address(sd_lldp_neighbor *n, struct ether_addr* address);
 int sd_lldp_neighbor_get_destination_address(sd_lldp_neighbor *n, struct ether_addr* address);
 int sd_lldp_neighbor_get_timestamp(sd_lldp_neighbor *n, clockid_t clock, uint64_t *ret);
-int sd_lldp_neighbor_get_raw(sd_lldp_neighbor *n, const void **ret, size_t *size);
 
 /* High-level, direct, parsed out field access. These fields exist at most once, hence may be queried directly. */
 int sd_lldp_neighbor_get_chassis_id(sd_lldp_neighbor *n, uint8_t *type, const void **ret, size_t *size);
@@ -90,6 +84,7 @@ int sd_lldp_neighbor_get_port_description(sd_lldp_neighbor *n, const char **ret)
 int sd_lldp_neighbor_get_mud_url(sd_lldp_neighbor *n, const char **ret);
 int sd_lldp_neighbor_get_system_capabilities(sd_lldp_neighbor *n, uint16_t *ret);
 int sd_lldp_neighbor_get_enabled_capabilities(sd_lldp_neighbor *n, uint16_t *ret);
+int sd_lldp_neighbor_get_port_vlan_id(sd_lldp_neighbor *n, uint16_t *ret);
 
 /* Low-level, iterative TLV access. This is for everything else, it iteratively goes through all available TLVs
  * (including the ones covered with the calls above), and allows multiple TLVs for the same fields. */

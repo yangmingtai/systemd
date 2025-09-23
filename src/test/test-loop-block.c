@@ -1,21 +1,20 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <fcntl.h>
+#include <linux/fs.h>
 #include <linux/loop.h>
 #include <pthread.h>
 #include <sys/file.h>
 #include <sys/ioctl.h>
-#include <sys/mount.h>
+#include <unistd.h>
 
 #include "alloc-util.h"
 #include "capability-util.h"
 #include "dissect-image.h"
 #include "fd-util.h"
-#include "fileio.h"
-#include "fs-util.h"
 #include "gpt.h"
+#include "loop-util.h"
 #include "main-func.h"
-#include "missing_loop.h"
 #include "mkfs-util.h"
 #include "mount-util.h"
 #include "namespace-util.h"
@@ -24,8 +23,8 @@
 #include "string-util.h"
 #include "strv.h"
 #include "tests.h"
+#include "time-util.h"
 #include "tmpfile-util.h"
-#include "user-util.h"
 #include "virt.h"
 
 static unsigned arg_n_threads = 5;
@@ -49,10 +48,10 @@ static void verify_dissected_image(DissectedImage *dissected) {
 static void verify_dissected_image_harder(DissectedImage *dissected) {
         verify_dissected_image(dissected);
 
-        assert_se(streq(dissected->partitions[PARTITION_ESP].fstype, "vfat"));
-        assert_se(streq(dissected->partitions[PARTITION_XBOOTLDR].fstype, "vfat"));
-        assert_se(streq(dissected->partitions[PARTITION_ROOT].fstype, "ext4"));
-        assert_se(streq(dissected->partitions[PARTITION_HOME].fstype, "ext4"));
+        ASSERT_STREQ(dissected->partitions[PARTITION_ESP].fstype, "vfat");
+        ASSERT_STREQ(dissected->partitions[PARTITION_XBOOTLDR].fstype, "vfat");
+        ASSERT_STREQ(dissected->partitions[PARTITION_ROOT].fstype, "ext4");
+        ASSERT_STREQ(dissected->partitions[PARTITION_HOME].fstype, "ext4");
 }
 
 static void* thread_func(void *ptr) {
@@ -82,9 +81,16 @@ static void* thread_func(void *ptr) {
 
                 log_notice("Acquired loop device %s, will mount on %s", loop->node, mounted);
 
-                r = dissect_loop_device(loop, NULL, NULL, NULL, DISSECT_IMAGE_READ_ONLY|DISSECT_IMAGE_ADD_PARTITION_DEVICES|DISSECT_IMAGE_PIN_PARTITION_DEVICES, &dissected);
+                r = dissect_loop_device(
+                                loop,
+                                /* verity= */ NULL,
+                                /* mount_options= */ NULL,
+                                /* image_policy= */ NULL,
+                                /* image_filter= */ NULL,
+                                DISSECT_IMAGE_READ_ONLY|DISSECT_IMAGE_ADD_PARTITION_DEVICES|DISSECT_IMAGE_PIN_PARTITION_DEVICES,
+                                &dissected);
                 if (r < 0)
-                        log_error_errno(r, "Failed dissect loopback device %s: %m", loop->node);
+                        log_error_errno(r, "Failed to dissect loopback device %s: %m", loop->node);
                 assert_se(r >= 0);
 
                 log_info("Dissected loop device %s", loop->node);
@@ -101,7 +107,13 @@ static void* thread_func(void *ptr) {
 
                 verify_dissected_image(dissected);
 
-                r = dissected_image_mount(dissected, mounted, UID_INVALID, UID_INVALID, DISSECT_IMAGE_READ_ONLY);
+                r = dissected_image_mount(
+                                dissected,
+                                mounted,
+                                /* uid_shift= */ UID_INVALID,
+                                /* uid_range= */ UID_INVALID,
+                                /* userns_fd= */ -EBADF,
+                                DISSECT_IMAGE_READ_ONLY);
                 log_notice_errno(r, "Mounted %s → %s: %m", loop->node, mounted);
                 assert_se(r >= 0);
 
@@ -143,7 +155,7 @@ static int run(int argc, char *argv[]) {
         sd_id128_t id;
 #endif
         _cleanup_free_ char *p = NULL, *cmd = NULL;
-        _cleanup_(pclosep) FILE *sfdisk = NULL;
+        _cleanup_pclose_ FILE *sfdisk = NULL;
         _cleanup_(loop_device_unrefp) LoopDevice *loop = NULL;
         _cleanup_close_ int fd = -EBADF;
         int r;
@@ -213,25 +225,35 @@ static int run(int argc, char *argv[]) {
         sfdisk = NULL;
 
 #if HAVE_BLKID
-        assert_se(dissect_image_file(p, NULL, NULL, NULL, 0, &dissected) >= 0);
+        assert_se(dissect_image_file(
+                                  p,
+                                  /* verity= */ NULL,
+                                  /* mount_options= */ NULL,
+                                  /* image_policy= */ NULL,
+                                  /* image_filter= */ NULL,
+                                  /* flags= */ 0,
+                                  &dissected) >= 0);
         verify_dissected_image(dissected);
         dissected = dissected_image_unref(dissected);
 #endif
 
-        if (geteuid() != 0 || have_effective_cap(CAP_SYS_ADMIN) <= 0) {
-                log_tests_skipped("not running privileged");
-                return 0;
-        }
+        if (geteuid() != 0 || have_effective_cap(CAP_SYS_ADMIN) <= 0)
+                return log_tests_skipped("not running privileged");
 
-        if (detect_container() > 0) {
-                log_tests_skipped("Test not supported in a container, requires udev/uevent notifications");
-                return 0;
-        }
+        if (detect_container() > 0)
+                return log_tests_skipped("Test not supported in a container, requires udev/uevent notifications");
 
         assert_se(loop_device_make(fd, O_RDWR, 0, UINT64_MAX, 0, LO_FLAGS_PARTSCAN, LOCK_EX, &loop) >= 0);
 
 #if HAVE_BLKID
-        assert_se(dissect_loop_device(loop, NULL, NULL, NULL, DISSECT_IMAGE_ADD_PARTITION_DEVICES|DISSECT_IMAGE_PIN_PARTITION_DEVICES, &dissected) >= 0);
+        assert_se(dissect_loop_device(
+                                  loop,
+                                  /* verity= */ NULL,
+                                  /* mount_options= */ NULL,
+                                  /* image_policy= */ NULL,
+                                  /* image_filter= */ NULL,
+                                  DISSECT_IMAGE_ADD_PARTITION_DEVICES|DISSECT_IMAGE_PIN_PARTITION_DEVICES,
+                                  &dissected) >= 0);
         verify_dissected_image(dissected);
 
         FOREACH_STRING(fs, "vfat", "ext4") {
@@ -245,16 +267,16 @@ static int run(int argc, char *argv[]) {
         assert_se(r >= 0);
 
         assert_se(sd_id128_randomize(&id) >= 0);
-        assert_se(make_filesystem(dissected->partitions[PARTITION_ESP].node, "vfat", "EFI", NULL, id, true, false, 0, NULL) >= 0);
+        assert_se(make_filesystem(dissected->partitions[PARTITION_ESP].node, "vfat", "EFI", NULL, id, MKFS_DISCARD, 0, NULL, NULL, NULL) >= 0);
 
         assert_se(sd_id128_randomize(&id) >= 0);
-        assert_se(make_filesystem(dissected->partitions[PARTITION_XBOOTLDR].node, "vfat", "xbootldr", NULL, id, true, false, 0, NULL) >= 0);
+        assert_se(make_filesystem(dissected->partitions[PARTITION_XBOOTLDR].node, "vfat", "xbootldr", NULL, id, MKFS_DISCARD, 0, NULL, NULL, NULL) >= 0);
 
         assert_se(sd_id128_randomize(&id) >= 0);
-        assert_se(make_filesystem(dissected->partitions[PARTITION_ROOT].node, "ext4", "root", NULL, id, true, false, 0, NULL) >= 0);
+        assert_se(make_filesystem(dissected->partitions[PARTITION_ROOT].node, "ext4", "root", NULL, id, MKFS_DISCARD, 0, NULL, NULL, NULL) >= 0);
 
         assert_se(sd_id128_randomize(&id) >= 0);
-        assert_se(make_filesystem(dissected->partitions[PARTITION_HOME].node, "ext4", "home", NULL, id, true, false, 0, NULL) >= 0);
+        assert_se(make_filesystem(dissected->partitions[PARTITION_HOME].node, "ext4", "home", NULL, id, MKFS_DISCARD, 0, NULL, NULL, NULL) >= 0);
 
         dissected = dissected_image_unref(dissected);
 
@@ -267,12 +289,26 @@ static int run(int argc, char *argv[]) {
 
         /* Try to read once, without pinning or adding partitions, i.e. by only accessing the whole block
          * device. */
-        assert_se(dissect_loop_device(loop, NULL, NULL, NULL, 0, &dissected) >= 0);
+        assert_se(dissect_loop_device(
+                                  loop,
+                                  /* verity= */ NULL,
+                                  /* mount_options= */ NULL,
+                                  /* image_policy= */ NULL,
+                                  /* image_filter= */ NULL,
+                                  /* flags= */ 0,
+                                  &dissected) >= 0);
         verify_dissected_image_harder(dissected);
         dissected = dissected_image_unref(dissected);
 
         /* Now go via the loopback device after all, but this time add/pin, because now we want to mount it. */
-        assert_se(dissect_loop_device(loop, NULL, NULL, NULL, DISSECT_IMAGE_ADD_PARTITION_DEVICES|DISSECT_IMAGE_PIN_PARTITION_DEVICES, &dissected) >= 0);
+        assert_se(dissect_loop_device(
+                                  loop,
+                                  /* verity= */ NULL,
+                                  /* mount_options= */ NULL,
+                                  /* image_policy= */ NULL,
+                                  /* image_filter= */ NULL,
+                                  DISSECT_IMAGE_ADD_PARTITION_DEVICES|DISSECT_IMAGE_PIN_PARTITION_DEVICES,
+                                  &dissected) >= 0);
         verify_dissected_image_harder(dissected);
 
         assert_se(mkdtemp_malloc(NULL, &mounted) >= 0);
@@ -291,7 +327,13 @@ static int run(int argc, char *argv[]) {
         assert_se(detach_mount_namespace() >= 0);
 
         /* This first (writable) mount will initialize the mount point dirs, so that the subsequent read-only ones can work */
-        assert_se(dissected_image_mount(dissected, mounted, UID_INVALID, UID_INVALID, 0) >= 0);
+        assert_se(dissected_image_mount(
+                                  dissected,
+                                  mounted,
+                                  /* uid_shift= */ UID_INVALID,
+                                  /* uid_range= */ UID_INVALID,
+                                  /* userns_fd= */ -EBADF,
+                                  0) >= 0);
 
         /* Now we mounted everything, the partitions are pinned. Now it's fine to release the lock
          * fully. This means udev could now issue BLKRRPART again, but that's OK given this will fail because
@@ -316,7 +358,7 @@ static int run(int argc, char *argv[]) {
         log_notice("All threads started now.");
 
         if (arg_n_threads == 1)
-                assert_se(thread_func(FD_TO_PTR(fd)) == NULL);
+                ASSERT_NULL(thread_func(FD_TO_PTR(fd)));
         else
                 for (unsigned i = 0; i < arg_n_threads; i++) {
                         log_notice("Joining thread #%u.", i);

@@ -1,11 +1,7 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include <stdbool.h>
-#include <stdint.h>
-#include <sys/types.h>
-
-#include "macro.h"
+#include "forward.h"
 
 /* See source file for an API description. */
 
@@ -34,7 +30,7 @@ struct Barrier {
         int64_t barriers;
 };
 
-#define BARRIER_NULL {-1, -1, {-1, -1}, 0}
+#define BARRIER_NULL {-EBADF, -EBADF, {-EBADF, -EBADF}, 0}
 
 int barrier_create(Barrier *obj);
 Barrier* barrier_destroy(Barrier *b);

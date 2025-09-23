@@ -3,21 +3,25 @@
 #include "alloc-util.h"
 #include "escape.h"
 #include "ether-addr-util.h"
+#include "hashmap.h"
 #include "hexdecoct.h"
 #include "in-addr-util.h"
+#include "json-util.h"
 #include "lldp-neighbor.h"
+#include "lldp-rx-internal.h"
 #include "memory-util.h"
-#include "missing_network.h"
+#include "prioq.h"
+#include "siphash24.h"
 #include "unaligned.h"
 
 static void lldp_neighbor_id_hash_func(const LLDPNeighborID *id, struct siphash *state) {
         assert(id);
         assert(state);
 
-        siphash24_compress(id->chassis_id, id->chassis_id_size, state);
-        siphash24_compress(&id->chassis_id_size, sizeof(id->chassis_id_size), state);
-        siphash24_compress(id->port_id, id->port_id_size, state);
-        siphash24_compress(&id->port_id_size, sizeof(id->port_id_size), state);
+        siphash24_compress_safe(id->chassis_id, id->chassis_id_size, state);
+        siphash24_compress_typesafe(id->chassis_id_size, state);
+        siphash24_compress_safe(id->port_id, id->port_id_size, state);
+        siphash24_compress_typesafe(id->port_id_size, state);
 }
 
 int lldp_neighbor_id_compare_func(const LLDPNeighborID *x, const LLDPNeighborID *y) {
@@ -36,9 +40,7 @@ DEFINE_HASH_OPS_WITH_VALUE_DESTRUCTOR(
         sd_lldp_neighbor,
         lldp_neighbor_unlink);
 
-int lldp_neighbor_prioq_compare_func(const void *a, const void *b) {
-        const sd_lldp_neighbor *x = a, *y = b;
-
+int lldp_neighbor_prioq_compare_func(const sd_lldp_neighbor *x, const sd_lldp_neighbor *y) {
         assert(x);
         assert(y);
 
@@ -159,8 +161,7 @@ static int parse_string(sd_lldp_rx *lldp_rx, char **s, const void *q, size_t n) 
         if (!k)
                 return log_oom_debug();
 
-        free(*s);
-        *s = k;
+        free_and_replace(*s, k);
 
         return 1;
 }
@@ -179,7 +180,7 @@ int lldp_neighbor_parse(sd_lldp_neighbor *n) {
 
         memcpy(&h, LLDP_NEIGHBOR_RAW(n), sizeof(h));
 
-        if (h.ether_type != htobe16(ETHERTYPE_LLDP))
+        if (h.ether_type != htobe16(ETH_P_LLDP))
                 return log_lldp_rx_errno(n->lldp_rx, SYNTHETIC_ERRNO(EBADMSG),
                                          "Received packet with wrong type, ignoring.");
 
@@ -313,6 +314,16 @@ int lldp_neighbor_parse(sd_lldp_neighbor *n) {
                                 if (r < 0)
                                         return r;
                         }
+
+                        /* IEEE 802.1: VLAN ID */
+                        if (memcmp(p, SD_LLDP_OUI_802_1_VLAN_ID, sizeof(SD_LLDP_OUI_802_1_VLAN_ID)) == 0) {
+                                if (length != (sizeof(SD_LLDP_OUI_802_1_VLAN_ID) + sizeof(uint16_t)))
+                                        return log_lldp_rx_errno(n->lldp_rx, SYNTHETIC_ERRNO(EBADMSG),
+                                                                 "Found 802.1 VLAN ID TLV with wrong length, ignoring.");
+
+                                n->has_port_vlan_id = true;
+                                n->port_vlan_id = unaligned_read_be16(p + sizeof(SD_LLDP_OUI_802_1_VLAN_ID));
+                        }
                         break;
                 }
 
@@ -374,17 +385,6 @@ int sd_lldp_neighbor_get_destination_address(sd_lldp_neighbor *n, struct ether_a
         assert_return(address, -EINVAL);
 
         *address = n->destination_address;
-        return 0;
-}
-
-int sd_lldp_neighbor_get_raw(sd_lldp_neighbor *n, const void **ret, size_t *size) {
-        assert_return(n, -EINVAL);
-        assert_return(ret, -EINVAL);
-        assert_return(size, -EINVAL);
-
-        *ret = LLDP_NEIGHBOR_RAW(n);
-        *size = n->raw_size;
-
         return 0;
 }
 
@@ -641,26 +641,15 @@ int sd_lldp_neighbor_get_enabled_capabilities(sd_lldp_neighbor *n, uint16_t *ret
         return 0;
 }
 
-int sd_lldp_neighbor_from_raw(sd_lldp_neighbor **ret, const void *raw, size_t raw_size) {
-        _cleanup_(sd_lldp_neighbor_unrefp) sd_lldp_neighbor *n = NULL;
-        int r;
-
+int sd_lldp_neighbor_get_port_vlan_id(sd_lldp_neighbor *n, uint16_t *ret) {
+        assert_return(n, -EINVAL);
         assert_return(ret, -EINVAL);
-        assert_return(raw || raw_size <= 0, -EINVAL);
 
-        n = lldp_neighbor_new(raw_size);
-        if (!n)
-                return -ENOMEM;
+        if (!n->has_port_vlan_id)
+                return -ENODATA;
 
-        memcpy_safe(LLDP_NEIGHBOR_RAW(n), raw, raw_size);
-
-        r = lldp_neighbor_parse(n);
-        if (r < 0)
-                return r;
-
-        *ret = TAKE_PTR(n);
-
-        return r;
+        *ret = n->port_vlan_id;
+        return 0;
 }
 
 int sd_lldp_neighbor_tlv_rewind(sd_lldp_neighbor *n) {
@@ -718,7 +707,7 @@ int sd_lldp_neighbor_tlv_is_type(sd_lldp_neighbor *n, uint8_t type) {
         return type == k;
 }
 
-int sd_lldp_neighbor_tlv_get_oui(sd_lldp_neighbor *n, uint8_t oui[_SD_ARRAY_STATIC 3], uint8_t *subtype) {
+int sd_lldp_neighbor_tlv_get_oui(sd_lldp_neighbor *n, uint8_t oui[static 3], uint8_t *subtype) {
         const uint8_t *d;
         size_t length;
         int r;
@@ -747,7 +736,7 @@ int sd_lldp_neighbor_tlv_get_oui(sd_lldp_neighbor *n, uint8_t oui[_SD_ARRAY_STAT
         return 0;
 }
 
-int sd_lldp_neighbor_tlv_is_oui(sd_lldp_neighbor *n, const uint8_t oui[_SD_ARRAY_STATIC 3], uint8_t subtype) {
+int sd_lldp_neighbor_tlv_is_oui(sd_lldp_neighbor *n, const uint8_t oui[static 3], uint8_t subtype) {
         uint8_t k[3], st;
         int r;
 
@@ -793,4 +782,38 @@ int sd_lldp_neighbor_get_timestamp(sd_lldp_neighbor *n, clockid_t clock, uint64_
 
         *ret = triple_timestamp_by_clock(&n->timestamp, clock);
         return 0;
+}
+
+int lldp_neighbor_build_json(sd_lldp_neighbor *n, sd_json_variant **ret) {
+        const char *chassis_id = NULL, *port_id = NULL, *port_description = NULL,
+                *system_name = NULL, *system_description = NULL;
+        uint16_t cc = 0;
+        bool valid_cc;
+        uint16_t vlanid = 0;
+        bool valid_vlanid;
+
+        assert(n);
+        assert(ret);
+
+        (void) sd_lldp_neighbor_get_chassis_id_as_string(n, &chassis_id);
+        (void) sd_lldp_neighbor_get_port_id_as_string(n, &port_id);
+        (void) sd_lldp_neighbor_get_port_description(n, &port_description);
+        (void) sd_lldp_neighbor_get_system_name(n, &system_name);
+        (void) sd_lldp_neighbor_get_system_description(n, &system_description);
+
+        valid_cc = sd_lldp_neighbor_get_enabled_capabilities(n, &cc) >= 0;
+        valid_vlanid = sd_lldp_neighbor_get_port_vlan_id(n, &vlanid) >= 0;
+
+        return sd_json_buildo(
+                        ret,
+                        JSON_BUILD_PAIR_STRING_NON_EMPTY("ChassisID", chassis_id),
+                        SD_JSON_BUILD_PAIR_BYTE_ARRAY("RawChassisID", n->id.chassis_id, n->id.chassis_id_size),
+                        JSON_BUILD_PAIR_STRING_NON_EMPTY("PortID", port_id),
+                        SD_JSON_BUILD_PAIR_BYTE_ARRAY("RawPortID", n->id.port_id, n->id.port_id_size),
+                        JSON_BUILD_PAIR_STRING_NON_EMPTY("PortDescription", port_description),
+                        JSON_BUILD_PAIR_STRING_NON_EMPTY("SystemName", system_name),
+                        JSON_BUILD_PAIR_STRING_NON_EMPTY("SystemDescription", system_description),
+                        SD_JSON_BUILD_PAIR_CONDITION(valid_cc, "EnabledCapabilities", SD_JSON_BUILD_UNSIGNED(cc)),
+                        JSON_BUILD_PAIR_STRING_NON_EMPTY("MUDURL", n->mud_url),
+                        SD_JSON_BUILD_PAIR_CONDITION(valid_vlanid, "VlanID", SD_JSON_BUILD_UNSIGNED(vlanid)));
 }

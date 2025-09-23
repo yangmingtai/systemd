@@ -1,56 +1,76 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
+#include "sd-bus.h"
+
+#include "alloc-util.h"
 #include "bus-error.h"
 #include "bus-locator.h"
-#include "locale-util.h"
+#include "bus-unit-util.h"
+#include "bus-util.h"
+#include "glyph-util.h"
+#include "install.h"
+#include "log.h"
+#include "path-lookup.h"
 #include "path-util.h"
+#include "string-util.h"
+#include "strv-fundamental.h"
+#include "strv.h"
+#include "systemctl.h"
 #include "systemctl-daemon-reload.h"
 #include "systemctl-enable.h"
 #include "systemctl-start-unit.h"
 #include "systemctl-sysv-compat.h"
 #include "systemctl-util.h"
-#include "systemctl.h"
+#include "unit-name.h"
+#include "verbs.h"
 
-static int normalize_filenames(char **names) {
+static int normalize_link_paths(char **paths) {
         int r;
 
-        STRV_FOREACH(u, names)
-                if (!path_is_absolute(*u)) {
-                        char* normalized_path;
+        STRV_FOREACH(u, paths) {
+                if (path_is_absolute(*u))
+                        continue;
 
-                        if (!isempty(arg_root))
-                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
-                                                       "Non-absolute paths are not allowed when --root is used: %s",
-                                                       *u);
+                if (!isempty(arg_root))
+                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                               "Non-absolute paths are not allowed when --root= is used: %s",
+                                               *u);
 
-                        if (!strchr(*u, '/'))
-                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
-                                                       "Link argument must contain at least one directory separator.\n"
-                                                       "If you intended to link a file in the current directory, try ./%s instead.",
-                                                       *u);
+                if (!is_path(*u))
+                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                               "Link argument must contain at least one directory separator.\n"
+                                               "If you intended to link a file in the current directory, try './%s' instead.",
+                                               *u);
 
-                        r = path_make_absolute_cwd(*u, &normalized_path);
-                        if (r < 0)
-                                return r;
+                char *normalized_path;
 
-                        free_and_replace(*u, normalized_path);
-                }
+                r = path_make_absolute_cwd(*u, &normalized_path);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to normalize path '%s': %m", *u);
+
+                path_simplify(normalized_path);
+
+                free_and_replace(*u, normalized_path);
+        }
 
         return 0;
 }
 
 static int normalize_names(char **names) {
         bool was_path = false;
+        int r;
 
         STRV_FOREACH(u, names) {
-                int r;
-
                 if (!is_path(*u))
                         continue;
 
-                r = free_and_strdup(u, basename(*u));
+                char *fn;
+
+                r = path_extract_filename(*u, &fn);
                 if (r < 0)
-                        return log_error_errno(r, "Failed to normalize unit file path: %m");
+                        return log_error_errno(r, "Failed to extract file name from '%s': %m", *u);
+
+                free_and_replace(*u, fn);
 
                 was_path = true;
         }
@@ -62,16 +82,18 @@ static int normalize_names(char **names) {
 }
 
 int verb_enable(int argc, char *argv[], void *userdata) {
+        const char *verb = ASSERT_PTR(argv[0]);
         _cleanup_strv_free_ char **names = NULL;
-        const char *verb = argv[0];
         int carries_install_info = -1;
         bool ignore_carries_install_info = arg_quiet || arg_no_warn;
+        sd_bus *bus = NULL;
         int r;
 
-        if (!argv[1])
+        if (streq(verb, "preset") && should_bypass("SYSTEMD_PRESET"))
                 return 0;
 
-        r = mangle_names("to enable", strv_skip(argv, 1), &names);
+        const char *operation = strjoina("to ", verb);
+        r = mangle_names(operation, ASSERT_PTR(strv_skip(argv, 1)), &names);
         if (r < 0)
                 return r;
 
@@ -88,17 +110,14 @@ int verb_enable(int argc, char *argv[], void *userdata) {
                 return r > 0 ? 0 : r;
         }
 
-        if (streq(verb, "disable")) {
+        if (streq(verb, "disable"))
                 r = normalize_names(names);
-                if (r < 0)
-                        return r;
-        }
-
-        if (streq(verb, "link")) {
-                r = normalize_filenames(names);
-                if (r < 0)
-                        return r;
-        }
+        else if (streq(verb, "link"))
+                r = normalize_link_paths(names);
+        else
+                r = 0;
+        if (r < 0)
+                return r;
 
         if (install_client_side()) {
                 UnitFileFlags flags;
@@ -108,6 +127,7 @@ int verb_enable(int argc, char *argv[], void *userdata) {
                 CLEANUP_ARRAY(changes, n_changes, install_changes_free);
 
                 flags = unit_file_flags_from_args();
+
                 if (streq(verb, "enable")) {
                         r = unit_file_enable(arg_runtime_scope, flags, arg_root, names, &changes, &n_changes);
                         carries_install_info = r;
@@ -138,11 +158,11 @@ int verb_enable(int argc, char *argv[], void *userdata) {
                 _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
                 bool expect_carries_install_info = false;
                 bool send_runtime = true, send_force = true, send_preset_mode = false;
-                const char *method;
-                sd_bus *bus;
+                const char *method, *warn_trigger_operation = NULL;
+                bool warn_trigger_ignore_masked = true; /* suppress "used uninitialized" warning */
 
                 if (STR_IN_SET(verb, "mask", "unmask")) {
-                        _cleanup_(lookup_paths_free) LookupPaths lp = {};
+                        _cleanup_(lookup_paths_done) LookupPaths lp = {};
 
                         r = lookup_paths_init_or_warn(&lp, arg_runtime_scope, 0, arg_root);
                         if (r < 0)
@@ -170,6 +190,9 @@ int verb_enable(int argc, char *argv[], void *userdata) {
                         method = "DisableUnitFilesWithFlagsAndInstallInfo";
                         expect_carries_install_info = true;
                         send_force = false;
+
+                        warn_trigger_operation = "Disabling";
+                        warn_trigger_ignore_masked = true;
                 } else if (streq(verb, "reenable")) {
                         method = "ReenableUnitFiles";
                         expect_carries_install_info = true;
@@ -185,9 +208,12 @@ int verb_enable(int argc, char *argv[], void *userdata) {
 
                         expect_carries_install_info = true;
                         ignore_carries_install_info = true;
-                } else if (streq(verb, "mask"))
+                } else if (streq(verb, "mask")) {
                         method = "MaskUnitFiles";
-                else if (streq(verb, "unmask")) {
+
+                        warn_trigger_operation = "Masking";
+                        warn_trigger_ignore_masked = false;
+                } else if (streq(verb, "unmask")) {
                         method = "UnmaskUnitFiles";
                         send_force = false;
                 } else if (streq(verb, "revert")) {
@@ -245,6 +271,10 @@ int verb_enable(int argc, char *argv[], void *userdata) {
                         if (r < 0)
                                 return r;
                 }
+
+                if (warn_trigger_operation && !arg_quiet && !arg_no_warn)
+                        STRV_FOREACH(unit, names)
+                                warn_triggering_units(bus, *unit, warn_trigger_operation, warn_trigger_ignore_masked);
         }
 
         if (carries_install_info == 0 && !ignore_carries_install_info)
@@ -252,22 +282,23 @@ int verb_enable(int argc, char *argv[], void *userdata) {
                            "Also=, or Alias= settings in the [Install] section, and DefaultInstance= for\n"
                            "template units). This means they are not meant to be enabled or disabled using systemctl.\n"
                            " \n" /* trick: the space is needed so that the line does not get stripped from output */
-                           "Possible reasons for having this kind of units are:\n"
+                           "Possible reasons for having these kinds of units are:\n"
                            "%1$s A unit may be statically enabled by being symlinked from another unit's\n"
-                           "  .wants/ or .requires/ directory.\n"
+                           "  .wants/, .requires/, or .upholds/ directory.\n"
                            "%1$s A unit's purpose may be to act as a helper for some other unit which has\n"
                            "  a requirement dependency on it.\n"
                            "%1$s A unit may be started when needed via activation (socket, path, timer,\n"
                            "  D-Bus, udev, scripted systemctl call, ...).\n"
                            "%1$s In case of template units, the unit is meant to be enabled with some\n"
                            "  instance name specified.",
-                           special_glyph(SPECIAL_GLYPH_BULLET));
+                           glyph(GLYPH_BULLET));
 
         if (streq(verb, "disable") && arg_runtime_scope == RUNTIME_SCOPE_USER && !arg_quiet && !arg_no_warn) {
                 /* If some of the units are disabled in user scope but still enabled in global scope,
                  * we emit a warning for that. */
 
-                _cleanup_strv_free_ char **enabled_in_global_scope = NULL;
+                /* No strv_free here, strings are owned by 'names' */
+                _cleanup_free_ char **enabled_in_global_scope = NULL;
 
                 STRV_FOREACH(name, names) {
                         UnitFileState state;
@@ -279,46 +310,101 @@ int verb_enable(int argc, char *argv[], void *userdata) {
                                 return log_error_errno(r, "Failed to get unit file state for %s: %m", *name);
 
                         if (IN_SET(state, UNIT_FILE_ENABLED, UNIT_FILE_ENABLED_RUNTIME)) {
-                                r = strv_extend(&enabled_in_global_scope, *name);
+                                r = strv_push(&enabled_in_global_scope, *name);
                                 if (r < 0)
                                         return log_oom();
                         }
                 }
 
                 if (!strv_isempty(enabled_in_global_scope)) {
-                        _cleanup_free_ char *units = NULL;
+                        _cleanup_free_ char *joined = NULL;
 
-                        units = strv_join(enabled_in_global_scope, ", ");
-                        if (!units)
+                        joined = strv_join(enabled_in_global_scope, ", ");
+                        if (!joined)
                                 return log_oom();
 
                         log_notice("The following unit files have been enabled in global scope. This means\n"
                                    "they will still be started automatically after a successful disablement\n"
                                    "in user scope:\n"
                                    "%s",
-                                   units);
+                                   joined);
                 }
         }
 
-        if (arg_now && STR_IN_SET(argv[0], "enable", "disable", "mask")) {
-                sd_bus *bus;
-                size_t len, i;
+        if (arg_now) {
+                _cleanup_strv_free_ char **new_args = NULL;
+                const char *start_verb;
+                bool accept_path, prohibit_templates;
 
-                r = acquire_bus(BUS_MANAGER, &bus);
-                if (r < 0)
-                        return r;
+                if (streq(verb, "enable")) {
+                        start_verb = "start";
+                        accept_path = true;
+                        prohibit_templates = true;
+                } else if (STR_IN_SET(verb, "disable", "mask")) {
+                        start_verb = "stop";
+                        accept_path = false;
+                        prohibit_templates = false;
+                } else if (streq(verb, "reenable")) {
+                        /* Note that we use try-restart here. This matches the semantics of reenable better,
+                         * and allows us to glob template units. */
+                        start_verb = "try-restart";
+                        accept_path = true;
+                        prohibit_templates = false;
+                } else
+                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                               "--now can only be used with verb enable, disable, reenable, or mask.");
 
-                len = strv_length(names);
-                {
-                        char *new_args[len + 2];
+                if (install_client_side())
+                        return log_error_errno(SYNTHETIC_ERRNO(EREMOTE),
+                                               "--now cannot be used when systemd is not running or in conjunction with --root=/--global, refusing.");
 
-                        new_args[0] = (char*) (streq(argv[0], "enable") ? "start" : "stop");
-                        for (i = 0; i < len; i++)
-                                new_args[i + 1] = basename(names[i]);
-                        new_args[i + 1] = NULL;
+                assert(bus);
 
-                        r = verb_start(len + 1, new_args, userdata);
+                if (strv_extend(&new_args, start_verb) < 0)
+                        return log_oom();
+
+                STRV_FOREACH(name, names) {
+                        _cleanup_free_ char *fn = NULL;
+                        const char *unit_name;
+
+                        if (accept_path) {
+                                /* 'enable' and 'reenable' accept path to unit files, so extract it first. */
+
+                                r = path_extract_filename(*name, &fn);
+                                if (r < 0)
+                                        return log_error_errno(r, "Failed to extract filename of '%s': %m", *name);
+
+                                unit_name = fn;
+                        } else
+                                unit_name = *name;
+
+                        if (unit_name_is_valid(unit_name, UNIT_NAME_TEMPLATE)) {
+                                char *globbed;
+
+                                if (prohibit_templates) {
+                                        /* Skip template units when enabling. Globbing doesn't make sense
+                                         * since the semantics would be altered (we're operating on
+                                         * DefaultInstance= when enabling), and starting template unit
+                                         * is not supported anyway. */
+                                        log_warning("Template unit is not supported by %s --now, skipping: %s",
+                                                    verb, unit_name);
+                                        continue;
+                                }
+
+                                assert(!STR_IN_SET(start_verb, "start", "restart"));
+
+                                r = unit_name_replace_instance_full(unit_name, "*", /* accept_glob = */ true, &globbed);
+                                if (r < 0)
+                                        return log_error_errno(r, "Failed to glob unit name '%s': %m", unit_name);
+
+                                r = strv_consume(&new_args, globbed);
+                        } else
+                                r = strv_extend(&new_args, unit_name);
+                        if (r < 0)
+                                return log_oom();
                 }
+
+                return verb_start(strv_length(new_args), new_args, userdata);
         }
 
         return 0;

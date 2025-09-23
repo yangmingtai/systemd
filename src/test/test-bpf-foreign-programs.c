@@ -1,18 +1,18 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <fcntl.h>
+#include <linux/bpf.h>
 #include <linux/bpf_insn.h>
 #include <string.h>
-#include <sys/mman.h>
 #include <unistd.h>
 
-#include "bpf-foreign.h"
+#include "bpf-program.h"
 #include "load-fragment.h"
 #include "manager.h"
 #include "process-util.h"
 #include "rlimit-util.h"
 #include "rm-rf.h"
 #include "service.h"
+#include "strv.h"
 #include "tests.h"
 #include "unit.h"
 #include "virt.h"
@@ -246,14 +246,15 @@ static int test_bpf_cgroup_programs(Manager *m, const char *unit_name, const Tes
         SERVICE(u)->type = SERVICE_ONESHOT;
         u->load_state = UNIT_LOADED;
 
+        ASSERT_OK(unit_patch_contexts(u));
         r = unit_start(u, NULL);
         if (r < 0)
-                return log_error_errno(r, "Unit start failed %m");
+                return log_error_errno(r, "Unit start failed: %m");
 
         while (!IN_SET(SERVICE(u)->state, SERVICE_DEAD, SERVICE_FAILED)) {
                 r = sd_event_run(m->event, UINT64_MAX);
                 if (r < 0)
-                        return log_error_errno(errno, "Event run failed %m");
+                        return log_error_errno(r, "Event run failed: %m");
         }
 
         cld_code = SERVICE(u)->exec_command[SERVICE_EXEC_START]->exec_status.code;
@@ -282,7 +283,11 @@ int main(int argc, char *argv[]) {
         if (getuid() != 0)
                 return log_tests_skipped("not running as root");
 
-        assert_se(getrlimit(RLIMIT_MEMLOCK, &rl) >= 0);
+        r = bpf_program_supported();
+        if (r < 0)
+                return log_tests_skipped_errno(r, "BPF programs not supported");
+
+        ASSERT_OK(getrlimit(RLIMIT_MEMLOCK, &rl));
         rl.rlim_cur = rl.rlim_max = MAX(rl.rlim_max, CAN_MEMLOCK_SIZE);
         (void) setrlimit_closest(RLIMIT_MEMLOCK, &rl);
 
@@ -297,34 +302,34 @@ int main(int argc, char *argv[]) {
         if (r == -ENOMEDIUM)
                 return log_tests_skipped("cgroupfs not available");
 
-        assert_se(get_testdata_dir("units", &unit_dir) >= 0);
-        assert_se(set_unit_path(unit_dir) >= 0);
+        ASSERT_OK(get_testdata_dir("units", &unit_dir));
+        ASSERT_OK(setenv_unit_path(unit_dir));
         assert_se(runtime_dir = setup_fake_runtime_dir());
 
-        assert_se(manager_new(RUNTIME_SCOPE_USER, MANAGER_TEST_RUN_BASIC, &m) >= 0);
-        assert_se(manager_startup(m, NULL, NULL, NULL) >= 0);
+        ASSERT_OK(manager_new(RUNTIME_SCOPE_USER, MANAGER_TEST_RUN_BASIC, &m));
+        ASSERT_OK(manager_startup(m, NULL, NULL, NULL));
 
-        assert_se(test_bpf_cgroup_programs(m,
-                                "single_prog.service", single_prog, ELEMENTSOF(single_prog)) >= 0);
-        assert_se(test_bpf_cgroup_programs(m,
+        ASSERT_OK(test_bpf_cgroup_programs(m,
+                                "single_prog.service", single_prog, ELEMENTSOF(single_prog)));
+        ASSERT_OK(test_bpf_cgroup_programs(m,
                                 "multi_prog_same_hook.service",
-                                multi_prog_same_hook, ELEMENTSOF(multi_prog_same_hook)) >= 0);
-        assert_se(test_bpf_cgroup_programs(m,
+                                multi_prog_same_hook, ELEMENTSOF(multi_prog_same_hook)));
+        ASSERT_OK(test_bpf_cgroup_programs(m,
                                 "same_prog_multi_hook.service",
-                                same_prog_multi_hook, ELEMENTSOF(same_prog_multi_hook)) >= 0);
-        assert_se(test_bpf_cgroup_programs(m,
+                                same_prog_multi_hook, ELEMENTSOF(same_prog_multi_hook)));
+        ASSERT_OK(test_bpf_cgroup_programs(m,
                                 "same_prog_multi_option_0.service",
-                                same_prog_multi_option_0, ELEMENTSOF(same_prog_multi_option_0)) >= 0);
-        assert_se(test_bpf_cgroup_programs(m,
+                                same_prog_multi_option_0, ELEMENTSOF(same_prog_multi_option_0)));
+        ASSERT_OK(test_bpf_cgroup_programs(m,
                                 "same_prog_multi_option_1.service",
-                                same_prog_multi_option_1, ELEMENTSOF(same_prog_multi_option_1)) >= 0);
-        assert_se(test_bpf_cgroup_programs(m,
+                                same_prog_multi_option_1, ELEMENTSOF(same_prog_multi_option_1)));
+        ASSERT_OK(test_bpf_cgroup_programs(m,
                                 "same_prog_same_hook.service",
                                 same_prog_same_hook,
-                                ELEMENTSOF(same_prog_same_hook)) >= 0);
-        assert_se(test_bpf_cgroup_programs(m,
+                                ELEMENTSOF(same_prog_same_hook)));
+        ASSERT_OK(test_bpf_cgroup_programs(m,
                                 "path_split_test.service",
                                 path_split_test,
-                                ELEMENTSOF(path_split_test)) >= 0);
+                                ELEMENTSOF(path_split_test)));
         return 0;
 }

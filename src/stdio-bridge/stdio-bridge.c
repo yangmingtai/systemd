@@ -1,15 +1,12 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <errno.h>
 #include <getopt.h>
-#include <stddef.h>
-#include <string.h>
+#include <poll.h>
 #include <unistd.h>
 
 #include "sd-bus.h"
 #include "sd-daemon.h"
 
-#include "alloc-util.h"
 #include "build.h"
 #include "bus-internal.h"
 #include "bus-util.h"
@@ -17,11 +14,10 @@
 #include "io-util.h"
 #include "log.h"
 #include "main-func.h"
-#include "version.h"
+#include "parse-argument.h"
+#include "time-util.h"
 
-#define DEFAULT_BUS_PATH "unix:path=/run/dbus/system_bus_socket"
-
-static const char *arg_bus_path = DEFAULT_BUS_PATH;
+static const char *arg_bus_path = DEFAULT_SYSTEM_BUS_ADDRESS;
 static BusTransport arg_transport = BUS_TRANSPORT_LOCAL;
 static RuntimeScope arg_runtime_scope = RUNTIME_SCOPE_SYSTEM;
 
@@ -34,15 +30,15 @@ static int help(void) {
                "     --system            Connect to system bus\n"
                "     --user              Connect to user bus\n"
                "  -M --machine=CONTAINER Name of local container to connect to\n",
-               program_invocation_short_name, DEFAULT_BUS_PATH);
+               program_invocation_short_name, DEFAULT_SYSTEM_BUS_ADDRESS);
 
         return 0;
 }
 
 static int parse_argv(int argc, char *argv[]) {
+
         enum {
                 ARG_VERSION = 0x100,
-                ARG_MACHINE,
                 ARG_USER,
                 ARG_SYSTEM,
         };
@@ -57,7 +53,7 @@ static int parse_argv(int argc, char *argv[]) {
                 {},
         };
 
-        int c;
+        int r, c;
 
         assert(argc >= 0);
         assert(argv);
@@ -85,17 +81,22 @@ static int parse_argv(int argc, char *argv[]) {
                         break;
 
                 case 'M':
-                        arg_bus_path = optarg;
-                        arg_transport = BUS_TRANSPORT_MACHINE;
+                        r = parse_machine_argument(optarg, &arg_bus_path, &arg_transport);
+                        if (r < 0)
+                                return r;
                         break;
 
                 case '?':
                         return -EINVAL;
 
                 default:
-                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
-                                               "Unknown option code %c", c);
+                        assert_not_reached();
                 }
+
+        if (argc > optind)
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                       "%s takes no arguments.",
+                                       program_invocation_short_name);
 
         return 1;
 }
@@ -106,9 +107,7 @@ static int run(int argc, char *argv[]) {
         bool is_unix;
         int r, in_fd, out_fd;
 
-        log_set_target(LOG_TARGET_JOURNAL_OR_KMSG);
-        log_parse_environment();
-        log_open();
+        log_setup();
 
         r = parse_argv(argc, argv);
         if (r <= 0)
@@ -145,7 +144,7 @@ static int run(int argc, char *argv[]) {
 
         r = sd_bus_start(a);
         if (r < 0)
-                return log_error_errno(r, "Failed to start bus client: %m");
+                return bus_log_connect_error(r, arg_transport, arg_runtime_scope);
 
         r = sd_bus_get_bus_id(a, &server_id);
         if (r < 0)
@@ -173,7 +172,7 @@ static int run(int argc, char *argv[]) {
 
         r = sd_bus_start(b);
         if (r < 0)
-                return log_error_errno(r, "Failed to start bus client: %m");
+                return log_error_errno(r, "Failed to start bus forwarding server: %m");
 
         for (;;) {
                 _cleanup_(sd_bus_message_unrefp) sd_bus_message *m = NULL;
@@ -183,10 +182,14 @@ static int run(int argc, char *argv[]) {
                 assert_cc(sizeof(usec_t) == sizeof(uint64_t));
 
                 r = sd_bus_process(a, &m);
+                if (ERRNO_IS_NEG_DISCONNECT(r)) /* Treat 'connection reset by peer' as clean exit condition */
+                        return 0;
                 if (r < 0)
                         return log_error_errno(r, "Failed to process bus a: %m");
-
                 if (m) {
+                        if (sd_bus_message_is_signal(m, "org.freedesktop.DBus.Local", "Disconnected"))
+                                return 0;
+
                         r = sd_bus_send(b, m, NULL);
                         if (r < 0)
                                 return log_error_errno(r, "Failed to send message: %m");
@@ -196,15 +199,14 @@ static int run(int argc, char *argv[]) {
                         continue;
 
                 r = sd_bus_process(b, &m);
-                if (r < 0) {
-                        /* treat 'connection reset by peer' as clean exit condition */
-                        if (ERRNO_IS_DISCONNECT(r))
+                if (ERRNO_IS_NEG_DISCONNECT(r)) /* Treat 'connection reset by peer' as clean exit condition */
+                        return 0;
+                if (r < 0)
+                        return log_error_errno(r, "Failed to process bus: %m");
+                if (m) {
+                        if (sd_bus_message_is_signal(m, "org.freedesktop.DBus.Local", "Disconnected"))
                                 return 0;
 
-                        return log_error_errno(r, "Failed to process bus: %m");
-                }
-
-                if (m) {
                         r = sd_bus_send(a, m, NULL);
                         if (r < 0)
                                 return log_error_errno(r, "Failed to send message: %m");
@@ -236,20 +238,15 @@ static int run(int argc, char *argv[]) {
                 t = usec_sub_unsigned(MIN(timeout_a, timeout_b), now(CLOCK_MONOTONIC));
 
                 struct pollfd p[3] = {
-                        { .fd = fd,            .events = events_a           },
-                        { .fd = STDIN_FILENO,  .events = events_b & POLLIN  },
-                        { .fd = STDOUT_FILENO, .events = events_b & POLLOUT },
+                        { .fd = fd,     .events = events_a           },
+                        { .fd = in_fd,  .events = events_b & POLLIN  },
+                        { .fd = out_fd, .events = events_b & POLLOUT },
                 };
 
                 r = ppoll_usec(p, ELEMENTSOF(p), t);
-                if (r < 0) {
-                        if (ERRNO_IS_TRANSIENT(r)) /* don't be bothered by signals, i.e. EINTR */
-                                continue;
+                if (r < 0 && !ERRNO_IS_TRANSIENT(r))  /* don't be bothered by signals, i.e. EINTR */
                         return log_error_errno(r, "ppoll() failed: %m");
-                }
         }
-
-        return 0;
 }
 
 DEFINE_MAIN_FUNCTION(run);

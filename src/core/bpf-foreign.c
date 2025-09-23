@@ -1,19 +1,23 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
+#include <linux/bpf.h>
+#include <linux/magic.h>
+
+#include "alloc-util.h"
 #include "bpf-foreign.h"
 #include "bpf-program.h"
 #include "cgroup.h"
-#include "memory-util.h"
-#include "missing_magic.h"
-#include "mountpoint-util.h"
-#include "set.h"
+#include "errno-util.h"
+#include "hash-funcs.h"
+#include "hashmap.h"
+#include "siphash24.h"
 #include "stat-util.h"
+#include "unit.h"
 
-typedef struct BPFForeignKey BPFForeignKey;
-struct BPFForeignKey {
+typedef struct BPFForeignKey {
         uint32_t prog_id;
         uint32_t attach_type;
-};
+} BPFForeignKey;
 
 static int bpf_foreign_key_new(uint32_t prog_id,
                 enum bpf_attach_type attach_type,
@@ -24,7 +28,7 @@ static int bpf_foreign_key_new(uint32_t prog_id,
 
         p = new(BPFForeignKey, 1);
         if (!p)
-                return log_oom();
+                return -ENOMEM;
 
         *p = (BPFForeignKey) {
                 .prog_id = prog_id,
@@ -45,8 +49,8 @@ static int bpf_foreign_key_compare_func(const BPFForeignKey *a, const BPFForeign
 }
 
 static void bpf_foreign_key_hash_func(const BPFForeignKey *p, struct siphash *h) {
-        siphash24_compress(&p->prog_id, sizeof(p->prog_id), h);
-        siphash24_compress(&p->attach_type, sizeof(p->attach_type), h);
+        siphash24_compress_typesafe(p->prog_id, h);
+        siphash24_compress_typesafe(p->attach_type, h);
 }
 
 DEFINE_PRIVATE_HASH_OPS_FULL(bpf_foreign_by_key_hash_ops,
@@ -56,17 +60,17 @@ DEFINE_PRIVATE_HASH_OPS_FULL(bpf_foreign_by_key_hash_ops,
 static int attach_programs(Unit *u, const char *path, Hashmap* foreign_by_key, uint32_t attach_flags) {
         const BPFForeignKey *key;
         BPFProgram *prog;
-        int r;
+        int r, ret = 0;
 
         assert(u);
 
         HASHMAP_FOREACH_KEY(prog, key, foreign_by_key) {
                 r = bpf_program_cgroup_attach(prog, key->attach_type, path, attach_flags);
                 if (r < 0)
-                        return log_unit_error_errno(u, r, "bpf-foreign: Attaching foreign BPF program to cgroup %s failed: %m", path);
+                        RET_GATHER(ret, log_unit_error_errno(u, r, "bpf-foreign: Attaching foreign BPF program to cgroup %s failed: %m", path));
         }
 
-        return 0;
+        return ret;
 }
 
 /*
@@ -78,6 +82,7 @@ static int bpf_foreign_prepare(
                 Unit *u,
                 enum bpf_attach_type attach_type,
                 const char *bpffs_path) {
+
         _cleanup_(bpf_program_freep) BPFProgram *prog = NULL;
         _cleanup_free_ BPFForeignKey *key = NULL;
         uint32_t prog_id;
@@ -87,12 +92,21 @@ static int bpf_foreign_prepare(
         assert(bpffs_path);
 
         r = path_is_fs_type(bpffs_path, BPF_FS_MAGIC);
+        if (r == -ENOENT) {
+                log_unit_warning_errno(u, r, "bpf-foreign: foreign program %s does not exist, skipping.", bpffs_path);
+                return 0;
+        }
         if (r < 0)
                 return log_unit_error_errno(u, r,
                                 "bpf-foreign: Failed to determine filesystem type of %s: %m", bpffs_path);
         if (r == 0)
                 return log_unit_error_errno(u, SYNTHETIC_ERRNO(EINVAL),
                                 "bpf-foreign: Path in BPF filesystem is expected.");
+
+        CGroupRuntime *crt = unit_get_cgroup_runtime(u);
+        if (!crt)
+                return log_unit_error_errno(u, SYNTHETIC_ERRNO(EINVAL),
+                                            "Failed to get control group runtime object.");
 
         r = bpf_program_new_from_bpffs_path(bpffs_path, &prog);
         if (r < 0)
@@ -107,7 +121,7 @@ static int bpf_foreign_prepare(
                 return log_unit_error_errno(u, r,
                                 "bpf-foreign: Failed to create foreign BPF program key from path '%s': %m", bpffs_path);
 
-        r = hashmap_ensure_put(&u->bpf_foreign_by_key, &bpf_foreign_by_key_hash_ops, key, prog);
+        r = hashmap_ensure_put(&crt->bpf_foreign_by_key, &bpf_foreign_by_key_hash_ops, key, prog);
         if (r == -EEXIST) {
                 log_unit_warning_errno(u, r, "bpf-foreign: Foreign BPF program already exists, ignoring: %m");
                 return 0;
@@ -124,7 +138,8 @@ static int bpf_foreign_prepare(
 int bpf_foreign_install(Unit *u) {
         _cleanup_free_ char *cgroup_path = NULL;
         CGroupContext *cc;
-        int r;
+        CGroupRuntime *crt;
+        int r, ret = 0;
 
         assert(u);
 
@@ -132,19 +147,16 @@ int bpf_foreign_install(Unit *u) {
         if (!cc)
                 return 0;
 
-        r = cg_get_path(SYSTEMD_CGROUP_CONTROLLER, u->cgroup_path, NULL, &cgroup_path);
+        crt = unit_get_cgroup_runtime(u);
+        if (!crt)
+                return 0;
+
+        r = cg_get_path(SYSTEMD_CGROUP_CONTROLLER, crt->cgroup_path, NULL, &cgroup_path);
         if (r < 0)
                 return log_unit_error_errno(u, r, "bpf-foreign: Failed to get cgroup path: %m");
 
-        LIST_FOREACH(programs, p, cc->bpf_foreign_programs) {
-                r = bpf_foreign_prepare(u, p->attach_type, p->bpffs_path);
-                if (r < 0)
-                        return log_unit_error_errno(u, r, "bpf-foreign: Failed to prepare foreign BPF hashmap: %m");
-        }
+        LIST_FOREACH(programs, p, cc->bpf_foreign_programs)
+                RET_GATHER(ret, bpf_foreign_prepare(u, p->attach_type, p->bpffs_path));
 
-        r = attach_programs(u, cgroup_path, u->bpf_foreign_by_key, BPF_F_ALLOW_MULTI);
-        if (r < 0)
-                  return log_unit_error_errno(u, r, "bpf-foreign: Failed to install foreign BPF programs: %m");
-
-        return 0;
+        return RET_GATHER(ret, attach_programs(u, cgroup_path, crt->bpf_foreign_by_key, BPF_F_ALLOW_MULTI));
 }

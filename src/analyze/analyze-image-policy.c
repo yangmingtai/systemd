@@ -1,9 +1,12 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include "analyze-image-policy.h"
+#include "alloc-util.h"
 #include "analyze.h"
+#include "analyze-image-policy.h"
+#include "ansi-color.h"
 #include "format-table.h"
-#include "terminal-util.h"
+#include "image-policy.h"
+#include "string-util.h"
 
 static int table_add_designator_line(Table *table, PartitionDesignator d, PartitionPolicyFlags f) {
         _cleanup_free_ char *q = NULL;
@@ -49,7 +52,6 @@ static int table_add_designator_line(Table *table, PartitionDesignator d, Partit
 
         default:
                 r = table_add_many(table, TABLE_EMPTY);
-                break;
         }
         if (r < 0)
                 return table_log_add_error(r);
@@ -66,9 +68,7 @@ static int table_add_designator_line(Table *table, PartitionDesignator d, Partit
 
         default:
                 r = table_add_many(table, TABLE_EMPTY);
-                break;
         }
-
         if (r < 0)
                 return table_log_add_error(r);
 
@@ -92,6 +92,10 @@ int verb_image_policy(int argc, char *argv[], void *userdata) {
                         p = &image_policy_sysext;
                 else if (streq(argv[i], "@sysext-strict"))
                         p = &image_policy_sysext_strict;
+                else if (streq(argv[i], "@confext"))
+                        p = &image_policy_confext;
+                else if (streq(argv[i], "@confext-strict"))
+                        p = &image_policy_confext_strict;
                 else if (streq(argv[i], "@container"))
                         p = &image_policy_container;
                 else if (streq(argv[i], "@service"))

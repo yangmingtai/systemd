@@ -3,17 +3,16 @@
   Copyright © 2013 Intel Corporation. All rights reserved.
 ***/
 
-#include <errno.h>
-#include <net/ethernet.h>
-#include <net/if.h>
-#include <net/if_arp.h>
-#include <stdio.h>
-#include <string.h>
 #include <linux/filter.h>
 #include <linux/if_infiniband.h>
 #include <linux/if_packet.h>
+#include <net/if_arp.h>
+#include <stdio.h>
+#include <string.h>
 
-#include "dhcp-internal.h"
+#include "dhcp-network.h"
+#include "dhcp-protocol.h"
+#include "ether-addr-util.h"
 #include "fd-util.h"
 #include "socket-util.h"
 #include "unaligned.h"
@@ -115,6 +114,10 @@ static int _bind_raw_socket(
         if (r < 0)
                 return -errno;
 
+        r = setsockopt_int(s, SOL_SOCKET, SO_TIMESTAMP, true);
+        if (r < 0)
+                return r;
+
         if (so_priority_set) {
                 r = setsockopt_int(s, SOL_SOCKET, SO_PRIORITY, so_priority);
                 if (r < 0)
@@ -131,7 +134,7 @@ static int _bind_raw_socket(
         /* We may overflow link->ll. link->ll_buffer ensures we have enough space. */
         memcpy(link->ll.sll_addr, bcast_addr->bytes, bcast_addr->length);
 
-        r = bind(s, &link->sa, SOCKADDR_LL_LEN(link->ll));
+        r = bind(s, &link->sa, sockaddr_ll_len(&link->ll));
         if (r < 0)
                 return -errno;
 
@@ -206,6 +209,10 @@ int dhcp_network_bind_udp_socket(int ifindex, be32_t address, uint16_t port, int
         if (r < 0)
                 return r;
 
+        r = setsockopt_int(s, SOL_SOCKET, SO_TIMESTAMP, true);
+        if (r < 0)
+                return r;
+
         if (ifindex > 0) {
                 r = socket_bind_to_ifindex(s, ifindex);
                 if (r < 0)
@@ -249,7 +256,7 @@ int dhcp_network_send_raw_socket(
         assert(packet);
         assert(len > 0);
 
-        if (sendto(s, packet, len, 0, &link->sa, SOCKADDR_LL_LEN(link->ll)) < 0)
+        if (sendto(s, packet, len, 0, &link->sa, sockaddr_ll_len(&link->ll)) < 0)
                 return -errno;
 
         return 0;

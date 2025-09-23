@@ -1,54 +1,64 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <stdlib.h>
+#include <unistd.h>
 
 #include "analyze.h"
 #include "analyze-condition.h"
 #include "analyze-verify-util.h"
 #include "condition.h"
-#include "conf-parser.h"
 #include "load-fragment.h"
+#include "manager.h"
 #include "service.h"
+#include "string-util.h"
+#include "strv.h"
 
 static int parse_condition(Unit *u, const char *line) {
         assert(u);
         assert(line);
 
-        for (ConditionType t = 0; t < _CONDITION_TYPE_MAX; t++) {
-                ConfigParserCallback callback;
-                Condition **target;
-                const char *p, *name;
+        line = skip_leading_chars(line, /* bad = */ NULL);
 
-                name = condition_type_to_string(t);
-                p = startswith(line, name);
-                if (p)
-                        target = &u->conditions;
-                else {
-                        name = assert_type_to_string(t);
-                        p = startswith(line, name);
-                        if (!p)
-                                continue;
+        const char *eq = strchr(line, '=');
+        if (!eq)
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Cannot parse \"%s\".", line);
 
-                        target = &u->asserts;
-                }
+        _cleanup_free_ char *type_string = strndup(line, eq - line);
+        if (!type_string)
+                return log_oom();
 
-                p += strspn(p, WHITESPACE);
+        delete_trailing_chars(type_string, /* bad = */ NULL);
 
-                if (*p != '=')
-                        continue;
-                p++;
-
-                p += strspn(p, WHITESPACE);
-
-                if (condition_takes_path(t))
-                        callback = config_parse_unit_condition_path;
-                else
-                        callback = config_parse_unit_condition_string;
-
-                return callback(NULL, "(cmdline)", 0, NULL, 0, name, t, p, target, u);
+        Condition **target;
+        ConditionType type;
+        if (startswith(type_string, "Condition")) {
+                target = &u->conditions;
+                type = condition_type_from_string(type_string);
+        } else {
+                target = &u->asserts;
+                type = assert_type_from_string(type_string);
         }
+        if (type < 0)
+                return log_error_errno(type, "Cannot parse \"%s\".", line);
 
-        return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Cannot parse \"%s\".", line);
+        const char *val = skip_leading_chars(eq + 1, /* bad = */ NULL);
+
+        ConfigParserCallback callback;
+        if (condition_takes_path(type))
+                callback = config_parse_unit_condition_path;
+        else
+                callback = config_parse_unit_condition_string;
+
+        return callback(/* unit = */ NULL,
+                        /* filename = */ "(cmdline)",
+                        /* line = */ 0,
+                        /* section = */ NULL,
+                        /* section_line = */ 0,
+                        /* lvalue = */ type_string,
+                        /* ltype = */ type,
+                        /* rvalue = */ val,
+                        /* data = */ target,
+                        /* userdata = */ u);
 }
 
 _printf_(7, 8)
@@ -62,10 +72,10 @@ static int log_helper(void *userdata, int level, int error, const char *file, in
 
         va_start(ap, format);
         r = log_object_internalv(level, error, file, line, func,
-                                 NULL,
-                                 u->id,
-                                 NULL,
-                                 NULL,
+                                 /* object_field = */ unit_log_field(u),
+                                 /* object = */ u->id,
+                                 /* extra_field = */ NULL,
+                                 /* extra = */ NULL,
                                  format, ap);
         va_end(ap);
 
@@ -78,21 +88,12 @@ static int verify_conditions(char **lines, RuntimeScope scope, const char *unit,
         int r, q = 1;
 
         if (unit) {
-                _cleanup_strv_free_ char **filenames = NULL;
-                _cleanup_free_ char *var = NULL;
-
-                filenames = strv_new(unit);
-                if (!filenames)
-                        return log_oom();
-
-                r = verify_generate_path(&var, filenames);
+                r = verify_set_unit_path(STRV_MAKE(unit));
                 if (r < 0)
-                        return log_error_errno(r, "Failed to generate unit load path: %m");
-
-                assert_se(set_unit_path(var) >= 0);
+                        return log_error_errno(r, "Failed to set unit load path: %m");
         }
 
-        r = manager_new(scope, MANAGER_TEST_RUN_MINIMAL, &m);
+        r = manager_new(scope, MANAGER_TEST_RUN_MINIMAL|MANAGER_TEST_DONT_OPEN_EXECUTOR, &m);
         if (r < 0)
                 return log_error_errno(r, "Failed to initialize manager: %m");
 
@@ -123,13 +124,14 @@ static int verify_conditions(char **lines, RuntimeScope scope, const char *unit,
                 }
         }
 
-        r = condition_test_list(u->asserts, environ, assert_type_to_string, log_helper, u);
+        condition_test_logger_t logger = arg_quiet ? NULL : log_helper;
+        r = condition_test_list(u->asserts, environ, assert_type_to_string, logger, u);
         if (u->asserts)
-                log_notice("Asserts %s.", r > 0 ? "succeeded" : "failed");
+                log_full(arg_quiet ? LOG_DEBUG : LOG_NOTICE, "Asserts %s.", r > 0 ? "succeeded" : "failed");
 
-        q = condition_test_list(u->conditions, environ, condition_type_to_string, log_helper, u);
+        q = condition_test_list(u->conditions, environ, condition_type_to_string, logger, u);
         if (u->conditions)
-                log_notice("Conditions %s.", q > 0 ? "succeeded" : "failed");
+                log_full(arg_quiet ? LOG_DEBUG : LOG_NOTICE, "Conditions %s.", q > 0 ? "succeeded" : "failed");
 
         return r > 0 && q > 0 ? 0 : -EIO;
 }

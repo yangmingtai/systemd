@@ -1,14 +1,12 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <sys/types.h>
-#include <unistd.h>
-
 #include "acpi-fpdt.h"
 #include "boot-timestamps.h"
 #include "efi-loader.h"
 #include "errno-util.h"
 #include "log.h"
 #include "tests.h"
+#include "time-util.h"
 
 static int test_acpi_fpdt(void) {
         usec_t loader_start, loader_exit;
@@ -76,11 +74,11 @@ int main(int argc, char* argv[]) {
         test_setup_logging(LOG_DEBUG);
 
         p = test_acpi_fpdt();
-        assert_se(p >= 0);
+        ASSERT_OK(p);
         q = test_efi_loader();
-        assert_se(q >= 0);
+        ASSERT_OK(q);
         r = test_boot_timestamps();
-        assert_se(r >= 0);
+        ASSERT_OK(r);
 
         if (p == 0 && q == 0 && r == 0)
                 return log_tests_skipped("access to firmware variables not possible");

@@ -1,10 +1,6 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <errno.h>
-
 #include "dhcp-lease-internal.h"
-#include "macro.h"
-#include "string-util.h"
 #include "strv.h"
 #include "tests.h"
 
@@ -60,8 +56,8 @@ TEST(dhcp_lease_parse_search_domains_no_data) {
         _cleanup_strv_free_ char **domains = NULL;
         static const uint8_t optionbuf[3] = {0, 0, 0};
 
-        assert_se(dhcp_lease_parse_search_domains(NULL, 0, &domains) == -ENODATA);
-        assert_se(dhcp_lease_parse_search_domains(optionbuf, 0, &domains) == -ENODATA);
+        assert_se(dhcp_lease_parse_search_domains(NULL, 0, &domains) == -EBADMSG);
+        assert_se(dhcp_lease_parse_search_domains(optionbuf, 0, &domains) == -EBADMSG);
 }
 
 TEST(dhcp_lease_parse_search_domains_loops) {

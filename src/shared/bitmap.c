@@ -1,15 +1,9 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <errno.h>
-#include <stddef.h>
-#include <stdint.h>
-#include <stdlib.h>
 #include <string.h>
 
 #include "alloc-util.h"
 #include "bitmap.h"
-#include "hashmap.h"
-#include "macro.h"
 #include "memory-util.h"
 
 /* Bitmaps are only meant to store relatively small numbers
@@ -129,13 +123,12 @@ bool bitmap_isset(const Bitmap *b, unsigned n) {
 }
 
 bool bitmap_isclear(const Bitmap *b) {
-        unsigned i;
 
         if (!b)
                 return true;
 
-        for (i = 0; i < b->n_bitmaps; i++)
-                if (b->bitmaps[i] != 0)
+        FOREACH_ARRAY(i, b->bitmaps, b->n_bitmaps)
+                if (*i != 0)
                         return false;
 
         return true;
@@ -163,9 +156,9 @@ bool bitmap_iterate(const Bitmap *b, Iterator *i, unsigned *n) {
         rem = BITMAP_NUM_TO_REM(i->idx);
         bitmask = UINT64_C(1) << rem;
 
-        for (; offset < b->n_bitmaps; offset ++) {
+        for (; offset < b->n_bitmaps; offset++) {
                 if (b->bitmaps[offset]) {
-                        for (; bitmask; bitmask <<= 1, rem ++) {
+                        for (; bitmask; bitmask <<= 1, rem++) {
                                 if (b->bitmaps[offset] & bitmask) {
                                         *n = BITMAP_OFFSET_TO_NUM(offset, rem);
                                         i->idx = *n + 1;
@@ -187,7 +180,6 @@ bool bitmap_iterate(const Bitmap *b, Iterator *i, unsigned *n) {
 bool bitmap_equal(const Bitmap *a, const Bitmap *b) {
         size_t common_n_bitmaps;
         const Bitmap *c;
-        unsigned i;
 
         if (a == b)
                 return true;
@@ -203,7 +195,7 @@ bool bitmap_equal(const Bitmap *a, const Bitmap *b) {
                 return false;
 
         c = a->n_bitmaps > b->n_bitmaps ? a : b;
-        for (i = common_n_bitmaps; i < c->n_bitmaps; i++)
+        for (unsigned i = common_n_bitmaps; i < c->n_bitmaps; i++)
                 if (c->bitmaps[i] != 0)
                         return false;
 
